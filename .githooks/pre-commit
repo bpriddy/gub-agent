@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# gitleaks pre-commit hook.
+# Scans staged changes for secrets (API keys, tokens, JSON keys, etc.).
+# Fails the commit on any finding so the secret never lands.
+#
+# One-time setup per clone (see README "Local setup"):
+#
+#   brew install gitleaks
+#   git config core.hooksPath .githooks
+#
+# Escape hatch — set SKIP_GITLEAKS=1 for a one-off commit when you genuinely
+# have to bypass the check (last resort; justify in the commit message):
+#
+#   SKIP_GITLEAKS=1 git commit ...
+
+if [ "$SKIP_GITLEAKS" = "1" ]; then
+  echo "gitleaks: skipped via SKIP_GITLEAKS=1" >&2
+  exit 0
+fi
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  cat >&2 <<'MSG'
+gitleaks not installed — refusing to commit.
+
+Install it:
+  brew install gitleaks        # macOS
+  # or see: https://github.com/gitleaks/gitleaks#installation
+
+Then confirm the hook is wired up for this clone:
+  git config core.hooksPath .githooks
+
+If you genuinely have to bypass for a one-off commit:
+  SKIP_GITLEAKS=1 git commit ...
+MSG
+  exit 1
+fi
+
+# --redact masks any detected secret in the output so the scan report itself
+# doesn't leak. gitleaks v8: `git --staged` scans staged changes (the v7
+# `protect --staged` command was renamed).
+gitleaks git --staged --redact --no-banner

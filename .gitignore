@@ -12,6 +12,17 @@ build/
 
 # Environment
 .env
+.env.*
+!.env.example
+
+# Secrets — service account JSON, private keys, certs
+secrets/
+keys/
+*.pem
+*.key
+*.p12
+*-sa.json
+*service-account*.json
 
 # ADK / Vertex
 .adk/
