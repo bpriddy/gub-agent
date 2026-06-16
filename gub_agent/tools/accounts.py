@@ -83,16 +83,22 @@ def get_campaign(
     """
     Get details of a single campaign.
 
-    Returns campaign name, status, dates, the parent account, and the staff
-    member who created it.
+    Returns campaign name, status, dates, the parent account, the staff
+    member who created it, and a pre-written Markdown status summary
+    (`statusMarkdown`) when one has been synthesized by the Drive
+    review-approval flow.
 
-    Use this when you have a specific campaign UUID and need its full details.
-    Use get_account_overview to browse all campaigns for an account.
+    Use this when you have a specific campaign UUID and need its full
+    details. Use get_account_overview to browse all campaigns for an
+    account.
 
     Args:
         campaign_id: The UUID of the campaign
 
     Returns:
-        dict with campaign details including account and createdByStaff.
+        dict with campaign details. When the `statusMarkdown` key is
+        present and non-empty, render it VERBATIM in your response —
+        it's hand-shaped status prose meant for direct display, not a
+        summary input.
     """
     return gub_get(f"/org/campaigns/{campaign_id}", tool_context)

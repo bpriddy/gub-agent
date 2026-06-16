@@ -14,6 +14,83 @@ Sibling repos: [gcp-universal-backend](https://github.com/bpriddy/gcp-universal-
 - Deployed to Vertex AI Agent Engine
 - Registered with a Gemini Enterprise app for end-user chat
 
+## Architecture
+
+`root_agent` is a small multi-agent pipeline, not a single LLM — a deliberate,
+minimal borrowing from the Agentic-RAG "critic-before-commit" pattern:
+
+```
+LoopAgent(max_iterations=2)
+  ├─ executor   — the tool-using LLM (gub_agent/agent.py)
+  ├─ critic     — evaluates the executor's answer (gub_agent/agents/critic.py)
+  └─ escalator  — exits the loop early when the critic is satisfied
+```
+
+On a clean answer the loop exits after one pass; on a flagged answer the
+executor runs again, sees the critic's feedback in session state, and fixes
+it. We keep just this one specialist (critic), not a planner/rewriter/fanout
+fleet — at our scale the critic is the single piece that materially improves
+dependability.
+
+### Tools
+
+- `org_query` — structured query primitive (filter / sort / group / aggregate
+  / `similar_to` trigram) against GUB's `POST /org/query`. THE preferred tool
+  for any filter/count/sort/aggregate question. Lightweight: returns only
+  catalog fields, never large text blobs. (`gub_agent/tools/org_query.py`)
+- `find_staff_for_resourcing`, `search_staff`, `get_staff_profile` — staff.
+- `list_accounts`, `get_account_overview`, `get_campaign` — detail tools.
+  These return the rich per-entity fields (e.g. `statusMarkdown`); `org_query`
+  is for *finding* entities, the detail tools for *reading* one.
+
+### Synthesis principles (how the agent decides what to say)
+
+These are general — phrased to scale across question types, never tuned to a
+specific phrasing. See `gub_agent/agent.py` (`SYSTEM_INSTRUCTION`) and
+`gub_agent/agents/critic.py`.
+
+- **Author to the question's intended CLOSURE, not its literal words.** A
+  question seeking a FACT wants the value ("47"); an ASSESSMENT ("how is X?",
+  "should we worry about X?") wants a VERDICT up front plus the few drivers
+  that earn it — never a catalog; an EXPLORATORY question wants a shaped
+  shortlist. "Technically answered" is a near-zero bar ("Active." technically
+  answers "how is the chevy account?"); the real bar is serving the asker's
+  intent. Length follows closure, not data volume.
+- **Verdicts must be earned** — grounded in retrieved signals, like any claim.
+- **Ground every entity.** Never name an account/campaign/person that didn't
+  appear in a tool result this turn — no inventing, no "helpful completion".
+- **Time is part of relevance.** Weight recent and currently-active items;
+  don't surface something long-finished as if it were current.
+
+### The critic — two-axis evaluation
+
+`CriticVerdict` reports two independent judgments, gating `sufficient`:
+
+1. `info_sufficient` — did the tool calls gather enough to answer this
+   question? (right tools used, every entity queried, multi-part questions
+   decomposed, not answered with zero tool calls).
+2. `answer_satisfies` — does the answer deliver the right KIND of closure,
+   grounded, recency-respected? (a catalog answer to "how is X" fails here).
+
+`sufficient = info_sufficient AND answer_satisfies`. False triggers a retry.
+
+### Deterministic current-date injection
+
+Gemini doesn't reliably know "now", and a `get_current_date` tool would be
+LLM-mediated (the model has to choose to call it). Instead, both the executor
+and critic use an ADK **`InstructionProvider`** (a *callable* instruction,
+`gub_agent/instruction_utils.py:with_current_date`) that appends
+"Today is YYYY-MM-DD (UTC)" on **every** request — computed server-side,
+deterministic, never stale, no tool, no caller coupling. This is what makes
+"recent" / "this week" reliable.
+
+> **ADK brace trap:** ADK runs `{var}` session-state injection over instruction
+> strings (including an InstructionProvider's *output*). Any literal `{anything}`
+> that isn't a real state key crashes the run with `KeyError` before the LLM is
+> called — visible only in the Reasoning Engine logs. Grep prompts for `{`
+> before every `adk deploy`. (f-string interpolations like `f"{base}"` are safe
+> because they don't emit literal braces.)
+
 ## Local setup
 
 ```bash
@@ -43,8 +120,35 @@ python -m gub_agent
 
 ## Deploy
 
-See `deployment/` — `register_agent.py` ships the agent to Vertex AI Agent
-Engine and registers it with the configured Gemini Enterprise app.
+The agent deploys to **Vertex AI Agent Engine via `adk deploy agent_engine`**
+— NOT Cloud Build. It will never appear in `gcloud builds`. Update in place
+(same engine id, so callers — the Chat bot, Agentspace — see no change):
+
+```bash
+adk deploy agent_engine \
+  --project=os-test-491819 \
+  --region=us-central1 \
+  --agent_engine_id=9136379226620952576 \
+  --display_name=gub-agent \
+  --description="<what changed>" \
+  gub_agent
+```
+
+The positional `gub_agent` (the package exporting `root_agent`) is required.
+Agent names must be valid Python identifiers — no dashes (e.g. `gub_pipeline`,
+not `gub-pipeline`), or ADK rejects the deploy. A transient `code 13
+INTERNAL` from Agent Engine usually succeeds on a retry.
+
+Then `register_agent.py` (see `deployment/`) registers the deployed engine
+with the Gemini Enterprise app — a separate, occasional step.
+
+### Debug client
+
+`debug_client/` is a local-only Next.js tool for inspecting the agent's
+decomposition trace (per-iteration tool calls, the two-axis critic verdict,
+sources). Sign in with Google, ask a question, watch how the agent turns it
+into queries. See `debug_client/README.md`. It calls Vertex AI server-side via
+ADC; it never deploys.
 
 ## Security
 

@@ -26,3 +26,6 @@ keys/
 
 # ADK / Vertex
 .adk/
+
+# adk deploy build artifacts
+gub_agent_tmp*/

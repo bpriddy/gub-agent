@@ -10,14 +10,17 @@ Import pattern in agent.py:
 """
 
 from .accounts import get_account_overview, get_campaign, list_accounts
+from .org_query import org_query
 from .staff import find_staff_for_resourcing, get_staff_profile, search_staff
 
 ALL_TOOLS = [
+    # Structured query primitive — preferred for filter/sort/count/aggregate
+    org_query,
     # Staff & resourcing
     find_staff_for_resourcing,
     get_staff_profile,
     search_staff,
-    # Accounts & campaigns
+    # Accounts & campaigns (detail tools)
     list_accounts,
     get_account_overview,
     get_campaign,
@@ -25,6 +28,7 @@ ALL_TOOLS = [
 
 __all__ = [
     "ALL_TOOLS",
+    "org_query",
     "find_staff_for_resourcing",
     "get_staff_profile",
     "search_staff",
