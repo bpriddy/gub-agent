@@ -80,6 +80,8 @@ function IterationCard({ iteration }: { iteration: AgentIteration }) {
           {iteration.toolCalls.length === 0 && <div style={S.empty}>(no tool calls)</div>}
           {iteration.toolCalls.map((tc, i) => <ToolCallCard key={i} call={tc} />)}
 
+          {iteration.thoughts && <ThoughtsBlock label="Executor thinking" text={iteration.thoughts} />}
+
           {iteration.text && (
             <div style={{ marginTop: '0.75rem' }}>
               <div style={S.subhead}>Executor text</div>
@@ -112,6 +114,7 @@ function IterationCard({ iteration }: { iteration: AgentIteration }) {
                     <b>Feedback to executor:</b> {iteration.critic.feedback}
                   </div>
                 )}
+                {iteration.critic.thoughts && <ThoughtsBlock label="Critic thinking" text={iteration.critic.thoughts} />}
               </div>
             </div>
           )}
@@ -140,6 +143,19 @@ function ToolCallCard({ call }: { call: AgentToolCall }) {
           <pre style={S.preInline}>{JSON.stringify(call.response, null, 2)}</pre>
         </div>
       )}
+    </div>
+  );
+}
+
+function ThoughtsBlock({ label, text }: { label: string; text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: '0.5rem' }}>
+      <button onClick={() => setOpen(!open)} style={S.thoughtsHead}>
+        <span>💭 {label}</span>
+        <span style={S.expand}>{open ? '▼' : '▶'}</span>
+      </button>
+      {open && <div style={S.thoughtsBody}>{text}</div>}
     </div>
   );
 }
@@ -218,6 +234,9 @@ const S: Record<string, React.CSSProperties> = {
   pre: { background: '#161b22', border: '1px solid #30363d', borderRadius: '4px', padding: '0.75rem', fontSize: '0.6875rem', fontFamily: 'ui-monospace, monospace', overflow: 'auto', maxHeight: '60vh' },
 
   executorText: { background: '#0d1117', padding: '0.5rem 0.75rem', borderRadius: '4px', fontSize: '0.8125rem', whiteSpace: 'pre-wrap', lineHeight: 1.5, color: '#e6edf3' },
+
+  thoughtsHead: { display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', background: 'transparent', border: '1px dashed #30363d', borderRadius: '4px', padding: '0.25rem 0.5rem', color: '#a371f7', font: 'inherit', fontSize: '0.75rem', cursor: 'pointer', textAlign: 'left' },
+  thoughtsBody: { marginTop: '0.25rem', padding: '0.5rem 0.75rem', background: '#161b22', border: '1px solid #21262d', borderRadius: '4px', fontSize: '0.75rem', whiteSpace: 'pre-wrap', lineHeight: 1.5, color: '#b9a3e3', fontStyle: 'italic' },
 
   sourceBadge: { fontSize: '0.6875rem', background: '#1f4068', color: '#fff', padding: '0.125rem 0.375rem', borderRadius: '3px' },
   sourceList: { margin: 0, padding: '0 0 0 1.25rem', fontSize: '0.8125rem' },

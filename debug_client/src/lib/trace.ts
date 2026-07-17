@@ -34,6 +34,8 @@ export interface AgentCriticVerdict {
   answerSatisfies?: boolean;
   reason?: string;
   feedback?: string;
+  /** Thought-summary text (only when the agent runs with EMIT_THINKING). */
+  thoughts?: string;
 }
 
 export interface AgentIteration {
@@ -41,6 +43,8 @@ export interface AgentIteration {
   toolCalls: AgentToolCall[];
   text: string;
   critic?: AgentCriticVerdict;
+  /** Executor thought-summary text (only when EMIT_THINKING is set). */
+  thoughts?: string;
 }
 
 export interface AgentTrace {
@@ -100,7 +104,12 @@ function consumeEvent(evt: unknown, acc: Accumulator): void {
   for (const part of content.parts) {
     const txt = part.text;
     if (typeof txt === 'string' && txt.length > 0) {
-      acc.current.text = acc.current.text ? `${acc.current.text}\n${txt}` : txt;
+      if (part.thought === true) {
+        // Thought-summary part (EMIT_THINKING) — keep it OUT of the answer text.
+        acc.current.thoughts = acc.current.thoughts ? `${acc.current.thoughts}\n${txt}` : txt;
+      } else {
+        acc.current.text = acc.current.text ? `${acc.current.text}\n${txt}` : txt;
+      }
     }
 
     const fnCall = part.function_call as { name?: string; args?: Record<string, unknown> } | undefined;
@@ -134,21 +143,33 @@ function consumeEvent(evt: unknown, acc: Accumulator): void {
 function extractCriticVerdict(evt: Record<string, unknown>): AgentCriticVerdict | null {
   const content = evt.content as { parts?: Array<Record<string, unknown>> } | undefined;
   if (!content?.parts) return null;
+  let verdict: AgentCriticVerdict | null = null;
+  let thoughts = '';
   for (const part of content.parts) {
+    // Thought-summary part (EMIT_THINKING) — collect, don't treat as the verdict.
+    if (part.thought === true && typeof part.text === 'string') {
+      thoughts = thoughts ? `${thoughts}\n${part.text}` : part.text;
+      continue;
+    }
+    if (verdict) continue;
     const fnResp = part.function_response as { response?: Record<string, unknown> } | undefined;
     const obj = fnResp?.response;
-    if (obj && typeof obj.sufficient === 'boolean') return shapeCritic(obj);
+    if (obj && typeof obj.sufficient === 'boolean') {
+      verdict = shapeCritic(obj);
+      continue;
+    }
     const txt = part.text;
     if (typeof txt === 'string') {
       try {
         const parsed = JSON.parse(txt) as Record<string, unknown>;
-        if (typeof parsed.sufficient === 'boolean') return shapeCritic(parsed);
+        if (typeof parsed.sufficient === 'boolean') verdict = shapeCritic(parsed);
       } catch {
         /* not json */
       }
     }
   }
-  return null;
+  if (verdict && thoughts) verdict.thoughts = thoughts;
+  return verdict;
 }
 
 function shapeCritic(obj: Record<string, unknown>): AgentCriticVerdict {

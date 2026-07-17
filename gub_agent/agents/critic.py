@@ -28,95 +28,31 @@ from typing import AsyncGenerator
 
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import Event, EventActions
 from pydantic import BaseModel, Field
 
-from ..config import GEMINI_MODEL
-from ..instruction_utils import with_current_date
-
-
-CRITIC_INSTRUCTION = """
-You are a quality-control critic for a GUB AI agent that answers questions
-about an agency's people, clients, and campaigns.
-
-The executor agent has just produced a response to the user's question.
-Read the conversation, the tool calls the executor made and their results,
-and the executor's most recent response. Evaluate it on TWO axes. BOTH
-must pass for the answer to be sufficient.
-
-=== AXIS 1 — INFORMATION SUFFICIENCY ===
-Did the executor's tool calls gather ENOUGH to answer THIS question?
-- Was every entity the question refers to actually looked up via a tool —
-  not assumed, not remembered from an earlier turn, not invented?
-- Were the right tools used? Filtering, counting, sorting, ranking, and
-  aggregating go through `org_query`, not list-and-reason. Fuzzy name
-  lookups use `org_query` with the `similar_to` operator.
-- For multi-part or multi-entity questions, was each part queried (chained
-  `org_query` calls using the `in` operator as the join)?
-- If the executor made NO tool calls but the question needs data, the
-  information is automatically insufficient.
-- If any fact needed to answer is absent from every tool result, the
-  information is insufficient — say exactly what still needs to be queried.
-
-=== AXIS 2 — ANSWER SATISFACTION ===
-Given what was retrieved, does the synthesized answer deliver the kind of
-CLOSURE this question sought — judged on intent, not literal words?
-- CLOSURE: every question seeks a kind of resolution. A FACT question
-  wants a value. An ASSESSMENT question ("how is X?", "where are we on X?",
-  "should we worry about X?") wants a VERDICT up front (healthy / mixed /
-  needs attention) plus the few drivers that earn it — NOT a catalog or a
-  generic summary. An EXPLORATORY question wants a shaped shortlist. An
-  answer that delivers the wrong kind of closure fails this axis even if
-  every fact in it is correct. For assessment questions specifically: no
-  clear verdict, or a data-dump in place of a verdict, is a fail.
-- RECENCY: today's date is in your context. Did the answer respect time?
-  Surfacing something that ended or went quiet long ago as if it were
-  current, or burying recent movement under stale history, fails. Current-
-  state answers must weight recent and currently-active items.
-- GROUNDING (hard fail): every account, campaign, or person named in the
-  answer must appear verbatim in a tool result from this turn. Invented or
-  "helpfully completed" names — e.g. answering "Chevrolet" when the tool
-  returned "chevy", or naming accounts when no query was run — fail this
-  axis, always, with no exceptions.
-- Completeness: does it address what was actually asked, fully, without
-  drifting, hedging, or refusing without cause?
-- Correct computation: counts, totals, and rankings come from `org_query`
-  results (the `total` field, the sorted rows) — never reasoned over a list.
-- Form: no UUIDs, internal IDs, or `_sources` in the prose; when a tool
-  result includes `statusMarkdown`, it is rendered verbatim with a brief
-  lead-in, not paraphrased.
-
-Do NOT second-guess data VALUES you can't verify — assume the numbers and
-names INSIDE tool results are correct. You are judging whether enough was
-retrieved and whether the answer is faithful to it, not re-checking the DB.
-
-=== OUTPUT ===
-- `info_sufficient`: true only if Axis 1 passed (enough was retrieved).
-- `answer_satisfies`: true only if Axis 2 passed (grounded, complete,
-  correctly computed and formed).
-- `sufficient`: true ONLY if info_sufficient AND answer_satisfies are both
-  true.
-- `reason`: one short sentence.
-- `feedback`: if not sufficient, name which axis failed and give concrete
-  next-step guidance — for an information gap, exactly what to query next
-  (e.g. "query org_query with similar_to 'chevy' on accounts"); for an
-  answer problem, exactly what to fix. Leave empty when sufficient.
-
-Be strict but not pedantic about minor formatting. But a missing-
-information gap (Axis 1) or an ungrounded / hallucinated entity (Axis 2
-grounding) is never "small" — either one forces sufficient = false.
-""".strip()
+from ..config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
+from ..instruction_utils import current_date_note
+from ..prompts import CRITIC_INSTRUCTION
 
 
 class CriticVerdict(BaseModel):
-    """Critic's two-axis evaluation of the executor's response."""
+    """Critic's two-axis decision on the executor's response.
+
+    The critic reasons through its checks (was a tool called, does each
+    question-entity map to a covering call, closure, grounding, recency) in
+    thinking tokens — see the instruction — and emits only this decision, not
+    the intermediate working.
+    """
 
     info_sufficient: bool = Field(
         description=(
             "Axis 1: did the executor's tool calls gather enough to answer "
-            "this question? False if entities weren't looked up, the wrong "
-            "tool was used, a multi-part question wasn't fully queried, or no "
-            "tool calls were made when data was needed."
+            "this question? False if any entity the question needs wasn't "
+            "retrieved, the wrong tool/operation was used, a multi-part "
+            "question wasn't fully queried, or no tool was called when data "
+            "was needed."
         ),
     )
     answer_satisfies: bool = Field(
@@ -144,12 +80,58 @@ class CriticVerdict(BaseModel):
     )
 
 
+def _executor_made_tool_call(ctx: ReadonlyContext) -> bool:
+    """Deterministic: did the executor emit ANY function_call this run?
+
+    The executor's tool calls are real events in the session — whether one was
+    made is a FACT, not a judgement. We compute it here and hand it to the
+    critic, instead of asking the LLM to read it off the transcript.
+    """
+    for event in ctx.session.events:
+        if event.author != AGENT_NAME:
+            continue
+        parts = event.content.parts if event.content and event.content.parts else []
+        if any(getattr(part, "function_call", None) for part in parts):
+            return True
+    return False
+
+
+def _critic_instruction(ctx: ReadonlyContext) -> str:
+    """InstructionProvider — base critic prompt + current date + the
+    deterministically-computed 'was a tool called this turn' fact."""
+    if _executor_made_tool_call(ctx):
+        tool_fact = (
+            "TOOL CALL THIS TURN: yes — the executor made at least one tool "
+            "call, so the data path was exercised. Judge sufficiency on what "
+            "the results actually cover."
+        )
+    else:
+        tool_fact = (
+            "TOOL CALL THIS TURN: no — the executor made NO tool call. Any "
+            "claim about a specific account, campaign, person, count, or status "
+            "is therefore from memory, so info_sufficient is FALSE — unless the "
+            "question genuinely needed no data (a greeting, 'what can you do?')."
+        )
+    return (
+        f"{CRITIC_INSTRUCTION}\n\n"
+        f"{current_date_note()}\n\n"
+        "## Deterministic facts (computed for you — not your judgement)\n"
+        f"{tool_fact}"
+    )
+
+
 critic_agent = LlmAgent(
     model=GEMINI_MODEL,
     name="critic",
-    # InstructionProvider — same deterministic current-date injection as the
-    # executor, so the critic can judge recency against an accurate "now".
-    instruction=with_current_date(CRITIC_INSTRUCTION),
+    # InstructionProvider — injects the current date AND the deterministic
+    # "was any tool called this turn" fact (computed from the event stream),
+    # so the critic reasons FROM a given fact instead of re-deriving it.
+    instruction=_critic_instruction,
+    # The critic REASONS through its remaining checks (entity↔call coverage,
+    # closure, grounding, recency) in thinking tokens, then emits only the
+    # two-axis decision below — a bare output_schema leaves no room to reason.
+    # Thought summaries are emitted for debugging when EMIT_THINKING is set.
+    planner=build_thinking_planner(),
     output_schema=CriticVerdict,
     output_key="critic_verdict",
 )
