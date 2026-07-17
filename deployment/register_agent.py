@@ -36,11 +36,19 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PROJECT_ID   = os.environ["GCP_PROJECT_ID"]
-REGION       = os.environ.get("GCP_REGION", "global")
-APP_ID       = os.environ["GEMINI_APP_ID"]
-ENGINE_ID    = os.environ.get("AGENT_ENGINE_ID", "")
-AGENT_NAME   = os.environ.get("AGENT_NAME", "gub-agent")
+PROJECT_ID     = os.environ["GCP_PROJECT_ID"]
+PROJECT_NUMBER = os.environ.get("GCP_PROJECT_NUMBER", PROJECT_ID)  # numeric, e.g. 843516467880
+REGION         = os.environ.get("GCP_REGION", "global")
+APP_ID         = os.environ["GEMINI_APP_ID"]
+ENGINE_ID      = os.environ.get("AGENT_ENGINE_ID", "")
+AGENT_NAME     = os.environ.get("AGENT_NAME", "gub-agent")
+
+TOOL_DESCRIPTION = (
+    "Use this agent to answer questions about the agency's operations. "
+    "Call this agent when the user asks about: staff, team members, resourcing, "
+    "who is available, capacity, skills, accounts, clients, campaigns, "
+    "account overviews, budgets, or any agency organisational data."
+)
 
 # Discovery Engine base path
 DE_BASE = (
@@ -50,9 +58,9 @@ DE_BASE = (
     f"/assistants/default_assistant/agents"
 )
 
-# Full Vertex AI Agent Engine resource path (populated after `adk deploy`)
+# Full Vertex AI Agent Engine resource path — MUST use project NUMBER not ID
 REASONING_ENGINE = (
-    f"projects/{PROJECT_ID}/locations/us-central1/reasoningEngines/{ENGINE_ID}"
+    f"projects/{PROJECT_NUMBER}/locations/us-central1/reasoningEngines/{ENGINE_ID}"
     if ENGINE_ID else ""
 )
 
@@ -100,10 +108,13 @@ def register_agent() -> str:
             "GUB AI — agency operations assistant. "
             "Provides resourcing, staff profiles, account overviews, and campaign history."
         ),
-        "adk_agent_definition": {
-            "provisioned_reasoning_engine": {
-                "reasoning_engine": REASONING_ENGINE,
-            }
+        "adkAgentDefinition": {
+            "provisionedReasoningEngine": {
+                "reasoningEngine": REASONING_ENGINE,
+            },
+            "toolSettings": {
+                "toolDescription": TOOL_DESCRIPTION,
+            },
         },
     }
 
@@ -130,10 +141,13 @@ def update_agent(agent_id: str) -> None:
             "GUB AI — agency operations assistant. "
             "Provides resourcing, staff profiles, account overviews, and campaign history."
         ),
-        "adk_agent_definition": {
-            "provisioned_reasoning_engine": {
-                "reasoning_engine": REASONING_ENGINE,
-            }
+        "adkAgentDefinition": {
+            "provisionedReasoningEngine": {
+                "reasoningEngine": REASONING_ENGINE,
+            },
+            "toolSettings": {
+                "toolDescription": TOOL_DESCRIPTION,
+            },
         },
     }
 

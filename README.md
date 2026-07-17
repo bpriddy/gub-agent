@@ -8,6 +8,29 @@ Sibling repos: [gcp-universal-backend](https://github.com/bpriddy/gcp-universal-
 [gub-admin](https://github.com/bpriddy/gub-admin),
 [gub-review](https://github.com/bpriddy/gub-review).
 
+## Status (2026-07-17)
+
+Strategic position: the **gchat bot (gub-gchat-bot) is the user entry point**,
+blending GUB answers with federated Workspace results. This agent is the
+bot's GUB answerer — the scope/abstention design (personal-Workspace
+questions answer exactly `NO_COMPANY_RECORDS` so the bot suppresses the GUB
+section) exists for that architecture. The Gemini-Enterprise-ambient
+direction (GUB as an MCP connector under native Gemini) was explored,
+technically validated, and set aside after team reception; the `/mcp`
+surface in gcp-universal-backend remains deployed but is not the priority.
+
+Two open threads, both needing one live Gemini Enterprise session to close:
+
+1. **OAuth token injection** (`gub_agent/tools/_client.py`): three candidate
+   state-key patterns are probed in order (direct `to_dict()[auth_id]`,
+   nested `auth_tokens`, `temp:` prefix) because the ADK/Gemini Enterprise
+   state-key format was still being pinned down. The winning pattern hasn't
+   been confirmed live — once it is, keep it and delete the other two.
+2. **Authorization ID**: the registered Gemini Enterprise authorization is
+   `gub-oauth-3` (re-registered during the same debugging; earlier ids are
+   dead). A mismatch between `GUB_AUTHORIZATION_ID` and the registration
+   fails token injection silently.
+
 ## Stack
 
 - Python 3.11+ with [Google ADK](https://github.com/google/adk-python)
@@ -138,6 +161,16 @@ The positional `gub_agent` (the package exporting `root_agent`) is required.
 Agent names must be valid Python identifiers — no dashes (e.g. `gub_pipeline`,
 not `gub-pipeline`), or ADK rejects the deploy. A transient `code 13
 INTERNAL` from Agent Engine usually succeeds on a retry.
+
+**Model endpoint vs engine region.** The model (`gemini-3.5-flash`) is served
+only from the Vertex **global** endpoint, so `.env` sets
+`GOOGLE_CLOUD_LOCATION=global` (the regional endpoint 404s the model). That is
+independent of `--region=us-central1` above, which controls only where the
+Agent Engine *resource* lives — `--region` overrides `GOOGLE_CLOUD_LOCATION`
+for the deploy target, while the baked runtime env keeps model calls on
+`global`. Do **not** pass `--region=global` (Agent Engine isn't deployable
+there). Callers (`debug_client`, gchat bot) keep `GCP_REGION=us-central1` —
+they address the regional engine resource, not the model.
 
 Then `register_agent.py` (see `deployment/`) registers the deployed engine
 with the Gemini Enterprise app — a separate, occasional step.

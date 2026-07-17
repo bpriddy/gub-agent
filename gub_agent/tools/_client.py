@@ -39,17 +39,64 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
         if cached:
             return cached
 
-        # 2. Google OAuth token injected by Gemini Enterprise
-        auth_tokens = tool_context.state.get("auth_tokens") or {}
-        gub_auth = auth_tokens.get(GUB_AUTHORIZATION_ID) or {}
-        google_access_token = (gub_auth.get("token") or {}).get("access_token")
+        # Log available state KEY NAMES for debugging — never values: the
+        # state can hold the user's Google access token, and values must not
+        # reach Cloud Logging.
+        try:
+            state_dict = tool_context.state.to_dict()
+            logger.info("auth debug — state keys: %s", sorted(state_dict.keys()))
+        except Exception as e:
+            logger.info("auth debug — state.to_dict() failed: %s", e)
+        try:
+            app_prefix = getattr(tool_context.state, 'APP_PREFIX', None)
+            temp_prefix = getattr(tool_context.state, 'TEMP_PREFIX', None)
+            logger.info("auth debug — APP_PREFIX=%s TEMP_PREFIX=%s", app_prefix, temp_prefix)
+        except Exception:
+            pass
 
-        if google_access_token:
-            logger.debug("Exchanging Google access token for GUB JWT")
-            gub_jwt = _exchange_google_token(google_access_token)
-            # Cache for the duration of this session
-            tool_context.state["gub_jwt"] = gub_jwt
-            return gub_jwt
+        # 2a. Try the direct state key pattern (ADK article pattern)
+        #     tool_context.state[auth_id] → access token string
+        #     Use to_dict() since State.get() may prepend a prefix
+        try:
+            state_dict = tool_context.state.to_dict()
+            google_access_token = state_dict.get(GUB_AUTHORIZATION_ID)
+            if google_access_token and isinstance(google_access_token, str):
+                logger.warning("Found OAuth token via to_dict()['%s']", GUB_AUTHORIZATION_ID)
+                gub_jwt = _exchange_google_token(google_access_token)
+                tool_context.state["gub_jwt"] = gub_jwt
+                return gub_jwt
+            elif google_access_token:
+                # Type only — the value may be a token-bearing structure.
+                logger.warning("State key '%s' exists but is type %s (expected str)",
+                            GUB_AUTHORIZATION_ID, type(google_access_token).__name__)
+        except Exception as e:
+            logger.warning("Error reading state via to_dict: %s", e)
+
+        # 2b. Try the nested auth_tokens pattern
+        try:
+            auth_tokens = tool_context.state.get("auth_tokens") or {}
+            gub_auth = auth_tokens.get(GUB_AUTHORIZATION_ID) or {}
+            google_access_token = (gub_auth.get("token") or {}).get("access_token")
+            if google_access_token:
+                logger.info("Found OAuth token via auth_tokens['%s']", GUB_AUTHORIZATION_ID)
+                gub_jwt = _exchange_google_token(google_access_token)
+                tool_context.state["gub_jwt"] = gub_jwt
+                return gub_jwt
+        except Exception as e:
+            logger.info("Error reading auth_tokens: %s", e)
+
+        # 2c. Try temp: prefix pattern (older ADK versions)
+        try:
+            temp_token = tool_context.state.get(f"temp:{GUB_AUTHORIZATION_ID}")
+            if temp_token and isinstance(temp_token, str):
+                logger.info("Found OAuth token via temp:%s", GUB_AUTHORIZATION_ID)
+                gub_jwt = _exchange_google_token(temp_token)
+                tool_context.state["gub_jwt"] = gub_jwt
+                return gub_jwt
+        except Exception as e:
+            logger.info("Error reading temp state: %s", e)
+
+        logger.warning("No OAuth token found in tool_context.state for '%s'", GUB_AUTHORIZATION_ID)
 
     # 3. Local dev / service account fallback
     if GUB_SERVICE_JWT:
