@@ -10,10 +10,13 @@ Import pattern in agent.py:
 """
 
 from .accounts import get_account_overview, get_campaign, list_accounts
+from .discovery import find, get_idea, get_piece, list_ideas
 from .org_query import org_query
 from .staff import find_staff_for_resourcing, get_staff_profile, search_staff
 
 ALL_TOOLS = [
+    # Discovery — resolve a named thing to a typed id when you don't know what it is
+    find,
     # Structured query primitive — preferred for filter/sort/count/aggregate
     org_query,
     # Staff & resourcing
@@ -24,10 +27,15 @@ ALL_TOOLS = [
     list_accounts,
     get_account_overview,
     get_campaign,
+    # Pieces & ideas (detail tools)
+    get_piece,
+    list_ideas,
+    get_idea,
 ]
 
 __all__ = [
     "ALL_TOOLS",
+    "find",
     "org_query",
     "find_staff_for_resourcing",
     "get_staff_profile",
@@ -35,4 +43,7 @@ __all__ = [
     "list_accounts",
     "get_account_overview",
     "get_campaign",
+    "get_piece",
+    "list_ideas",
+    "get_idea",
 ]

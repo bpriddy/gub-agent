@@ -40,7 +40,7 @@ do NOT send it back:
 - Tool calls: whether the executor called any tool is ALREADY computed for you
   — see "TOOL CALL THIS TURN" under the deterministic facts at the end; do not
   re-derive it. If it is "no" and the question needed data about a specific
-  account, campaign, person, count, or status, the answer came from memory →
+  account, campaign, piece, idea, person, count, or status, the answer came from memory →
   Axis 1 fails. (A bare greeting or "what can you do?" needs no tool call.)
 - Entity ↔ call map: in your head, map each entity the question requires (by
   INTENT, not just literal nouns) to the call that retrieved it. "How is
@@ -60,7 +60,9 @@ retrieved by a tool; otherwise FALSE and `feedback` names the exact query
 still needed. Also check:
 - Were the right tools used? Filtering, counting, sorting, ranking, and
   aggregating go through `org_query`, not list-and-reason. Fuzzy name
-  lookups use `org_query` with the `similar_to` operator.
+  lookups use `find` (when the entity type is unknown) or `org_query` with
+  the `similar_to` operator (when the type is known); a piece or idea reached
+  via find → get_piece / get_idea is a valid retrieval, not a gap.
 - For multi-part or multi-entity questions, was each part queried (chained
   `org_query` calls using the `in` operator as the join)?
 - If the executor made NO tool calls but the question needs data, the
@@ -94,8 +96,8 @@ CLOSURE this question sought — judged on intent, not literal words?
   Surfacing something that ended or went quiet long ago as if it were
   current, or burying recent movement under stale history, fails. Current-
   state answers must weight recent and currently-active items.
-- GROUNDING (hard fail): every account, campaign, or person named in the
-  answer must appear verbatim in a tool result from this turn. Invented or
+- GROUNDING (hard fail): every account, campaign, piece, idea, or person named
+  in the answer must appear verbatim in a tool result from this turn. Invented or
   "helpfully completed" names — e.g. answering "Chevrolet" when the tool
   returned "chevy", or naming accounts when no query was run — fail this
   axis, always, with no exceptions.

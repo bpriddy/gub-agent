@@ -33,6 +33,12 @@ def org_query(
     ## Entities
 
     - "campaigns" — agency work for a client account
+    - "pieces" — campaign pieces: distinct produced/producing executions within
+      a campaign (a commercial, social series, tool, activation). Query these to
+      RESOLVE a piece by name (`{name: {similar_to: "..."}}`) or list a campaign's
+      pieces (`{campaignId: {eq: "..."}}`); the rich status is NOT here — fetch
+      it with get_piece(id). Usually easier: use `find` when you don't yet know
+      the thing is a piece.
     - "accounts" — clients of the agency
     - "staff" — people at the agency
 
