@@ -24,7 +24,7 @@ there); the critic's lives in `prompts/critic.py`.
 
 from google.adk.agents import Agent, LoopAgent
 
-from .agents.critic import critic_agent, escalator_agent
+from .agents.critic import critic_gate, escalator_agent
 from .config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
 from .instruction_utils import with_current_date
 from .prompts import EXECUTOR_INSTRUCTION
@@ -40,12 +40,14 @@ executor_agent = Agent(
     tools=ALL_TOOLS,
 )
 
-# Wrap [executor → critic → escalator] in a LoopAgent. On clean answers
-# the critic emits sufficient=true, escalator triggers loop exit after
-# one iteration. On flagged failures, the executor runs again seeing the
-# critic's feedback in session state. Capped at 2 iterations.
+# Wrap [executor → critic-gate → escalator] in a LoopAgent. The gate skips
+# the critic LLM deterministically for exact abstentions (NO_COMPANY_RECORDS)
+# and runs the critic for everything else. On clean answers the critic emits
+# sufficient=true, escalator triggers loop exit after one iteration. On
+# flagged failures, the executor runs again seeing the critic's feedback in
+# session state. Capped at 2 iterations.
 root_agent = LoopAgent(
     name="gub_pipeline",
-    sub_agents=[executor_agent, critic_agent, escalator_agent],
+    sub_agents=[executor_agent, critic_gate, escalator_agent],
     max_iterations=2,
 )

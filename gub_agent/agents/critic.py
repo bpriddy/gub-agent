@@ -137,6 +137,67 @@ critic_agent = LlmAgent(
 )
 
 
+def _last_executor_text(ctx: InvocationContext) -> str:
+    """The executor's most recent visible response text (thoughts excluded)."""
+    for event in reversed(ctx.session.events):
+        if event.author != AGENT_NAME:
+            continue
+        parts = event.content.parts if event.content and event.content.parts else []
+        text = "".join(
+            part.text
+            for part in parts
+            if getattr(part, "text", None) and not getattr(part, "thought", False)
+        )
+        if text.strip():
+            return text
+    return ""
+
+
+class CriticGate(BaseAgent):
+    """Deterministic pre-check in front of the critic LLM.
+
+    The critic's instruction already auto-passes exact non-answers (the
+    NO_COMPANY_RECORDS abstention marker) — but reaching that verdict cost a
+    full LLM pass with thinking on every abstention turn (~observed 60-119s
+    turns whose entire output is one marker word). The marker is detectable
+    with a string check, so: when the executor's response IS the abstention,
+    write the sufficient verdict to state directly and skip the critic LLM
+    entirely. Every other response runs the critic exactly as before —
+    zero change to answer quality by construction.
+
+    The marker check mirrors the bot's own gubAbstained detection
+    (trim → upper → startswith).
+    """
+
+    async def _run_async_impl(
+        self,
+        ctx: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        text = _last_executor_text(ctx)
+        if text.strip().upper().startswith("NO_COMPANY_RECORDS"):
+            yield Event(
+                invocation_id=ctx.invocation_id,
+                author=self.name,
+                actions=EventActions(
+                    state_delta={
+                        "critic_verdict": {
+                            "info_sufficient": True,
+                            "answer_satisfies": True,
+                            "sufficient": True,
+                            "reason": (
+                                "Deterministic pass: exact NO_COMPANY_RECORDS "
+                                "abstention (no critic LLM run)."
+                            ),
+                            "feedback": "",
+                        }
+                    }
+                ),
+            )
+            return
+        async for event in self.sub_agents[0].run_async(ctx):
+            yield event
+
+
 class EscalateIfSufficient(BaseAgent):
     """Loop-exit sub-agent.
 
@@ -167,3 +228,7 @@ class EscalateIfSufficient(BaseAgent):
 
 
 escalator_agent = EscalateIfSufficient(name="loop_escalator")
+
+# The loop wires the GATE (not the raw critic): deterministic abstention pass,
+# critic LLM for everything else.
+critic_gate = CriticGate(name="critic_gate", sub_agents=[critic_agent])
