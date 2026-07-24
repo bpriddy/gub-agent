@@ -130,8 +130,11 @@ critic_agent = LlmAgent(
     # The critic REASONS through its remaining checks (entity↔call coverage,
     # closure, grounding, recency) in thinking tokens, then emits only the
     # two-axis decision below — a bare output_schema leaves no room to reason.
+    # Thinking capped at LOW: it's a checklist judge, and unbounded thinking
+    # measured 13-16s per turn (~29% of total latency) with no observed
+    # quality benefit over a short deliberation. Executor keeps dynamic.
     # Thought summaries are emitted for debugging when EMIT_THINKING is set.
-    planner=build_thinking_planner(),
+    planner=build_thinking_planner(thinking_level="LOW"),
     output_schema=CriticVerdict,
     output_key="critic_verdict",
 )

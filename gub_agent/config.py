@@ -48,12 +48,22 @@ AGENT_NAME: str = os.environ.get("AGENT_NAME", "gub_agent")
 EMIT_THINKING: bool = os.environ.get("EMIT_THINKING", "false").lower() in ("1", "true", "yes")
 
 
-def build_thinking_planner() -> BuiltInPlanner:
-    """Native dynamic-thinking planner shared by the executor and critic.
+def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
+    """Native thinking planner shared by the executor and critic.
 
-    Always lets the model think (dynamic budget); emits the thought summaries
-    only when EMIT_THINKING is set.
+    Default (thinking_level=None): dynamic budget — the model thinks as much
+    as it wants. Pass a level ('MINIMAL'/'LOW'/'MEDIUM'/'HIGH', the 3-series
+    knob) to cap it — the critic runs at LOW because it's a checklist judge
+    whose unbounded thinking measured 13-16s/turn (~29% of a whole turn).
+    Thought summaries are emitted only when EMIT_THINKING is set.
     """
+    if thinking_level is not None:
+        return BuiltInPlanner(
+            thinking_config=genai_types.ThinkingConfig(
+                thinking_level=thinking_level,
+                include_thoughts=EMIT_THINKING,
+            ),
+        )
     return BuiltInPlanner(
         thinking_config=genai_types.ThinkingConfig(
             thinking_budget=-1,
