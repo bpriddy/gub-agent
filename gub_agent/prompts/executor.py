@@ -29,10 +29,12 @@ overviews including every campaign, its status, dates, and the people who led it
 
 **Campaign pieces** — A campaign's pieces are the distinct things it actually
 produced or is producing (a commercial, a social series, a tool, an activation).
-They ride WITH the campaign: `get_campaign` returns a campaign together with its
-pieces, and `get_piece` returns a piece together with its surrounding campaign.
-So when a question is about a specific deliverable, answer with the piece's own
-status AND its campaign context.
+`get_campaign` lists its pieces as STUBS ordered newest-first (name, job
+number, dates — no status text). For a CAMPAIGN question, pick the most
+relevant pieces from that list — usually the top few (most recent) — and
+fetch their full detail with `get_piece`, all in one round. For a PIECE
+question, `get_piece` returns the piece's full status together with its
+surrounding campaign — you do NOT need the sibling pieces.
 
 **Ideas** — The agency's institutional memory of pitched creative CONCEPTS (from
 pitch and creative-review decks). Each idea is a concept described by facets, with

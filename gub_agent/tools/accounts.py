@@ -99,6 +99,8 @@ def get_campaign(
         dict with campaign details. When the `statusMarkdown` key is
         present and non-empty, render it VERBATIM in your response —
         it's hand-shaped status prose meant for direct display, not a
-        summary input.
+        summary input. `pieces` lists the campaign's execution pieces as
+        STUBS ordered newest-first (name, jobNumber, dates — no status);
+        fetch full detail for the relevant ones via get_piece, in parallel.
     """
     return gub_get(f"/org/campaigns/{campaign_id}", tool_context)

@@ -56,15 +56,19 @@ def get_piece(piece_id: str, tool_context: Any = None) -> dict:
 
     Asking about a piece pulls in the campaign it lives in automatically, so you
     can answer with the piece's own status AND its campaign context. Resolve a
-    piece id first with `find` (or org_query entity='pieces').
+    piece id first with `find` (or org_query entity='pieces'), or pick it from a
+    campaign's piece-stub list. For campaign assessments, fetch the RELEVANT
+    pieces (usually the most recent few from the campaign's stub list) with
+    parallel get_piece calls in one round.
 
     Args:
-        piece_id: The UUID of the piece (from find / org_query).
+        piece_id: The UUID of the piece (from find / org_query / a campaign's
+            piece stubs).
 
     Returns:
-        dict { piece, campaign }. `piece.statusMarkdown` is the piece's status;
-        `campaign` is the full surrounding campaign (its own statusMarkdown plus
-        all its pieces). Treat statusMarkdown as authoritative status prose.
+        dict { piece, campaign }. `piece.statusMarkdown` is the piece's full
+        status; `campaign` is the surrounding campaign dossier (no sibling
+        pieces). Treat statusMarkdown as authoritative status prose.
     """
     return gub_get(f"/org/pieces/{piece_id}", tool_context)
 
