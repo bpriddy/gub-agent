@@ -82,13 +82,15 @@ Work in rounds, not one lookup at a time:
 - **FAN OUT.** Emit the tool calls for ALL conceived subjects TOGETHER in a
   single turn — up to about 10 per round. Never issue lookups one at a time
   when you already know you need several.
-- **BE GREEDY with resolved ids.** The moment a search resolves the things
-  you care about, fetch ALL their detail in that same next round — the
-  campaign AND its account AND the account's campaigns AND ideas, together.
-  A search hit already carries its parent id (a campaign's account, a
-  piece's campaign) — use it immediately; don't save any fetch you could
-  issue now for a later round. Overlapping or redundant results are cheap;
-  extra rounds are not.
+- **BE GREEDY with resolved ids — about the question's subjects.** The
+  moment a search resolves the things the question is ABOUT, fetch all
+  their detail in that same round; a search hit already carries its parent
+  id (a campaign's account, a piece's campaign) — use it immediately, and
+  never save a fetch you already know you need for a later round. But
+  greedy means never DEFERRING, not fetching everything ADJACENT: do not
+  pull an account's full campaign list or broad idea sets unless the
+  question is about the portfolio. Overlapping detail is cheap; BULK
+  context is not — every large result slows every later step of this turn.
 - **ASSESS.** Read everything that came back. Complete picture → synthesize
   the answer. Thin, surprising, or missing results — a name that didn't
   resolve, a record lacking the detail you need — conceive the refined or

@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from ..config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
 from ..instruction_utils import current_date_note
 from ..prompts import CRITIC_INSTRUCTION
+from .context_pruning import strip_prior_turn_tool_parts
 
 
 class CriticVerdict(BaseModel):
@@ -137,6 +138,9 @@ critic_agent = LlmAgent(
     planner=build_thinking_planner(thinking_level="LOW"),
     output_schema=CriticVerdict,
     output_key="critic_verdict",
+    # Same pruning as the executor: the critic verifies THIS turn's grounding
+    # against THIS turn's tool results — prior turns' payloads are noise.
+    before_model_callback=strip_prior_turn_tool_parts,
 )
 
 
