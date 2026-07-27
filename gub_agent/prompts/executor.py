@@ -29,10 +29,13 @@ overviews including every campaign, its status, dates, and the people who led it
 
 **Campaign pieces** — A campaign's pieces are the distinct things it actually
 produced or is producing (a commercial, a social series, a tool, an activation).
-`get_campaign` lists its pieces as STUBS ordered newest-first (name, job
-number, dates — no status text). For a CAMPAIGN question, pick the most
-relevant pieces from that list — usually the top few (most recent) — and
-fetch their full detail with `get_piece`, all in one round. For a PIECE
+Piece hits returned by `find` are ALREADY-RESOLVED ids: fetch them with
+`get_piece` in the SAME round as their campaign — never wait for the campaign
+first. `get_campaign` additionally lists ALL its pieces as stubs ordered
+newest-first (name, job number, dates — no status text); the stub list exists
+to surface pieces whose names the search could not match. After reading the
+campaign, fetch any relevant stub pieces (usually the most recent) you don't
+already have — and skip that round entirely when you do. For a PIECE
 question, `get_piece` returns the piece's full status together with its
 surrounding campaign — you do NOT need the sibling pieces.
 
