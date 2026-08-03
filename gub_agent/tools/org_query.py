@@ -16,7 +16,7 @@ from typing import Any
 from ._client import gub_post
 
 
-def org_query(
+async def org_query(
     entity: str,
     filter: dict | None = None,
     sort: list[dict] | None = None,
@@ -171,4 +171,4 @@ def org_query(
         body["aggregate"] = aggregate
     if limit is not None:
         body["limit"] = limit
-    return gub_post("/org/query", body, tool_context)
+    return await gub_post("/org/query", body, tool_context)

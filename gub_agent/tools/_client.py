@@ -11,8 +11,9 @@ All GUB API calls go through gub_get() / gub_post() which pick the right mode
 automatically. Tool functions never need to think about auth.
 
 Every request — token exchange included — goes through one shared
-httpx.Client so connections are pooled and reused instead of being torn
-down per call. Timeout and pool tuning live in TIMEOUT / LIMITS below.
+httpx.AsyncClient so connections are pooled and reused instead of being
+torn down per call, and the event loop is never blocked while a request
+is in flight. Timeout and pool tuning live in TIMEOUT / LIMITS below.
 """
 
 from __future__ import annotations
@@ -31,28 +32,27 @@ logger = logging.getLogger(__name__)
 TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
 LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=100)
 
-_client: httpx.Client | None = None
+_client: httpx.AsyncClient | None = None
 
 
-def _get_client() -> httpx.Client:
+def _get_client() -> httpx.AsyncClient:
     """Return the shared client, creating it lazily on first use."""
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.Client(timeout=TIMEOUT, limits=LIMITS)
+        _client = httpx.AsyncClient(http2=True, timeout=TIMEOUT, limits=LIMITS)
     return _client
 
-
-def close_client() -> None:
+async def aclose_client() -> None:
     """Close the shared client (tests / graceful shutdown)."""
     global _client
     if _client is not None and not _client.is_closed:
-        _client.close()
+        await _client.aclose()
     _client = None
 
 
 # ── Token resolution ──────────────────────────────────────────────────────────
 
-def _resolve_gub_jwt(tool_context: Any | None) -> str:
+async def _resolve_gub_jwt(tool_context: Any | None) -> str:
     """
     Resolve a valid GUB JWT for this request.
 
@@ -90,7 +90,7 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
             google_access_token = state_dict.get(GUB_AUTHORIZATION_ID)
             if google_access_token and isinstance(google_access_token, str):
                 logger.warning("Found OAuth token via to_dict()['%s']", GUB_AUTHORIZATION_ID)
-                gub_jwt = _exchange_google_token(google_access_token)
+                gub_jwt = await _exchange_google_token(google_access_token)
                 tool_context.state["gub_jwt"] = gub_jwt
                 return gub_jwt
             elif google_access_token:
@@ -107,7 +107,7 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
             google_access_token = (gub_auth.get("token") or {}).get("access_token")
             if google_access_token:
                 logger.info("Found OAuth token via auth_tokens['%s']", GUB_AUTHORIZATION_ID)
-                gub_jwt = _exchange_google_token(google_access_token)
+                gub_jwt = await _exchange_google_token(google_access_token)
                 tool_context.state["gub_jwt"] = gub_jwt
                 return gub_jwt
         except Exception as e:
@@ -118,7 +118,7 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
             temp_token = tool_context.state.get(f"temp:{GUB_AUTHORIZATION_ID}")
             if temp_token and isinstance(temp_token, str):
                 logger.info("Found OAuth token via temp:%s", GUB_AUTHORIZATION_ID)
-                gub_jwt = _exchange_google_token(temp_token)
+                gub_jwt = await _exchange_google_token(temp_token)
                 tool_context.state["gub_jwt"] = gub_jwt
                 return gub_jwt
         except Exception as e:
@@ -136,13 +136,13 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
     )
 
 
-def _exchange_google_token(google_access_token: str) -> str:
+async def _exchange_google_token(google_access_token: str) -> str:
     """
     Exchange a Google OAuth access token for a GUB JWT via the broker endpoint.
     GUB verifies the token with Google's userinfo endpoint, then issues its own JWT.
     """
     client = _get_client()
-    resp = client.post(
+    resp = await client.post(
         f"{GUB_BASE_URL}/auth/google/access-token-exchange",
         json={"accessToken": google_access_token},
     )
@@ -159,7 +159,7 @@ def _exchange_google_token(google_access_token: str) -> str:
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-def gub_get(
+async def gub_get(
     path: str,
     tool_context: Any | None = None,
     **params: Any,
@@ -170,12 +170,12 @@ def gub_get(
     Non-None query params are forwarded as URL query parameters.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
-    jwt = _resolve_gub_jwt(tool_context)
+    jwt = await _resolve_gub_jwt(tool_context)
     clean_params = {k: v for k, v in params.items() if v is not None}
 
     client = _get_client()
     try:
-        resp = client.get(
+        resp = await client.get(
             f"{GUB_BASE_URL}{path}",
             headers={"Authorization": f"Bearer {jwt}"},
             params=clean_params,
@@ -194,7 +194,7 @@ def gub_get(
         return {"error": True, "status": 0, "message": f"Could not reach GUB backend: {exc}"}
 
 
-def gub_post(
+async def gub_post(
     path: str,
     body: dict,
     tool_context: Any | None = None,
@@ -203,11 +203,11 @@ def gub_post(
     Make an authenticated POST request to the GUB backend.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
-    jwt = _resolve_gub_jwt(tool_context)
+    jwt = await _resolve_gub_jwt(tool_context)
 
     client = _get_client()
     try:
-        resp = client.post(
+        resp = await client.post(
             f"{GUB_BASE_URL}{path}",
             headers={"Authorization": f"Bearer {jwt}"},
             json=body,
