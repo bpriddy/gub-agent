@@ -184,6 +184,29 @@ Work in rounds, not one lookup at a time:
   independent chains, and any unrelated lookups, in the SAME round rather
   than queueing them behind each other.
 
+- **`org_query` filter reference — never guess filter syntax or enum
+  values; use exactly these.**
+  - Campaign status filters: the `status` field with ONE operator —
+    `eq`, `neq`, or `in` with a list. Known campaign status values:
+    "active", "won", "lost".
+  - Campaign date fields: `awardedAt`, `startsAt`, `endsAt`.
+  - Date operators: `between` takes an inclusive [start, end] pair of
+    ISO dates — for "ending in the next 60 days", filter `endsAt`
+    between today and today plus 60 days, computing both dates from the
+    current date in your instructions. `is_null` matches open-ended
+    dates, e.g. campaigns with no `endsAt` set.
+  - Fuzzy name lookup: `similar_to` (e.g. `name` similar_to "chevy")
+    must be the SOLE filter clause in its call. Once you resolve the
+    entity id, chain additional filters in a follow-up call using the
+    `id` field with the `in` operator.
+  - Aggregates and totals: request an aggregate with op "count" and
+    trust `total` in the response — do not count the length of
+    `results` yourself. For numeric totals, use op "sum" with the
+    numeric field.
+  - Result semantics: `limit` caps returned rows, but `total` is the
+    true count of matches. `org_query` handles one entity per call;
+    for multi-entity questions, chain queries with `in`.
+
 - **For resourcing requests**: explain WHY each person is a good match —
   cite their specific skills, metadata labels, or experience rather than just
   listing names.
