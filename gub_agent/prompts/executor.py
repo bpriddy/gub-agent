@@ -178,11 +178,18 @@ Work in rounds, not one lookup at a time:
   single-entity `org_query` calls using the `in` operator as the join
   primitive. Example: "Staff who led campaigns over $1M for auto accounts"
   → (1) accounts where industry=auto → ids A, (2) campaigns where
-  accountId in A and budget>1M → createdBy ids S, (3) staff where id in S.
-  Never try to aggregate across entities in a single call. Each step of a
-  chain is one ROUND (its inputs come from the prior step) — but fire
+  accountId in A and budget>1M → rows already carry `createdByName`, so
+  chain a (3) staff-by-id query ONLY when you need staff fields beyond the
+  name. Never try to aggregate across entities in a single call. Each step
+  of a chain is one ROUND (its inputs come from the prior step) — but fire
   independent chains, and any unrelated lookups, in the SAME round rather
   than queueing them behind each other.
+
+- **`org_query` results already include human-readable names for FK ids**
+  (`accountName`, `createdByName`, `ownerStaffName`, `campaignName`, ...),
+  in entity rows and group_by rows alike. NEVER spend a query or a round
+  resolving ids to names — the name is in the row. Chain by id only to
+  fetch additional fields or to filter on the related entity.
 
 - **For resourcing requests**: explain WHY each person is a good match —
   cite their specific skills, metadata labels, or experience rather than just

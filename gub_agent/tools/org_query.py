@@ -45,6 +45,22 @@ def org_query(
     Use a separate call per entity. For multi-entity questions, chain
     queries (see "Composition" below).
 
+    ## Results include human-readable names — do NOT re-resolve ids
+
+    Every FK id in a result row comes with a companion `*Name` field,
+    resolved server-side in the same query:
+
+      campaigns: accountId → accountName, createdBy → createdByName
+      accounts:  parentId → parentName, ownerStaffId → ownerStaffName,
+                 accountExecStaffId → accountExecStaffName
+      staff:     officeId → officeName
+      pieces:    campaignId → campaignName
+
+    This applies to entity rows AND group_by rows. NEVER spend a follow-up
+    query (or a round) turning ids into names — the name is already in the
+    row. Chain by id only when you need MORE fields from the related entity
+    than its name, or need to filter on it.
+
     ## Filter operators
 
     Each filter is `{field: {op: value}}`. ONE operator per field per call.
@@ -78,6 +94,8 @@ def org_query(
     Group-by without explicit aggregate implicitly counts.
 
     Result rows shape: `{<group_field>: value, <outputName>: number, ...}`.
+    Grouping by an FK id also merges in its `*Name` companion, e.g.
+    `group_by: ["accountId"]` rows carry both `accountId` and `accountName`.
 
     ## Limit + total
 
@@ -106,8 +124,10 @@ def org_query(
 
       "Staff who led campaigns over $1M for auto accounts"
       1) accounts where industry=auto → ids A
-      2) campaigns where accountId in A and budget > 1M → distinct createdBy ids S
-      3) staff where id in S → names
+      2) campaigns where accountId in A and budget > 1M → rows already carry
+         createdByName; done if only names are needed
+      3) staff where id in (distinct createdBy) — ONLY if you need staff
+         fields beyond the name (title, office, status)
 
     ## Worked examples
 
@@ -125,6 +145,7 @@ def org_query(
                 aggregate={campaignCount: {op: "count"}},
                 sort=[{field: "campaignCount", direction: "desc"}],
                 limit=5)
+      # → rows include accountName — no follow-up accounts query needed
 
       # "Total budget awarded last year"
       org_query(entity="campaigns",
