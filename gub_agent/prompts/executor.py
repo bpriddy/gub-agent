@@ -188,8 +188,9 @@ Work in rounds, not one lookup at a time:
   values; use exactly these.**
   - Campaign status filters: the `status` field with ONE operator —
     `eq`, `neq`, or `in` with a list. Known campaign status values:
-    "active", "won", "lost".
-  - Campaign date fields: `awardedAt`, `startsAt`, `endsAt`.
+    "pitch", "awarded", "live", "complete". Known account status values:
+    "active", "prospect", "dormant".
+  - Campaign date fields: `awardedAt`, `liveAt`, `endsAt`.
   - Date operators: `between` takes an inclusive [start, end] pair of
     ISO dates — for "ending in the next 60 days", filter `endsAt`
     between today and today plus 60 days, computing both dates from the
