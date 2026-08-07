@@ -69,7 +69,14 @@ async def get_account_overview(
     account, campaigns_resp = await asyncio.gather(
         gub_get(f"/org/accounts/{account_id}", tool_context),
         gub_get(f"/org/accounts/{account_id}/campaigns", tool_context),
+        return_exceptions=True,
     )
+    # Re-raise only after both legs settle — an exception escaping mid-gather
+    # leaves the sibling task running with nobody to retrieve its result.
+    if isinstance(account, Exception):
+        raise account
+    if isinstance(campaigns_resp, Exception):
+        raise campaigns_resp
     if account.get("error"):
         return account
 

@@ -18,6 +18,7 @@ is in flight. Timeout and pool tuning live in TIMEOUT / LIMITS below.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -33,21 +34,32 @@ TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
 LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=100)
 
 _client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_client() -> httpx.AsyncClient:
-    """Return the shared client, creating it lazily on first use."""
-    global _client
-    if _client is None or _client.is_closed:
+    """Return the shared client, creating it lazily on first use.
+
+    Keyed on the running loop: a client's pool is bound to the loop that
+    opened its connections, and `is_closed` stays False when a loop is
+    discarded without `aclose_client()`.
+    """
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop is not loop:
         _client = httpx.AsyncClient(http2=True, timeout=TIMEOUT, limits=LIMITS)
+        _client_loop = loop
     return _client
 
+
 async def aclose_client() -> None:
-    """Close the shared client (tests / graceful shutdown)."""
-    global _client
+    """Close the shared client. No runtime caller today — tests use it per-run;
+    a graceful-shutdown hook can adopt it if the runtime ever exposes one."""
+    global _client, _client_loop
     if _client is not None and not _client.is_closed:
         await _client.aclose()
     _client = None
+    _client_loop = None
 
 
 # ── Token resolution ──────────────────────────────────────────────────────────

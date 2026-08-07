@@ -97,7 +97,14 @@ async def get_staff_profile(
     profile, metadata = await asyncio.gather(
         gub_get(f"/org/staff/{staff_id}", tool_context),
         gub_get(f"/org/staff/{staff_id}/metadata", tool_context),
+        return_exceptions=True,
     )
+    # Re-raise only after both legs settle — an exception escaping mid-gather
+    # leaves the sibling task running with nobody to retrieve its result.
+    if isinstance(profile, Exception):
+        raise profile
+    if isinstance(metadata, Exception):
+        raise metadata
     if profile.get("error"):
         return profile
 
