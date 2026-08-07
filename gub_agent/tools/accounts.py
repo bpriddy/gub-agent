@@ -9,12 +9,13 @@ Tools:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from ._client import gub_get
+from ._client import _resolve_gub_jwt, gub_get
 
 
-def list_accounts(
+async def list_accounts(
     query: str | None = None,
     limit: int = 20,
     tool_context: Any = None,
@@ -38,10 +39,10 @@ def list_accounts(
         dict with 'accounts' list. Each entry has id, name, and parent info
         for sub-accounts.
     """
-    return gub_get("/org/accounts", tool_context, q=query, limit=limit)
+    return await gub_get("/org/accounts", tool_context, q=query, limit=limit)
 
 
-def get_account_overview(
+async def get_account_overview(
     account_id: str,
     tool_context: Any = None,
 ) -> dict:
@@ -62,11 +63,23 @@ def get_account_overview(
         dict with account details and a nested 'campaigns' list.
         Each campaign includes id, name, status, createdAt, and createdByStaff.
     """
-    account = gub_get(f"/org/accounts/{account_id}", tool_context)
+    # Warm the session JWT cache before fanning out — on a cold session both
+    # gathered calls would miss it and fire two identical token exchanges.
+    await _resolve_gub_jwt(tool_context)
+    account, campaigns_resp = await asyncio.gather(
+        gub_get(f"/org/accounts/{account_id}", tool_context),
+        gub_get(f"/org/accounts/{account_id}/campaigns", tool_context),
+        return_exceptions=True,
+    )
+    # Re-raise only after both legs settle — an exception escaping mid-gather
+    # leaves the sibling task running with nobody to retrieve its result.
+    if isinstance(account, Exception):
+        raise account
+    if isinstance(campaigns_resp, Exception):
+        raise campaigns_resp
     if account.get("error"):
         return account
 
-    campaigns_resp = gub_get(f"/org/accounts/{account_id}/campaigns", tool_context)
     campaigns = (
         campaigns_resp.get("campaigns", campaigns_resp)
         if isinstance(campaigns_resp, dict) and not campaigns_resp.get("error")
@@ -76,7 +89,7 @@ def get_account_overview(
     return {**account, "campaigns": campaigns}
 
 
-def get_campaign(
+async def get_campaign(
     campaign_id: str,
     tool_context: Any = None,
 ) -> dict:
@@ -103,4 +116,4 @@ def get_campaign(
         STUBS ordered newest-first (name, jobNumber, dates — no status);
         fetch full detail for the relevant ones via get_piece, in parallel.
     """
-    return gub_get(f"/org/campaigns/{campaign_id}", tool_context)
+    return await gub_get(f"/org/campaigns/{campaign_id}", tool_context)

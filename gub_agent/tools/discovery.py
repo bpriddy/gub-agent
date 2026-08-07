@@ -15,7 +15,7 @@ from typing import Any
 from ._client import gub_get
 
 
-def find(query: str, tool_context: Any = None) -> dict:
+async def find(query: str, tool_context: Any = None) -> dict:
     """
     Discover WHAT a named thing is by fuzzy-matching it across every kind of org
     entity at once — accounts, campaigns, campaign pieces, ideas, and staff —
@@ -45,10 +45,10 @@ def find(query: str, tool_context: Any = None) -> dict:
         call; `parentId` is the account id (for a campaign) or the campaign id
         (for a piece). An empty list means nothing matched — say so, don't guess.
     """
-    return gub_get("/org/search", tool_context, q=query)
+    return await gub_get("/org/search", tool_context, q=query)
 
 
-def get_piece(piece_id: str, tool_context: Any = None) -> dict:
+async def get_piece(piece_id: str, tool_context: Any = None) -> dict:
     """
     Get a campaign piece — a distinct thing the campaign produced or is producing
     (a commercial, social series, tool, activation) — bundled with its
@@ -70,10 +70,10 @@ def get_piece(piece_id: str, tool_context: Any = None) -> dict:
         status; `campaign` is the surrounding campaign dossier (no sibling
         pieces). Treat statusMarkdown as authoritative status prose.
     """
-    return gub_get(f"/org/pieces/{piece_id}", tool_context)
+    return await gub_get(f"/org/pieces/{piece_id}", tool_context)
 
 
-def list_ideas(
+async def list_ideas(
     account_id: str | None = None,
     campaign_id: str | None = None,
     since: str | None = None,
@@ -109,7 +109,7 @@ def list_ideas(
         campaignName, awarded }. Requires the user to hold ideas access; without
         it the list is empty (not an error).
     """
-    return gub_get(
+    return await gub_get(
         "/org/ideas",
         tool_context,
         accountId=account_id,
@@ -120,7 +120,7 @@ def list_ideas(
     )
 
 
-def get_idea(idea_id: str, tool_context: Any = None) -> dict:
+async def get_idea(idea_id: str, tool_context: Any = None) -> dict:
     """
     Get a single idea (a pitched creative concept) by id — the detail path after
     `find` resolves a name to an idea.
@@ -132,4 +132,4 @@ def get_idea(idea_id: str, tool_context: Any = None) -> dict:
         dict { id, name, facets, pitchedAt, accountName, campaignName, awarded }.
         `facets` are the concept's description/arc. Empty when you lack ideas access.
     """
-    return gub_get(f"/org/ideas/{idea_id}", tool_context)
+    return await gub_get(f"/org/ideas/{idea_id}", tool_context)
