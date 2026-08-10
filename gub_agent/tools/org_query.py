@@ -50,9 +50,9 @@ async def org_query(
     Each filter is `{field: {op: value}}`. ONE operator per field per call.
     AND across multiple fields. For OR/range, use `in` or `between`.
 
-      eq          {status: {eq: "active"}}              equals
-      neq         {status: {neq: "lost"}}               not equals
-      in          {status: {in: ["active", "won"]}}     value in list
+      eq          {status: {eq: "live"}}                equals
+      neq         {status: {neq: "complete"}}           not equals
+      in          {status: {in: ["live", "awarded"]}}   value in list
       gt, gte     {budget: {gte: 100000}}               >, >=
       lt, lte     {budget: {lt: 50000}}                 <, <=
       between     {awardedAt: {between: ["2025-01-01","2025-12-31"]}}
@@ -88,6 +88,13 @@ async def org_query(
     RULE: for portfolio/analytics questions, prefer ONE rich org_query
     (multiple aggregates, multi-axis group_by, sort by aggregate) over many
     small calls.
+
+    CLOSURE: the grouped/aggregated rows ARE the answer to a comparison,
+    breakdown, or "how do X vs Y differ" question — synthesize directly from
+    them. Do NOT then fetch individual accounts, campaigns, or staff to
+    "enrich" a comparison: that re-introduces the per-entity fan-out the
+    aggregate just replaced. Drill into a single entity only if the user
+    asked about that specific one.
 
     ## Limit + total
 
@@ -174,9 +181,9 @@ async def org_query(
                 filter={awardedAt: {between: ["2025-01-01","2025-12-31"]}},
                 aggregate={total: {op: "sum", field: "budget"}})
 
-      # "Active campaigns sorted by budget"
+      # "Live campaigns sorted by budget"
       org_query(entity="campaigns",
-                filter={status: {eq: "active"}},
+                filter={status: {eq: "live"}},
                 sort=[{field: "budget", direction: "desc"}],
                 limit=20)
 
