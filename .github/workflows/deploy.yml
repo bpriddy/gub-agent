@@ -1,0 +1,78 @@
+# Deploy — update the Vertex AI Agent Engine in place via
+# `adk deploy agent_engine` (NOT Cloud Run, NOT Cloud Build — see README
+# "Deploy"). Same engine id every time, so callers (the Chat bot,
+# Agentspace/Gemini Enterprise) see no change.
+#
+# Auth is Workload Identity Federation (OIDC) — google-github-actions/auth
+# writes ADC credentials, which the ADK/Vertex SDK picks up automatically.
+# Required GitHub repository variables (incl. AGENT_ENGINE_ID): see CI-CD.md.
+#
+# Pre-deploy reminder (manual, from the README): grep prompt/instruction
+# strings for literal `{...}` — ADK's session-state injection KeyErrors on
+# any brace that isn't a real state key, visible only in engine logs.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      description:
+        description: What changed (stored as the engine revision description)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-agent-engine
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      # Without --agent_engine_id, adk deploy CREATES a brand-new engine and
+      # nothing points at it. Refuse to run rather than fork the deployment.
+      - name: Refuse to create a new engine
+        run: |
+          if [ -z "${{ vars.AGENT_ENGINE_ID }}" ]; then
+            echo "::error::AGENT_ENGINE_ID repository variable is not set — deploy would create a NEW Agent Engine instead of updating the existing one. See CI-CD.md."
+            exit 1
+          fi
+
+      - name: Install deploy dependencies
+        run: pip install -e ".[deploy]"
+
+      # --env_file bakes deploy-dev.env (EMIT_THINKING=1) into the engine,
+      # matching the current dev deploy convention. --region controls where
+      # the engine RESOURCE lives; model calls stay on the global endpoint
+      # via config (see README "Model endpoint vs engine region").
+      - name: Deploy to Vertex AI Agent Engine
+        run: |
+          DESC="${{ github.event.inputs.description }}"
+          [ -n "$DESC" ] || DESC="GitHub Actions deploy ${GITHUB_SHA::7}"
+          adk deploy agent_engine \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --agent_engine_id="${{ vars.AGENT_ENGINE_ID }}" \
+            --display_name="gub-agent" \
+            --description="$DESC" \
+            --env_file=deploy-dev.env \
+            gub_agent
