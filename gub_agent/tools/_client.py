@@ -64,6 +64,7 @@ async def aclose_client() -> None:
 
 # ── Token resolution ──────────────────────────────────────────────────────────
 
+
 async def _resolve_gub_jwt(tool_context: Any | None) -> str:
     """
     Resolve a valid GUB JWT for this request.
@@ -88,8 +89,8 @@ async def _resolve_gub_jwt(tool_context: Any | None) -> str:
         except Exception as e:
             logger.info("auth debug — state.to_dict() failed: %s", e)
         try:
-            app_prefix = getattr(tool_context.state, 'APP_PREFIX', None)
-            temp_prefix = getattr(tool_context.state, 'TEMP_PREFIX', None)
+            app_prefix = getattr(tool_context.state, "APP_PREFIX", None)
+            temp_prefix = getattr(tool_context.state, "TEMP_PREFIX", None)
             logger.info("auth debug — APP_PREFIX=%s TEMP_PREFIX=%s", app_prefix, temp_prefix)
         except Exception:
             pass
@@ -107,8 +108,11 @@ async def _resolve_gub_jwt(tool_context: Any | None) -> str:
                 return gub_jwt
             elif google_access_token:
                 # Type only — the value may be a token-bearing structure.
-                logger.warning("State key '%s' exists but is type %s (expected str)",
-                            GUB_AUTHORIZATION_ID, type(google_access_token).__name__)
+                logger.warning(
+                    "State key '%s' exists but is type %s (expected str)",
+                    GUB_AUTHORIZATION_ID,
+                    type(google_access_token).__name__,
+                )
         except Exception as e:
             logger.warning("Error reading state via to_dict: %s", e)
 
@@ -171,6 +175,7 @@ async def _exchange_google_token(google_access_token: str) -> str:
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
+
 
 async def gub_get(
     path: str,

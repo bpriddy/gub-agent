@@ -22,7 +22,9 @@ os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
 
 # ── GUB backend ───────────────────────────────────────────────────────────────
 # URL of the GUB backend this agent calls for data.
-GUB_BASE_URL: str = os.environ.get("GUB_BASE_URL", "https://gcp-universal-backend-dev-843516467880.us-central1.run.app")
+GUB_BASE_URL: str = os.environ.get(
+    "GUB_BASE_URL", "https://gcp-universal-backend-dev-843516467880.us-central1.run.app"
+)
 
 # Service JWT for local dev and CI — bypasses the Gemini Enterprise OAuth flow.
 # In production (Gemini Enterprise), the JWT is obtained dynamically via
