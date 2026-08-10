@@ -71,13 +71,23 @@ async def org_query(
 
     ## Group-by + aggregate (analytics)
 
-    `group_by: ["status"]` groups results by that field.
+    `group_by: ["status"]` groups results by that field. Multi-axis grouping
+    is supported: `group_by: ["status", "industry"]` → one row per
+    combination.
     `aggregate: {<outputName>: {op: "count"|"sum"|"avg"|"min"|"max", field?: "budget"}}`
+    MULTIPLE aggregates in one call are supported — one output name each:
+    `aggregate: {n: {op: "count"}, spend: {op: "sum", field: "budget"}}`.
 
     `count` takes no field. `sum/avg/min/max` require a numeric or date field.
     Group-by without explicit aggregate implicitly counts.
 
-    Result rows shape: `{<group_field>: value, <outputName>: number, ...}`.
+    Result rows shape: `{<group_field(s)>: value, <outputName>: number, ...}`,
+    and `sort` may reference any aggregate output name (e.g. sort by `spend`
+    desc, limit 5 → top-5 ranking computed in the DB).
+
+    RULE: for portfolio/analytics questions, prefer ONE rich org_query
+    (multiple aggregates, multi-axis group_by, sort by aggregate) over many
+    small calls.
 
     ## Limit + total
 
@@ -119,12 +129,45 @@ async def org_query(
                 aggregate={count: {op: "count"}})
       # → results: [{count: 7}], total: 1
 
-      # "Top 5 accounts by campaign count"
+      # "Top 5 accounts by campaign count" — top-N by aggregate: rank in the
+      # DB by sorting on the aggregate OUTPUT NAME. Extra aggregates ride
+      # along in the same call.
       org_query(entity="campaigns",
                 group_by=["accountId"],
-                aggregate={campaignCount: {op: "count"}},
+                aggregate={campaignCount: {op: "count"},
+                           totalBudget: {op: "sum", field: "budget"}},
                 sort=[{field: "campaignCount", direction: "desc"}],
                 limit=5)
+      # → [{accountId: "...", campaignCount: 9, totalBudget: 4200000}, ...]
+      # then ONE follow-up accounts query with id in [...] for names.
+
+      # "Who owns the most accounts?" — same top-N pattern on accounts
+      org_query(entity="accounts",
+                group_by=["ownerStaffId"],
+                aggregate={accountCount: {op: "count"}},
+                sort=[{field: "accountCount", direction: "desc"}],
+                limit=5)
+      # → then ONE staff query with id in [...] for names. TWO calls total.
+
+      # "How do active vs prospect vs inactive accounts differ?" — one
+      # multi-axis call gives the whole comparison grid; do NOT query each
+      # status separately.
+      org_query(entity="accounts",
+                group_by=["status", "industry"],
+                aggregate={accounts: {op: "count"}},
+                sort=[{field: "accounts", direction: "desc"}])
+      # → [{status: "active", industry: "auto", accounts: 4}, ...]
+
+      # "Portfolio rollup: volume, spend, and recency per account" — SEVERAL
+      # metrics per group in ONE call
+      org_query(entity="campaigns",
+                group_by=["accountId", "status"],
+                aggregate={n: {op: "count"},
+                           spend: {op: "sum", field: "budget"},
+                           avgBudget: {op: "avg", field: "budget"},
+                           latestEnd: {op: "max", field: "endsAt"}},
+                sort=[{field: "spend", direction: "desc"}])
+      # → one row per (account, status) with all four metrics attached.
 
       # "Total budget awarded last year"
       org_query(entity="campaigns",
