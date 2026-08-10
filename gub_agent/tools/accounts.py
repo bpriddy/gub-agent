@@ -49,11 +49,20 @@ def get_account_overview(
     Get a full overview of a client account: details plus all campaigns.
 
     Returns the account record together with every campaign associated with it,
-    including campaign name, status, dates, and the staff who created each one.
+    including each campaign's name, status, dates, a short statusSummary, and
+    the staff who created it.
 
     Use this when asked about a specific client, their campaign history,
     or what work the agency has done for them. Requires the account UUID —
     use list_accounts first if you only have a name.
+
+    The nested campaigns ALREADY carry `status` and a `statusSummary` for every
+    campaign. For an ASSESSMENT question ("how is this account doing", "what's
+    the status", a health/overview read), the status + statusSummary here is
+    SUFFICIENT — synthesize your answer from this response alone and do NOT call
+    `get_campaign` per campaign. Call `get_campaign` ONLY when the user asks
+    about ONE specific campaign in depth, or explicitly wants a campaign's
+    pieces — never as a blanket follow-up across every campaign in the list.
 
     Args:
         account_id: The UUID of the account
