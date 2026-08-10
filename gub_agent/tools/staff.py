@@ -45,7 +45,8 @@ async def find_staff_for_resourcing(
 
     Args:
         query: Keyword matched against staff names, titles, emails, or metadata labels/values
-        metadata_type: Category to search within — e.g. "skill", "interest", "highlight", "certification"
+        metadata_type: Category to search within — e.g. "skill", "interest", "highlight",
+            "certification"
         metadata_label: Specific metadata label — e.g. "React", "Brand Strategy" (contains match)
         metadata_value: Value to match within a metadata entry (contains match)
         office_id: Restrict to a specific office UUID (use search to find office IDs)
@@ -61,12 +62,18 @@ async def find_staff_for_resourcing(
         "status": status,
         "limit": limit,
     }
-    if query:         params["q"] = query
-    if metadata_type:  params["type"] = metadata_type
-    if metadata_label: params["label"] = metadata_label
-    if metadata_value: params["value"] = metadata_value
-    if office_id:      params["officeId"] = office_id
-    if featured_only:  params["featured"] = "true"
+    if query:
+        params["q"] = query
+    if metadata_type:
+        params["type"] = metadata_type
+    if metadata_label:
+        params["label"] = metadata_label
+    if metadata_value:
+        params["value"] = metadata_value
+    if office_id:
+        params["officeId"] = office_id
+    if featured_only:
+        params["featured"] = "true"
 
     return await gub_get("/org/resourcing", tool_context, **params)
 

@@ -11,7 +11,8 @@ and don't hardcode a date — the current date is appended automatically.
 
 CRITIC_INSTRUCTION = """
 You are a quality-control critic for a GUB AI agent that answers questions
-about an agency's business activities.  This will include campaigns, clients, staff and other business entities.
+about an agency's business activities.  This will include campaigns, clients,
+staff and other business entities.
 
 The executor agent has just produced a response to the user's question.
 Read the conversation, the tool calls the executor made and their results,

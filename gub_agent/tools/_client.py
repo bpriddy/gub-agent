@@ -144,7 +144,8 @@ async def _resolve_gub_jwt(tool_context: Any | None) -> str:
 
     raise RuntimeError(
         "No GUB JWT available. Set GUB_SERVICE_JWT for local dev, or ensure "
-        f"Gemini Enterprise is injecting an OAuth token under authorization ID '{GUB_AUTHORIZATION_ID}'."
+        f"Gemini Enterprise is injecting an OAuth token under authorization ID "
+        f"'{GUB_AUTHORIZATION_ID}'."
     )
 
 
