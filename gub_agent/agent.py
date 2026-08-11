@@ -24,6 +24,7 @@ there); the critic's lives in `prompts/critic.py`.
 
 from google.adk.agents import Agent, LoopAgent
 
+from .agents.circuit_breaker import circuit_breaker
 from .agents.context_pruning import strip_prior_turn_tool_parts
 from .agents.critic import critic_gate, escalator_agent
 from .config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
@@ -42,6 +43,9 @@ executor_agent = Agent(
     # Prior turns keep their prose, lose their tool payloads (see
     # context_pruning.py) — dead weight by the re-query doctrine.
     before_model_callback=strip_prior_turn_tool_parts,
+    # Dedupe repeated calls + hard per-turn tool budget (see circuit_breaker.py)
+    # — kills runaway fan-out (measured 15-20 calls on analytical/resourcing Q).
+    before_tool_callback=circuit_breaker,
 )
 
 # Wrap [executor → critic-gate → escalator] in a LoopAgent. The gate skips
