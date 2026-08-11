@@ -43,6 +43,41 @@ def _has_user_text(content: Any) -> bool:
     )
 
 
+# Keys that are pure tool plumbing — the executor/critic prompts already tell
+# the model these are for grounding infrastructure and MUST NOT appear in prose.
+# `_sources` (Drive file citations) measured at 512k chars / 128k tokens for ONE
+# account overview (3,257 file refs) — re-sent every ReAct round. Dead weight.
+_PLUMBING_KEYS = ("_sources",)
+
+
+def _scrub_plumbing(obj: Any) -> None:
+    """Recursively delete plumbing keys from a tool-response payload in place."""
+    if isinstance(obj, dict):
+        for k in _PLUMBING_KEYS:
+            obj.pop(k, None)
+        for v in obj.values():
+            _scrub_plumbing(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _scrub_plumbing(v)
+
+
+def strip_source_metadata(callback_context: Any, llm_request: Any) -> None:
+    """Observation masking: drop `_sources` citation plumbing from every tool
+    response in the request. The model is instructed to ignore it (see
+    prompts/executor.py, prompts/critic.py), yet it dominates prompt size on
+    portfolio questions — one account overview carried 128k tokens of file refs,
+    re-sent each round. Stripping it is loss-free for the answer and roughly
+    halves prompt tokens on the heavy questions."""
+    for content in (llm_request.contents or []):
+        for part in (content.parts or []):
+            fr = getattr(part, "function_response", None)
+            resp = getattr(fr, "response", None) if fr is not None else None
+            if isinstance(resp, dict):
+                _scrub_plumbing(resp)
+    return None
+
+
 def strip_prior_turn_tool_parts(callback_context: Any, llm_request: Any) -> None:
     """Drop function_call/function_response parts from pre-current-turn content."""
     contents = llm_request.contents or []

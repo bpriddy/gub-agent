@@ -25,7 +25,7 @@ there); the critic's lives in `prompts/critic.py`.
 from google.adk.agents import Agent, LoopAgent
 
 from .agents.circuit_breaker import circuit_breaker
-from .agents.context_pruning import strip_prior_turn_tool_parts
+from .agents.context_pruning import strip_prior_turn_tool_parts, strip_source_metadata
 from .agents.critic import critic_gate, escalator_agent
 from .agents.round_limiter import round_limit
 from .config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
@@ -35,9 +35,11 @@ from .tools import ALL_TOOLS
 
 
 def _before_model(callback_context, llm_request):
-    """Chain the two model-level guards: prune prior tool payloads, then cap
-    ReAct rounds (strip tools past the budget)."""
+    """Chain the model-level guards: prune prior-turn tool payloads, mask
+    `_sources` citation plumbing from current-turn results, then cap ReAct
+    rounds (strip tools past the budget)."""
     strip_prior_turn_tool_parts(callback_context, llm_request)
+    strip_source_metadata(callback_context, llm_request)
     return round_limit(callback_context, llm_request)
 
 
