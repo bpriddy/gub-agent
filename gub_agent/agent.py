@@ -46,8 +46,11 @@ executor_agent = Agent(
     name=AGENT_NAME,
     # InstructionProvider — appends today's date deterministically per request.
     instruction=with_current_date(EXECUTOR_INSTRUCTION),
-    # Native dynamic thinking; emits thought summaries when EMIT_THINKING is set.
-    planner=build_thinking_planner(),
+    # Native thinking capped at MEDIUM. Unbounded (dynamic) thinking was the top
+    # latency driver (thinking_tokens ↔ elapsed r=0.86): hard questions ran away
+    # to 9-13k thought tokens / one 40s pause per step (pitch 70s @ 2 calls,
+    # chevy 77s). MEDIUM keeps room to reason while cutting the runaway tail.
+    planner=build_thinking_planner("MEDIUM"),
     tools=ALL_TOOLS,
     # Prune prior-turn tool payloads + cap ReAct rounds (context_pruning.py,
     # round_limiter.py) — the round cap forces synthesis instead of endless fan-out.
