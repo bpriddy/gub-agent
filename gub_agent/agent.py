@@ -27,10 +27,19 @@ from google.adk.agents import Agent, LoopAgent
 from .agents.circuit_breaker import circuit_breaker
 from .agents.context_pruning import strip_prior_turn_tool_parts
 from .agents.critic import critic_gate, escalator_agent
+from .agents.round_limiter import round_limit
 from .config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
 from .instruction_utils import with_current_date
 from .prompts import EXECUTOR_INSTRUCTION
 from .tools import ALL_TOOLS
+
+
+def _before_model(callback_context, llm_request):
+    """Chain the two model-level guards: prune prior tool payloads, then cap
+    ReAct rounds (strip tools past the budget)."""
+    strip_prior_turn_tool_parts(callback_context, llm_request)
+    return round_limit(callback_context, llm_request)
+
 
 executor_agent = Agent(
     model=GEMINI_MODEL,
@@ -40,11 +49,11 @@ executor_agent = Agent(
     # Native dynamic thinking; emits thought summaries when EMIT_THINKING is set.
     planner=build_thinking_planner(),
     tools=ALL_TOOLS,
-    # Prior turns keep their prose, lose their tool payloads (see
-    # context_pruning.py) — dead weight by the re-query doctrine.
-    before_model_callback=strip_prior_turn_tool_parts,
-    # Dedupe repeated calls + hard per-turn tool budget (see circuit_breaker.py)
-    # — kills runaway fan-out (measured 15-20 calls on analytical/resourcing Q).
+    # Prune prior-turn tool payloads + cap ReAct rounds (context_pruning.py,
+    # round_limiter.py) — the round cap forces synthesis instead of endless fan-out.
+    before_model_callback=_before_model,
+    # Dedupe repeated calls + per-turn tool budget (circuit_breaker.py) —
+    # reliability guard against true loops / runaway fan-out.
     before_tool_callback=circuit_breaker,
 )
 
