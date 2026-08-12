@@ -26,13 +26,15 @@ from google.adk.agents import Agent, LoopAgent
 
 from .agents.context_pruning import strip_prior_turn_tool_parts
 from .agents.critic import critic_gate, escalator_agent
-from .config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
+from .config import AGENT_NAME, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
 from .prompts import EXECUTOR_INSTRUCTION
 from .tools import ALL_TOOLS
 
 executor_agent = Agent(
-    model=GEMINI_MODEL,
+    # Model carries retry-with-backoff on 429/5xx (Dynamic Shared Quota); see
+    # config.build_model. A string here would disable retries (ADK default).
+    model=build_model(),
     name=AGENT_NAME,
     # InstructionProvider — appends today's date deterministically per request.
     instruction=with_current_date(EXECUTOR_INSTRUCTION),

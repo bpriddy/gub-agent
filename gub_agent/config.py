@@ -7,6 +7,7 @@ All values are read from environment variables (via .env for local dev).
 import os
 
 from dotenv import load_dotenv
+from google.adk.models import Gemini
 from google.adk.planners import BuiltInPlanner
 from google.genai import types as genai_types
 
@@ -68,5 +69,32 @@ def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
         thinking_config=genai_types.ThinkingConfig(
             thinking_budget=-1,
             include_thoughts=EMIT_THINKING,
+        ),
+    )
+
+
+def build_model() -> Gemini:
+    """Gemini model wired with truncated exponential backoff + jitter on 429/5xx.
+
+    gemini-3.5-flash on Vertex is served via Dynamic Shared Quota: a transient
+    429 RESOURCE_EXHAUSTED reflects shared-pool congestion, NOT a project quota
+    that can be raised. Google's required mitigation is client-side retry with
+    backoff. ADK/genai default to NO retries (one attempt), so a single
+    transient 429 kills the whole turn — the executor makes several model calls
+    per question, so the odds of one hitting congestion are real. HttpRetryOptions
+    adds tenacity-backed exponential backoff + jitter, retrying 429/408/5xx.
+
+    Bounds are chat-latency-aware: attempts=5 with max_delay=16s (vs the SDK's
+    60s) keeps a retried call within the bot's 120s stream budget. Most
+    congestion clears on the first retry; the higher ceiling is only a backstop.
+    """
+    return Gemini(
+        model=GEMINI_MODEL,
+        retry_options=genai_types.HttpRetryOptions(
+            attempts=5,
+            initial_delay=1.0,
+            max_delay=16.0,
+            exp_base=2.0,
+            jitter=1.0,
         ),
     )

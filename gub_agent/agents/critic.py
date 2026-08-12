@@ -32,7 +32,7 @@ from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import Event, EventActions
 from pydantic import BaseModel, Field
 
-from ..config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
+from ..config import AGENT_NAME, build_model, build_thinking_planner
 from ..instruction_utils import current_date_note
 from ..prompts import CRITIC_INSTRUCTION
 from .context_pruning import strip_prior_turn_tool_parts
@@ -122,7 +122,8 @@ def _critic_instruction(ctx: ReadonlyContext) -> str:
 
 
 critic_agent = LlmAgent(
-    model=GEMINI_MODEL,
+    # Retry-with-backoff on 429/5xx, same as the executor (config.build_model).
+    model=build_model(),
     name="critic",
     # InstructionProvider — injects the current date AND the deterministic
     # "was any tool called this turn" fact (computed from the event stream),
