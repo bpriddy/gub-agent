@@ -84,16 +84,22 @@ def build_model() -> Gemini:
     per question, so the odds of one hitting congestion are real. HttpRetryOptions
     adds tenacity-backed exponential backoff + jitter, retrying 429/408/5xx.
 
-    Bounds are chat-latency-aware: attempts=5 with max_delay=16s (vs the SDK's
-    60s) keeps a retried call within the bot's 120s stream budget. Most
-    congestion clears on the first retry; the higher ceiling is only a backstop.
+    Bounds are chat-latency-aware. Retry is PER CALL and a turn makes several
+    model calls with NO shared retry budget, so under sustained congestion the
+    per-call waits compound. attempts=3 (~3s of backoff per call worst case)
+    keeps that compounding well under the bot's 120s stream ceiling: a transient
+    blip still clears (most do on the first retry), but a genuinely overloaded
+    turn fails fast instead of dragging toward the timeout. Retriable codes are
+    the genai defaults (408/429/5xx) — genuine client errors (400/403/404) are
+    NOT retried. Retries are logged by genai at INFO (before_sleep); a dedicated
+    retry counter is a worthwhile follow-up for prod visibility.
     """
     return Gemini(
         model=GEMINI_MODEL,
         retry_options=genai_types.HttpRetryOptions(
-            attempts=5,
+            attempts=3,
             initial_delay=1.0,
-            max_delay=16.0,
+            max_delay=8.0,
             exp_base=2.0,
             jitter=1.0,
         ),
