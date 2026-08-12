@@ -24,14 +24,25 @@ there); the critic's lives in `prompts/critic.py`.
 
 from google.adk.agents import Agent, LoopAgent
 
-from .agents.circuit_breaker import circuit_breaker
+from .agents.circuit_breaker import circuit_breaker, reset_tool_budget
 from .agents.context_pruning import strip_prior_turn_tool_parts, strip_source_metadata
 from .agents.critic import critic_gate, escalator_agent
-from .agents.round_limiter import round_limit
+from .agents.round_limiter import reset_rounds, round_limit
 from .config import AGENT_NAME, GEMINI_MODEL, build_thinking_planner
 from .instruction_utils import with_current_date
 from .prompts import EXECUTOR_INSTRUCTION
 from .tools import ALL_TOOLS
+
+
+def _before_agent(callback_context):
+    """before_agent_callback — fires once per executor pass (LoopAgent runs the
+    executor's run_async each iteration). Reset the per-pass round + tool budgets
+    so a critic-requested retry starts fresh instead of inheriting the previous
+    pass's counts (which would open the retry already at the cap, tools stripped,
+    unable to make the call the critic asked for)."""
+    reset_rounds(callback_context)
+    reset_tool_budget(callback_context)
+    return None
 
 
 def _before_model(callback_context, llm_request):
@@ -54,6 +65,9 @@ executor_agent = Agent(
     # chevy 77s). MEDIUM keeps room to reason while cutting the runaway tail.
     planner=build_thinking_planner("MEDIUM"),
     tools=ALL_TOOLS,
+    # Reset the per-pass round + tool budgets at the start of each executor pass
+    # (so critic-requested retries aren't born over budget). See _before_agent.
+    before_agent_callback=_before_agent,
     # Prune prior-turn tool payloads + cap ReAct rounds (context_pruning.py,
     # round_limiter.py) — the round cap forces synthesis instead of endless fan-out.
     before_model_callback=_before_model,

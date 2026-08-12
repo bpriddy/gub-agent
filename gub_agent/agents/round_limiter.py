@@ -12,6 +12,12 @@ Mechanism: before_model_callback fires once per model round. We count rounds per
 invocation (ADK state doesn't persist plain writes between calls, so we key an
 in-process dict on invocation_id). Past the cap we clear llm_request.config.tools
 and tools_dict and append a directive to answer now.
+
+The budget is PER EXECUTOR PASS: reset_rounds() runs as the executor's
+before_agent_callback, so each LoopAgent retry iteration (the critic asked the
+executor to try again) starts with a fresh MAX_ROUNDS budget. Without the reset,
+a retry would inherit the first pass's count — often already at the cap — and
+open with tools already stripped, unable to make the call the critic requested.
 """
 
 from __future__ import annotations
@@ -39,6 +45,15 @@ def _tick(invocation_id: str) -> int:
     while len(_ROUNDS) > _MAX_TRACKED:
         _ROUNDS.popitem(last=False)
     return n
+
+
+def reset_rounds(callback_context: Any) -> None:
+    """ADK before_agent_callback: clear this invocation's round count so each
+    LoopAgent iteration (executor pass) starts with a fresh MAX_ROUNDS budget —
+    see module docstring."""
+    invocation_id = getattr(callback_context, "invocation_id", "") or "?"
+    _ROUNDS.pop(invocation_id, None)
+    return None
 
 
 def round_limit(callback_context: Any, llm_request: Any) -> None:
