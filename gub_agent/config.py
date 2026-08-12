@@ -86,8 +86,9 @@ def build_model() -> Gemini:
 
     Bounds are chat-latency-aware. Retry is PER CALL and a turn makes several
     model calls with NO shared retry budget, so under sustained congestion the
-    per-call waits compound. attempts=3 (~3s of backoff per call worst case)
-    keeps that compounding well under the bot's 120s stream ceiling: a transient
+    per-call waits compound. attempts=3 (up to ~5s of backoff per call worst
+    case — ~2s after the first failure, ~3s after the second) keeps that
+    compounding well under the bot's 120s stream ceiling: a transient
     blip still clears (most do on the first retry), but a genuinely overloaded
     turn fails fast instead of dragging toward the timeout. Retriable codes are
     the genai defaults (408/429/5xx) — genuine client errors (400/403/404) are
