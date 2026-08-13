@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Cap at 3 gathering rounds; the 4th model call has no tools and must synthesize.
 MAX_ROUNDS = 3
 
-_ROUNDS: "OrderedDict[str, int]" = OrderedDict()
+_ROUNDS: OrderedDict[str, int] = OrderedDict()
 _MAX_TRACKED = 256
 
 
