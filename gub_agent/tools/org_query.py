@@ -51,7 +51,7 @@ async def org_query(
     AND across multiple fields. For OR/range, use `in` or `between`.
 
       eq          {status: {eq: "live"}}                equals
-      neq         {status: {neq: "complete"}}           not equals
+      neq         {status: {neq: "ended"}}              not equals
       in          {status: {in: ["live", "awarded"]}}   value in list
       gt, gte     {budget: {gte: 100000}}               >, >=
       lt, lte     {budget: {lt: 50000}}                 <, <=
@@ -64,9 +64,10 @@ async def org_query(
                                                         filter; chain follow-ups by `id.in`.
       is_null     {endsAt: {is_null: true}}             field IS / IS NOT NULL
 
-    Status values are ENTITY-SPECIFIC: campaigns use `pitch`/`live`/`awarded`/
-    `complete` (the values shown above); accounts use `active`/`prospect`/
-    `inactive`. A value from the wrong entity silently matches nothing.
+    Status values are ENTITY-SPECIFIC (a value from the wrong entity silently
+    matches nothing): campaigns use `pitch`/`awarded`/`live`/`ended`/`lost`;
+    accounts use `active`/`inactive`/`prospect`; staff use `active`/`on_leave`/
+    `former`.
 
     ## Sort
 
