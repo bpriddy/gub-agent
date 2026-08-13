@@ -65,8 +65,14 @@ jobs:
       # the engine RESOURCE lives; model calls stay on the global endpoint
       # via config (see README "Model endpoint vs engine region").
       - name: Deploy to Vertex AI Agent Engine
+        # The dispatch input is passed as an ENV VALUE, never interpolated into
+        # the script text — otherwise a crafted `description` (workflow_dispatch
+        # only needs repo write) would run as arbitrary shell in a job already
+        # authenticated to GCP via WIF.
+        env:
+          DEPLOY_DESCRIPTION: ${{ github.event.inputs.description }}
         run: |
-          DESC="${{ github.event.inputs.description }}"
+          DESC="$DEPLOY_DESCRIPTION"
           [ -n "$DESC" ] || DESC="GitHub Actions deploy ${GITHUB_SHA::7}"
           adk deploy agent_engine \
             --project="${{ vars.GCP_PROJECT_ID }}" \
