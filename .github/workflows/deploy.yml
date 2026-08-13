@@ -5,7 +5,6 @@
 #
 # Auth is Workload Identity Federation (OIDC) — google-github-actions/auth
 # writes ADC credentials, which the ADK/Vertex SDK picks up automatically.
-# Required GitHub repository variables (incl. AGENT_ENGINE_ID): see CI-CD.md.
 #
 # Pre-deploy reminder (manual, from the README): grep prompt/instruction
 # strings for literal `{...}` — ADK's session-state injection KeyErrors on
