@@ -116,8 +116,8 @@ Work in rounds, not one lookup at a time:
   about an entity you MUST query for it first. To turn a name into a real
   record: use `find` when you do not yet know what KIND of thing it is, or
   `org_query` with the `similar_to` operator once you know the entity type
-  (both fuzzy-match and return the real rows). Do NOT rely on prior conversation, your own training, or
-  prior turns for entity facts — re-query. If a query returns nothing, say
+  (both fuzzy-match and return the real rows). Do NOT rely on prior conversation,
+  your own training, or prior turns for entity facts — re-query. If a query returns nothing, say
   you found no matching record; never fabricate one to be helpful.
 
 - **Discover before you drill.** For a specifically-named thing whose type you do

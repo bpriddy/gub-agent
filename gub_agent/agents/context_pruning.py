@@ -23,9 +23,7 @@ from google.genai import types as genai_types
 
 
 def _is_function_part(part: Any) -> bool:
-    return bool(
-        getattr(part, "function_call", None) or getattr(part, "function_response", None)
-    )
+    return bool(getattr(part, "function_call", None) or getattr(part, "function_response", None))
 
 
 def _has_user_text(content: Any) -> bool:
@@ -37,10 +35,7 @@ def _has_user_text(content: Any) -> bool:
     """
     if content.role != "user":
         return False
-    return any(
-        getattr(p, "text", None) and not _is_function_part(p)
-        for p in (content.parts or [])
-    )
+    return any(getattr(p, "text", None) and not _is_function_part(p) for p in (content.parts or []))
 
 
 # Keys that are pure tool plumbing — the executor/critic prompts already tell
