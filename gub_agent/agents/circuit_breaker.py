@@ -28,7 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any
 
 # Healthy questions use 2-8 calls; pathological fan-out hit 15-20. 8 leaves
 # legitimate multi-round work untouched while cutting the runaway tail. Tune
@@ -37,7 +37,7 @@ MAX_TOOL_CALLS = 8
 
 # invocation_id → {"count": int, "seen": set[str]}, reset per executor pass by
 # reset_tool_budget(). Bounded so many turns don't grow it without limit.
-_BUDGETS: "OrderedDict[str, dict]" = OrderedDict()
+_BUDGETS: OrderedDict[str, dict] = OrderedDict()
 _MAX_TRACKED = 256
 
 
@@ -60,7 +60,7 @@ def reset_tool_budget(callback_context: Any) -> None:
     return None
 
 
-def circuit_breaker(tool: Any, args: dict, tool_context: Any) -> Optional[dict]:
+def circuit_breaker(tool: Any, args: dict, tool_context: Any) -> dict | None:
     """ADK before_tool_callback: dedupe repeats and cap calls per executor pass."""
     invocation_id = getattr(tool_context, "invocation_id", "") or "?"
     budget = _budget(invocation_id)
