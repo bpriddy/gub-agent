@@ -24,12 +24,35 @@ there); the critic's lives in `prompts/critic.py`.
 
 from google.adk.agents import Agent, LoopAgent
 
-from .agents.context_pruning import strip_prior_turn_tool_parts
+from .agents.circuit_breaker import circuit_breaker, reset_tool_budget
+from .agents.context_pruning import strip_prior_turn_tool_parts, strip_source_metadata
 from .agents.critic import critic_gate, escalator_agent
+from .agents.round_limiter import reset_rounds, round_limit
 from .config import AGENT_NAME, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
 from .prompts import EXECUTOR_INSTRUCTION
 from .tools import ALL_TOOLS
+
+
+def _before_agent(callback_context):
+    """before_agent_callback — fires once per executor pass (LoopAgent runs the
+    executor's run_async each iteration). Reset the per-pass round + tool budgets
+    so a critic-requested retry starts fresh instead of inheriting the previous
+    pass's counts (which would open the retry already at the cap, tools stripped,
+    unable to make the call the critic asked for)."""
+    reset_rounds(callback_context)
+    reset_tool_budget(callback_context)
+    return None
+
+
+def _before_model(callback_context, llm_request):
+    """Chain the model-level guards: prune prior-turn tool payloads, mask
+    `_sources` citation plumbing from current-turn results, then cap ReAct
+    rounds (strip tools past the budget)."""
+    strip_prior_turn_tool_parts(callback_context, llm_request)
+    strip_source_metadata(callback_context, llm_request)
+    return round_limit(callback_context, llm_request)
+
 
 executor_agent = Agent(
     # Model carries retry-with-backoff on 429/5xx (Dynamic Shared Quota); see
@@ -38,12 +61,21 @@ executor_agent = Agent(
     name=AGENT_NAME,
     # InstructionProvider — appends today's date deterministically per request.
     instruction=with_current_date(EXECUTOR_INSTRUCTION),
-    # Native dynamic thinking; emits thought summaries when EMIT_THINKING is set.
-    planner=build_thinking_planner(),
+    # Native thinking capped at MEDIUM. Unbounded (dynamic) thinking was the top
+    # latency driver (thinking_tokens ↔ elapsed r=0.86): hard questions ran away
+    # to 9-13k thought tokens / one 40s pause per step (pitch 70s @ 2 calls,
+    # chevy 77s). MEDIUM keeps room to reason while cutting the runaway tail.
+    planner=build_thinking_planner("MEDIUM"),
     tools=ALL_TOOLS,
-    # Prior turns keep their prose, lose their tool payloads (see
-    # context_pruning.py) — dead weight by the re-query doctrine.
-    before_model_callback=strip_prior_turn_tool_parts,
+    # Reset the per-pass round + tool budgets at the start of each executor pass
+    # (so critic-requested retries aren't born over budget). See _before_agent.
+    before_agent_callback=_before_agent,
+    # Prune prior-turn tool payloads + cap ReAct rounds (context_pruning.py,
+    # round_limiter.py) — the round cap forces synthesis instead of endless fan-out.
+    before_model_callback=_before_model,
+    # Dedupe repeated calls + per-turn tool budget (circuit_breaker.py) —
+    # reliability guard against true loops / runaway fan-out.
+    before_tool_callback=circuit_breaker,
 )
 
 # Wrap [executor → critic-gate → escalator] in a LoopAgent. The gate skips
