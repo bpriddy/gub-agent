@@ -79,8 +79,8 @@ def strip_source_metadata(callback_context: Any, llm_request: Any) -> None:
     halves prompt tokens on the heavy questions. The scrubbed copy is assigned
     back to `function_response.response` — the original (session-shared) payload
     is never mutated in place."""
-    for content in (llm_request.contents or []):
-        for part in (content.parts or []):
+    for content in llm_request.contents or []:
+        for part in content.parts or []:
             fr = getattr(part, "function_response", None)
             resp = getattr(fr, "response", None) if fr is not None else None
             if isinstance(resp, dict):
