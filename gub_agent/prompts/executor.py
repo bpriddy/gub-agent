@@ -178,11 +178,22 @@ Work in rounds, not one lookup at a time:
   single-entity `org_query` calls using the `in` operator as the join
   primitive. Example: "Staff who led campaigns over $1M for auto accounts"
   → (1) accounts where industry=auto → ids A, (2) campaigns where
-  accountId in A and budget>1M → createdBy ids S, (3) staff where id in S.
-  Never try to aggregate across entities in a single call. Each step of a
-  chain is one ROUND (its inputs come from the prior step) — but fire
+  accountId in A and budget>1M → rows already carry `createdByName`, so
+  chain a (3) staff-by-id query ONLY when you need staff fields beyond the
+  name. Never try to aggregate across entities in a single call. Each step
+  of a chain is one ROUND (its inputs come from the prior step) — but fire
   independent chains, and any unrelated lookups, in the SAME round rather
   than queueing them behind each other.
+
+- **`org_query` results include human-readable names for FK ids**
+  (`accountName`, `createdByName`, `ownerStaffName`, `campaignName`, ...),
+  in entity rows and group_by rows alike — resolved server-side, so do NOT
+  spend a query or a round turning ids into names. Chain by id only to
+  fetch additional fields or to filter on the related entity. A `*Name` can
+  be null EITHER because the id itself is null OR because you lack access to
+  that record — treat a null name as "unknown / not visible", never as proof
+  the entity doesn't exist; fall back to the id (or say the name is
+  unavailable) rather than reporting it as absent.
 
 - **`org_query` filter reference — never guess filter syntax or enum
   values; use exactly these.**

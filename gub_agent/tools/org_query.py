@@ -45,6 +45,28 @@ async def org_query(
     Use a separate call per entity. For multi-entity questions, chain
     queries (see "Composition" below).
 
+    ## Results include human-readable names — do NOT re-resolve ids
+
+    Every FK id in a result row comes with a companion `*Name` field,
+    resolved server-side in the same query:
+
+      campaigns: accountId → accountName, createdBy → createdByName
+      accounts:  parentId → parentName, ownerStaffId → ownerStaffName,
+                 accountExecStaffId → accountExecStaffName
+      staff:     officeId → officeName
+      pieces:    campaignId → campaignName
+
+    This applies to entity rows AND group_by rows. NEVER spend a follow-up
+    query (or a round) turning ids into names — the name is already in the
+    row. Chain by id only when you need MORE fields from the related entity
+    than its name, or need to filter on it.
+
+    A `*Name` is null in two cases you must NOT conflate: the FK id itself is
+    null (no related record), OR you lack access to that record (it exists,
+    but its name is withheld by your grants). Treat a null name as "unknown /
+    not visible" — fall back to the id or say the name is unavailable; never
+    report the related entity as nonexistent on the basis of a null name.
+
     ## Filter operators
 
     Each filter is `{field: {op: value}}`. ONE operator per field per call.
@@ -87,7 +109,10 @@ async def org_query(
 
     Result rows shape: `{<group_field(s)>: value, <outputName>: number, ...}`,
     and `sort` may reference any aggregate output name (e.g. sort by `spend`
-    desc, limit 5 → top-5 ranking computed in the DB).
+    desc, limit 5 → top-5 ranking computed in the DB). Grouping by an FK id
+    also merges in its `*Name` companion — `group_by: ["accountId"]` rows
+    carry both `accountId` and `accountName` (null when the id is null or the
+    record isn't visible to you).
 
     RULE: for portfolio/analytics questions, prefer ONE rich org_query
     (multiple aggregates, multi-axis group_by, sort by aggregate) over many
@@ -127,8 +152,10 @@ async def org_query(
 
       "Staff who led campaigns over $1M for auto accounts"
       1) accounts where industry=auto → ids A
-      2) campaigns where accountId in A and budget > 1M → distinct createdBy ids S
-      3) staff where id in S → names
+      2) campaigns where accountId in A and budget > 1M → rows already carry
+         createdByName; done if only names are needed
+      3) staff where id in (distinct createdBy) — ONLY if you need staff
+         fields beyond the name (title, office, status)
 
     ## Worked examples
 
@@ -149,8 +176,9 @@ async def org_query(
                            totalBudget: {op: "sum", field: "budget"}},
                 sort=[{field: "campaignCount", direction: "desc"}],
                 limit=5)
-      # → [{accountId: "...", campaignCount: 9, totalBudget: 4200000}, ...]
-      # then ONE follow-up accounts query with id in [...] for names.
+      # → [{accountId: "...", campaignCount: 9, totalBudget: 4200000,
+      #     accountName: "..."}, ...] — accountName rides along; NO
+      #     follow-up accounts query just to resolve names.
 
       # "Who owns the most accounts?" — same top-N pattern on accounts
       org_query(entity="accounts",
@@ -158,7 +186,8 @@ async def org_query(
                 aggregate={accountCount: {op: "count"}},
                 sort=[{field: "accountCount", direction: "desc"}],
                 limit=5)
-      # → then ONE staff query with id in [...] for names. TWO calls total.
+      # → rows carry ownerStaffName; ONE call, not two. A null name means
+      #   the owner is unset or not visible to you — fall back to the id.
 
       # "How do active vs prospect vs inactive accounts differ?" — one
       # multi-axis call gives the whole comparison grid; do NOT query each
