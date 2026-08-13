@@ -8,6 +8,26 @@ remaining exposures) lives in internal notes instead of this public log.
 
 ## [Unreleased]
 
+### Performance (2026-08-12)
+
+- **Agent latency cut ~30%** (mean 44s → 31s, worst case 79s → 46s; prompt
+  tokens 3.05M → 1.16M) via three measured levers, benchmarked on a prod-DB copy:
+  - **Round-level cutoff** (`gub_agent/agents/round_limiter.py`, new) — caps
+    ReAct at `MAX_ROUNDS` gather rounds, then strips the tool declarations so the
+    model must synthesize instead of fanning out endlessly.
+  - **Thinking budget MEDIUM** (`agent.py`) — the executor's unbounded dynamic
+    thinking was the top latency driver (thinking_tokens ↔ elapsed r=0.86);
+    MEDIUM cuts the runaway tail. Critic already runs LOW.
+  - **`_sources` observation masking** (`gub_agent/agents/context_pruning.py`) —
+    strips Drive citation plumbing (128k tokens on one account overview, re-sent
+    every round) that the prompts already tell the model to ignore. Copy-on-write,
+    so the session-shared payload is never mutated in place.
+- **Circuit breaker** (`gub_agent/agents/circuit_breaker.py`, new) — per-executor-
+  pass tool-call budget + identical-call dedup; a reliability guard against
+  runaway fan-out / loops. Both the round and tool budgets reset at the start of
+  each executor pass (`before_agent_callback`), so a critic-requested retry
+  starts with a fresh budget rather than inheriting the previous pass's count.
+
 ### Added (2026-06-15)
 
 - **Multi-agent pipeline** (`gub_agent/agents/critic.py`, `agent.py`). The

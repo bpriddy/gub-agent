@@ -9,12 +9,13 @@ Tools:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from ._client import gub_get
+from ._client import _resolve_gub_jwt, gub_get
 
 
-def find_staff_for_resourcing(
+async def find_staff_for_resourcing(
     query: str | None = None,
     metadata_type: str | None = None,
     metadata_label: str | None = None,
@@ -44,7 +45,8 @@ def find_staff_for_resourcing(
 
     Args:
         query: Keyword matched against staff names, titles, emails, or metadata labels/values
-        metadata_type: Category to search within — e.g. "skill", "interest", "highlight", "certification"
+        metadata_type: Category to search within — e.g. "skill", "interest", "highlight",
+            "certification"
         metadata_label: Specific metadata label — e.g. "React", "Brand Strategy" (contains match)
         metadata_value: Value to match within a metadata entry (contains match)
         office_id: Restrict to a specific office UUID (use search to find office IDs)
@@ -60,17 +62,23 @@ def find_staff_for_resourcing(
         "status": status,
         "limit": limit,
     }
-    if query:         params["q"] = query
-    if metadata_type:  params["type"] = metadata_type
-    if metadata_label: params["label"] = metadata_label
-    if metadata_value: params["value"] = metadata_value
-    if office_id:      params["officeId"] = office_id
-    if featured_only:  params["featured"] = "true"
+    if query:
+        params["q"] = query
+    if metadata_type:
+        params["type"] = metadata_type
+    if metadata_label:
+        params["label"] = metadata_label
+    if metadata_value:
+        params["value"] = metadata_value
+    if office_id:
+        params["officeId"] = office_id
+    if featured_only:
+        params["featured"] = "true"
 
-    return gub_get("/org/resourcing", tool_context, **params)
+    return await gub_get("/org/resourcing", tool_context, **params)
 
 
-def get_staff_profile(
+async def get_staff_profile(
     staff_id: str,
     tool_context: Any = None,
 ) -> dict:
@@ -90,11 +98,23 @@ def get_staff_profile(
     Returns:
         dict with full staff profile and a 'metadata' list of entries.
     """
-    profile = gub_get(f"/org/staff/{staff_id}", tool_context)
+    # Warm the session JWT cache before fanning out — on a cold session both
+    # gathered calls would miss it and fire two identical token exchanges.
+    await _resolve_gub_jwt(tool_context)
+    profile, metadata = await asyncio.gather(
+        gub_get(f"/org/staff/{staff_id}", tool_context),
+        gub_get(f"/org/staff/{staff_id}/metadata", tool_context),
+        return_exceptions=True,
+    )
+    # Re-raise only after both legs settle — an exception escaping mid-gather
+    # leaves the sibling task running with nobody to retrieve its result.
+    if isinstance(profile, Exception):
+        raise profile
+    if isinstance(metadata, Exception):
+        raise metadata
     if profile.get("error"):
         return profile
 
-    metadata = gub_get(f"/org/staff/{staff_id}/metadata", tool_context)
     metadata_list = (
         metadata.get("metadata", metadata)
         if isinstance(metadata, dict) and not metadata.get("error")
@@ -104,7 +124,7 @@ def get_staff_profile(
     return {**profile, "metadata": metadata_list}
 
 
-def search_staff(
+async def search_staff(
     query: str | None = None,
     status: str = "active",
     limit: int = 20,
@@ -129,4 +149,4 @@ def search_staff(
     Returns:
         dict with 'staff' list and pagination metadata.
     """
-    return gub_get("/org/staff", tool_context, q=query, status=status, limit=limit)
+    return await gub_get("/org/staff", tool_context, q=query, status=status, limit=limit)

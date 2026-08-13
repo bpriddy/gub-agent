@@ -23,9 +23,7 @@ from google.genai import types as genai_types
 
 
 def _is_function_part(part: Any) -> bool:
-    return bool(
-        getattr(part, "function_call", None) or getattr(part, "function_response", None)
-    )
+    return bool(getattr(part, "function_call", None) or getattr(part, "function_response", None))
 
 
 def _has_user_text(content: Any) -> bool:
@@ -37,10 +35,62 @@ def _has_user_text(content: Any) -> bool:
     """
     if content.role != "user":
         return False
-    return any(
-        getattr(p, "text", None) and not _is_function_part(p)
-        for p in (content.parts or [])
-    )
+    return any(getattr(p, "text", None) and not _is_function_part(p) for p in (content.parts or []))
+
+
+# Keys that are pure tool plumbing — the executor/critic prompts already tell
+# the model these are for grounding infrastructure and MUST NOT appear in prose.
+# `_sources` (Drive file citations) measured at 512k chars / 128k tokens for ONE
+# account overview (3,257 file refs) — re-sent every ReAct round. Dead weight.
+_PLUMBING_KEYS = ("_sources",)
+
+
+def _without_plumbing(obj: Any) -> Any:
+    """Return `obj` with plumbing keys dropped, COPY-ON-WRITE: a new dict/list is
+    built only where a key was actually removed; unchanged subtrees (and all
+    scalars) are shared. So this never mutates the input in place — the
+    function_response payload is shared with ADK session history, and mutating a
+    nested field there can corrupt it (safe under the eager model_dump() prod
+    persistence uses today, but a landmine under InMemorySessionService and for
+    trace consumers that read `_sources`)."""
+    if isinstance(obj, dict):
+        new: dict = {}
+        changed = False
+        for k, v in obj.items():
+            if k in _PLUMBING_KEYS:
+                changed = True
+                continue
+            nv = _without_plumbing(v)
+            changed = changed or nv is not v
+            new[k] = nv
+        return new if changed else obj
+    if isinstance(obj, list):
+        rebuilt = [_without_plumbing(v) for v in obj]
+        return rebuilt if any(n is not o for n, o in zip(rebuilt, obj)) else obj
+    return obj
+
+
+def strip_source_metadata(callback_context: Any, llm_request: Any) -> None:
+    """Observation masking: drop `_sources` citation plumbing from every tool
+    response in the request. The model is instructed to ignore it (see
+    prompts/executor.py, prompts/critic.py), yet it dominates prompt size on
+    portfolio questions — one account overview carried 128k tokens of file refs,
+    re-sent each round. Stripping it is loss-free for the answer and roughly
+    halves prompt tokens on the heavy questions. The scrubbed copy is assigned
+    back to `function_response.response` — the original (session-shared) payload
+    is never mutated in place."""
+    for content in llm_request.contents or []:
+        for part in content.parts or []:
+            fr = getattr(part, "function_response", None)
+            resp = getattr(fr, "response", None) if fr is not None else None
+            if isinstance(resp, dict):
+                scrubbed = _without_plumbing(resp)
+                if scrubbed is not resp:
+                    try:
+                        fr.response = scrubbed
+                    except Exception:  # noqa: BLE001 — best-effort across ADK versions
+                        pass
+    return None
 
 
 def strip_prior_turn_tool_parts(callback_context: Any, llm_request: Any) -> None:

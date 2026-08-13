@@ -9,10 +9,16 @@ Handles two auth modes:
 
 All GUB API calls go through gub_get() / gub_post() which pick the right mode
 automatically. Tool functions never need to think about auth.
+
+Every request — token exchange included — goes through one shared
+httpx.AsyncClient so connections are pooled and reused instead of being
+torn down per call, and the event loop is never blocked while a request
+is in flight. Timeout and pool tuning live in TIMEOUT / LIMITS below.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -22,9 +28,44 @@ from ..config import GUB_AUTHORIZATION_ID, GUB_BASE_URL, GUB_SERVICE_JWT
 
 logger = logging.getLogger(__name__)
 
+# ── Shared client ─────────────────────────────────────────────────────────────
+
+TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+
+_client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Return the shared client, creating it lazily on first use.
+
+    Keyed on the running loop: a client's pool is bound to the loop that
+    opened its connections, and `is_closed` stays False when a loop is
+    discarded without `aclose_client()`.
+    """
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop is not loop:
+        _client = httpx.AsyncClient(http2=True, timeout=TIMEOUT, limits=LIMITS)
+        _client_loop = loop
+    return _client
+
+
+async def aclose_client() -> None:
+    """Close the shared client. No runtime caller today — tests use it per-run;
+    a graceful-shutdown hook can adopt it if the runtime ever exposes one."""
+    global _client, _client_loop
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+    _client_loop = None
+
+
 # ── Token resolution ──────────────────────────────────────────────────────────
 
-def _resolve_gub_jwt(tool_context: Any | None) -> str:
+
+async def _resolve_gub_jwt(tool_context: Any | None) -> str:
     """
     Resolve a valid GUB JWT for this request.
 
@@ -48,8 +89,8 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
         except Exception as e:
             logger.info("auth debug — state.to_dict() failed: %s", e)
         try:
-            app_prefix = getattr(tool_context.state, 'APP_PREFIX', None)
-            temp_prefix = getattr(tool_context.state, 'TEMP_PREFIX', None)
+            app_prefix = getattr(tool_context.state, "APP_PREFIX", None)
+            temp_prefix = getattr(tool_context.state, "TEMP_PREFIX", None)
             logger.info("auth debug — APP_PREFIX=%s TEMP_PREFIX=%s", app_prefix, temp_prefix)
         except Exception:
             pass
@@ -62,13 +103,16 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
             google_access_token = state_dict.get(GUB_AUTHORIZATION_ID)
             if google_access_token and isinstance(google_access_token, str):
                 logger.warning("Found OAuth token via to_dict()['%s']", GUB_AUTHORIZATION_ID)
-                gub_jwt = _exchange_google_token(google_access_token)
+                gub_jwt = await _exchange_google_token(google_access_token)
                 tool_context.state["gub_jwt"] = gub_jwt
                 return gub_jwt
             elif google_access_token:
                 # Type only — the value may be a token-bearing structure.
-                logger.warning("State key '%s' exists but is type %s (expected str)",
-                            GUB_AUTHORIZATION_ID, type(google_access_token).__name__)
+                logger.warning(
+                    "State key '%s' exists but is type %s (expected str)",
+                    GUB_AUTHORIZATION_ID,
+                    type(google_access_token).__name__,
+                )
         except Exception as e:
             logger.warning("Error reading state via to_dict: %s", e)
 
@@ -79,7 +123,7 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
             google_access_token = (gub_auth.get("token") or {}).get("access_token")
             if google_access_token:
                 logger.info("Found OAuth token via auth_tokens['%s']", GUB_AUTHORIZATION_ID)
-                gub_jwt = _exchange_google_token(google_access_token)
+                gub_jwt = await _exchange_google_token(google_access_token)
                 tool_context.state["gub_jwt"] = gub_jwt
                 return gub_jwt
         except Exception as e:
@@ -90,7 +134,7 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
             temp_token = tool_context.state.get(f"temp:{GUB_AUTHORIZATION_ID}")
             if temp_token and isinstance(temp_token, str):
                 logger.info("Found OAuth token via temp:%s", GUB_AUTHORIZATION_ID)
-                gub_jwt = _exchange_google_token(temp_token)
+                gub_jwt = await _exchange_google_token(temp_token)
                 tool_context.state["gub_jwt"] = gub_jwt
                 return gub_jwt
         except Exception as e:
@@ -104,34 +148,36 @@ def _resolve_gub_jwt(tool_context: Any | None) -> str:
 
     raise RuntimeError(
         "No GUB JWT available. Set GUB_SERVICE_JWT for local dev, or ensure "
-        f"Gemini Enterprise is injecting an OAuth token under authorization ID '{GUB_AUTHORIZATION_ID}'."
+        f"Gemini Enterprise is injecting an OAuth token under authorization ID "
+        f"'{GUB_AUTHORIZATION_ID}'."
     )
 
 
-def _exchange_google_token(google_access_token: str) -> str:
+async def _exchange_google_token(google_access_token: str) -> str:
     """
     Exchange a Google OAuth access token for a GUB JWT via the broker endpoint.
     GUB verifies the token with Google's userinfo endpoint, then issues its own JWT.
     """
-    with httpx.Client(timeout=10) as client:
-        resp = client.post(
-            f"{GUB_BASE_URL}/auth/google/access-token-exchange",
-            json={"accessToken": google_access_token},
-        )
-        if not resp.is_success:
-            logger.error("GUB token exchange failed: %s %s", resp.status_code, resp.text)
-            raise RuntimeError(f"GUB token exchange failed ({resp.status_code}): {resp.text}")
+    client = _get_client()
+    resp = await client.post(
+        f"{GUB_BASE_URL}/auth/google/access-token-exchange",
+        json={"accessToken": google_access_token},
+    )
+    if not resp.is_success:
+        logger.error("GUB token exchange failed: %s %s", resp.status_code, resp.text)
+        raise RuntimeError(f"GUB token exchange failed ({resp.status_code}): {resp.text}")
 
-        data = resp.json()
-        access_token = data.get("accessToken")
-        if not access_token:
-            raise RuntimeError("GUB token exchange response missing 'accessToken'")
-        return access_token
+    data = resp.json()
+    access_token = data.get("accessToken")
+    if not access_token:
+        raise RuntimeError("GUB token exchange response missing 'accessToken'")
+    return access_token
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-def gub_get(
+
+async def gub_get(
     path: str,
     tool_context: Any | None = None,
     **params: Any,
@@ -142,31 +188,31 @@ def gub_get(
     Non-None query params are forwarded as URL query parameters.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
-    jwt = _resolve_gub_jwt(tool_context)
+    jwt = await _resolve_gub_jwt(tool_context)
     clean_params = {k: v for k, v in params.items() if v is not None}
 
-    with httpx.Client(timeout=15) as client:
-        try:
-            resp = client.get(
-                f"{GUB_BASE_URL}{path}",
-                headers={"Authorization": f"Bearer {jwt}"},
-                params=clean_params,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as exc:
-            logger.warning("GUB GET %s returned %s", path, exc.response.status_code)
-            return {
-                "error": True,
-                "status": exc.response.status_code,
-                "message": _friendly_error(exc.response.status_code, path),
-            }
-        except httpx.RequestError as exc:
-            logger.error("GUB GET %s request error: %s", path, exc)
-            return {"error": True, "status": 0, "message": f"Could not reach GUB backend: {exc}"}
+    client = _get_client()
+    try:
+        resp = await client.get(
+            f"{GUB_BASE_URL}{path}",
+            headers={"Authorization": f"Bearer {jwt}"},
+            params=clean_params,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as exc:
+        logger.warning("GUB GET %s returned %s", path, exc.response.status_code)
+        return {
+            "error": True,
+            "status": exc.response.status_code,
+            "message": _friendly_error(exc.response.status_code, path),
+        }
+    except httpx.RequestError as exc:
+        logger.error("GUB GET %s request error: %s", path, exc)
+        return {"error": True, "status": 0, "message": f"Could not reach GUB backend: {exc}"}
 
 
-def gub_post(
+async def gub_post(
     path: str,
     body: dict,
     tool_context: Any | None = None,
@@ -175,27 +221,27 @@ def gub_post(
     Make an authenticated POST request to the GUB backend.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
-    jwt = _resolve_gub_jwt(tool_context)
+    jwt = await _resolve_gub_jwt(tool_context)
 
-    with httpx.Client(timeout=15) as client:
-        try:
-            resp = client.post(
-                f"{GUB_BASE_URL}{path}",
-                headers={"Authorization": f"Bearer {jwt}"},
-                json=body,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as exc:
-            logger.warning("GUB POST %s returned %s", path, exc.response.status_code)
-            return {
-                "error": True,
-                "status": exc.response.status_code,
-                "message": _friendly_error(exc.response.status_code, path),
-            }
-        except httpx.RequestError as exc:
-            logger.error("GUB POST %s request error: %s", path, exc)
-            return {"error": True, "status": 0, "message": f"Could not reach GUB backend: {exc}"}
+    client = _get_client()
+    try:
+        resp = await client.post(
+            f"{GUB_BASE_URL}{path}",
+            headers={"Authorization": f"Bearer {jwt}"},
+            json=body,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as exc:
+        logger.warning("GUB POST %s returned %s", path, exc.response.status_code)
+        return {
+            "error": True,
+            "status": exc.response.status_code,
+            "message": _friendly_error(exc.response.status_code, path),
+        }
+    except httpx.RequestError as exc:
+        logger.error("GUB POST %s request error: %s", path, exc)
+        return {"error": True, "status": 0, "message": f"Could not reach GUB backend: {exc}"}
 
 
 def _friendly_error(status: int, path: str) -> str:

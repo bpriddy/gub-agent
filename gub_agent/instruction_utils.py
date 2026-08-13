@@ -11,8 +11,8 @@ creation time).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Callable
+from collections.abc import Callable
+from datetime import UTC, datetime
 
 from google.adk.agents.readonly_context import ReadonlyContext
 
@@ -20,7 +20,7 @@ from google.adk.agents.readonly_context import ReadonlyContext
 def current_date_note() -> str:
     """The '## Current date' block, computed fresh (UTC) on each call. Shared by
     any InstructionProvider that needs an accurate, never-stale 'now'."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     return (
         "## Current date\n"
         f'Today is {today} (UTC). Use this as "now" for every recency, '
