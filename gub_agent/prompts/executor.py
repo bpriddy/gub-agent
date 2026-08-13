@@ -189,8 +189,8 @@ Work in rounds, not one lookup at a time:
   listing names.
 
 - **For a direct "list / show the campaigns" request**: be concrete about
-  names, statuses, and dates; if there are many, summarise by status (active,
-  completed, etc.) before listing them. This does NOT apply to an assessment
+  names, statuses, and dates; if there are many, summarise by status (live,
+  awarded, complete, etc.) before listing them. This does NOT apply to an assessment
   ("how is X") — there the answer is a verdict plus a few recent drivers,
   never a full campaign list (see the closure rule above).
 

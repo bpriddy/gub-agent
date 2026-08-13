@@ -64,6 +64,10 @@ async def org_query(
                                                         filter; chain follow-ups by `id.in`.
       is_null     {endsAt: {is_null: true}}             field IS / IS NOT NULL
 
+    Status values are ENTITY-SPECIFIC: campaigns use `pitch`/`live`/`awarded`/
+    `complete` (the values shown above); accounts use `active`/`prospect`/
+    `inactive`. A value from the wrong entity silently matches nothing.
+
     ## Sort
 
     `[{field: "budget", direction: "desc"}, ...]`. Multi-key allowed.
