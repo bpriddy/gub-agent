@@ -9,9 +9,10 @@ Tools:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from ._client import gub_get
+from ._client import _resolve_gub_jwt, gub_get
 
 
 async def list_accounts(
@@ -48,38 +49,44 @@ async def get_account_overview(
     """
     Get a full overview of a client account: details plus all campaigns.
 
-    Returns the account record with a nested `campaigns` list. Each campaign
-    carries name, status, budget, dates, and a truncated `statusSummary` — the
-    account detail embeds these in ONE fetch (backend `GET /org/accounts/:id`),
-    so there is no separate per-campaign call.
+    Returns the account record together with every campaign associated with it,
+    including campaign name, status, dates, and the staff who created each one.
 
-    Use this when asked about a specific client, their campaign history, or what
-    work the agency has done for them. Requires the account UUID — use
-    list_accounts first if you only have a name.
-
-    The nested campaigns ALREADY carry `status` and a `statusSummary` for every
-    campaign. For an ASSESSMENT question ("how is this account doing", "what's
-    the status", a health/overview read), that is SUFFICIENT — synthesize your
-    answer from this response alone and do NOT call `get_campaign` per campaign.
-    Call `get_campaign` ONLY when the user asks about ONE specific campaign in
-    depth (its full `statusMarkdown` writeup or pieces) — never as a blanket
-    follow-up across every campaign in the list.
+    Use this when asked about a specific client, their campaign history,
+    or what work the agency has done for them. Requires the account UUID —
+    use list_accounts first if you only have a name.
 
     Args:
         account_id: The UUID of the account
 
     Returns:
-        dict with account details and a nested 'campaigns' list. Each campaign
-        includes id, name, status, budget, dates, and statusSummary.
+        dict with account details and a nested 'campaigns' list.
+        Each campaign includes id, name, status, createdAt, and createdByStaff.
     """
-    # The account detail already embeds campaigns[] (with statusSummary) — one
-    # fetch, no separate campaigns-by-account call. Requires the backend that
-    # embeds the stubs to be deployed (companion backend PR).
-    account = await gub_get(f"/org/accounts/{account_id}", tool_context)
+    # Warm the session JWT cache before fanning out — on a cold session both
+    # gathered calls would miss it and fire two identical token exchanges.
+    await _resolve_gub_jwt(tool_context)
+    account, campaigns_resp = await asyncio.gather(
+        gub_get(f"/org/accounts/{account_id}", tool_context),
+        gub_get(f"/org/accounts/{account_id}/campaigns", tool_context),
+        return_exceptions=True,
+    )
+    # Re-raise only after both legs settle — an exception escaping mid-gather
+    # leaves the sibling task running with nobody to retrieve its result.
+    if isinstance(account, Exception):
+        raise account
+    if isinstance(campaigns_resp, Exception):
+        raise campaigns_resp
     if account.get("error"):
         return account
-    account.setdefault("campaigns", [])
-    return account
+
+    campaigns = (
+        campaigns_resp.get("campaigns", campaigns_resp)
+        if isinstance(campaigns_resp, dict) and not campaigns_resp.get("error")
+        else []
+    )
+
+    return {**account, "campaigns": campaigns}
 
 
 async def get_campaign(
