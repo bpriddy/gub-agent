@@ -14,9 +14,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Required for `adk deploy agent_engine` and the registration script
+# Required for deployment/deploy_agent_engine.py and the registration script.
+# aiplatform is pinned: the SDK deploy cloudpickles the AdkApp here and
+# unpickles it in the engine (deploy_agent_engine.py pins the engine's
+# requirements to the versions installed at deploy time), and 1.165.1 is the
+# template version verified to accept per-call run_config on stream_query
+# (gub-gchat-bot#3). Bump deliberately, then re-run the cadence gate.
 deploy = [
-    "google-cloud-aiplatform>=1.70.0",
+    "google-cloud-aiplatform[agent_engines]==1.165.1",
     "google-auth>=2.29.0",
     "requests>=2.31.0",
 ]

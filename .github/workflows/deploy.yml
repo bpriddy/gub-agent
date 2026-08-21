@@ -1,7 +1,13 @@
-# Deploy — update the Vertex AI Agent Engine in place via
-# `adk deploy agent_engine` (NOT Cloud Run, NOT Cloud Build — see README
-# "Deploy"). Same engine id every time, so callers (the Chat bot,
+# Deploy — update the Vertex AI Agent Engine in place via the Python SDK
+# (deployment/deploy_agent_engine.py; NOT Cloud Run, NOT Cloud Build — see
+# README "Deploy"). Same engine id every time, so callers (the Chat bot,
 # Agentspace/Gemini Enterprise) see no change.
+#
+# Why the SDK and not `adk deploy agent_engine`: the SDK deploy ships the
+# CURRENT AdkApp template, whose stream_query accepts a per-call `run_config`
+# — that's what lets the Chat bot request SSE token streaming (gub-gchat-bot
+# issue #3). Streaming is opt-in per call; callers that don't pass run_config
+# keep today's one-blob behavior.
 #
 # Auth is Workload Identity Federation (OIDC) — google-github-actions/auth
 # writes ADC credentials, which the ADK/Vertex SDK picks up automatically.
@@ -47,21 +53,28 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}
 
-      # Without --agent_engine_id, adk deploy CREATES a brand-new engine and
-      # nothing points at it. Refuse to run rather than fork the deployment.
+      # Without AGENT_ENGINE_ID the SDK path would have to CREATE a brand-new
+      # engine and nothing points at it. Refuse to run rather than fork the
+      # deployment. AGENT_STAGING_BUCKET is new with the SDK deploy: it uploads
+      # the pickled app + requirements through a GCS staging bucket (the old
+      # CLI path didn't need one).
       - name: Refuse to create a new engine
         run: |
           if [ -z "${{ vars.AGENT_ENGINE_ID }}" ]; then
             echo "::error::AGENT_ENGINE_ID repository variable is not set — deploy would create a NEW Agent Engine instead of updating the existing one. See CI-CD.md."
             exit 1
           fi
+          if [ -z "${{ vars.AGENT_STAGING_BUCKET }}" ]; then
+            echo "::error::AGENT_STAGING_BUCKET repository variable is not set — the SDK deploy needs a gs:// staging bucket (see deployment/deploy_agent_engine.py)."
+            exit 1
+          fi
 
       - name: Install deploy dependencies
         run: pip install -e ".[deploy]"
 
-      # --env_file bakes deploy-dev.env (EMIT_THINKING=1) into the engine,
-      # matching the current dev deploy convention. --region controls where
-      # the engine RESOURCE lives; model calls stay on the global endpoint
+      # deploy_agent_engine.py bakes deploy-dev.env (EMIT_THINKING=1) into the
+      # engine, matching the previous --env_file convention. GCP_REGION controls
+      # where the engine RESOURCE lives; model calls stay on the global endpoint
       # via config (see README "Model endpoint vs engine region").
       - name: Deploy to Vertex AI Agent Engine
         # The dispatch input is passed as an ENV VALUE, never interpolated into
@@ -70,14 +83,11 @@ jobs:
         # authenticated to GCP via WIF.
         env:
           DEPLOY_DESCRIPTION: ${{ github.event.inputs.description }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          AGENT_ENGINE_ID: ${{ vars.AGENT_ENGINE_ID }}
+          AGENT_STAGING_BUCKET: ${{ vars.AGENT_STAGING_BUCKET }}
         run: |
           DESC="$DEPLOY_DESCRIPTION"
           [ -n "$DESC" ] || DESC="GitHub Actions deploy ${GITHUB_SHA::7}"
-          adk deploy agent_engine \
-            --project="${{ vars.GCP_PROJECT_ID }}" \
-            --region="${{ vars.GCP_REGION }}" \
-            --agent_engine_id="${{ vars.AGENT_ENGINE_ID }}" \
-            --display_name="gub-agent" \
-            --description="$DESC" \
-            --env_file=deploy-dev.env \
-            gub_agent
+          python deployment/deploy_agent_engine.py --description "$DESC"

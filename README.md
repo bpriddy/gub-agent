@@ -143,24 +143,43 @@ python -m gub_agent
 
 ## Deploy
 
-The agent deploys to **Vertex AI Agent Engine via `adk deploy agent_engine`**
-— NOT Cloud Build. It will never appear in `gcloud builds`. Update in place
-(same engine id, so callers — the Chat bot, Agentspace — see no change):
+The agent deploys to **Vertex AI Agent Engine via the Python SDK**
+(`deployment/deploy_agent_engine.py`) — NOT Cloud Build, and no longer via the
+`adk deploy agent_engine` CLI. It will never appear in `gcloud builds`. Update
+in place (same engine id, so callers — the Chat bot, Agentspace — see no
+change):
 
 ```bash
-adk deploy agent_engine \
-  --project=os-test-491819 \
-  --region=us-central1 \
-  --agent_engine_id=9136379226620952576 \
-  --display_name=gub-agent \
-  --description="<what changed>" \
-  gub_agent
+pip install -e ".[deploy]"
+GCP_PROJECT_ID=os-test-491819 \
+GCP_REGION=us-central1 \
+AGENT_ENGINE_ID=9136379226620952576 \
+AGENT_STAGING_BUCKET=gs://<staging-bucket> \
+python deployment/deploy_agent_engine.py --description "<what changed>"
 ```
 
-The positional `gub_agent` (the package exporting `root_agent`) is required.
-Agent names must be valid Python identifiers — no dashes (e.g. `gub_pipeline`,
-not `gub-pipeline`), or ADK rejects the deploy. A transient `code 13
-INTERNAL` from Agent Engine usually succeeds on a retry.
+Why the SDK: the CURRENT AdkApp template accepts a per-call `run_config` on
+`stream_query`, which is what lets the Chat bot request
+`RunConfig(streaming_mode=SSE)` token streaming (gub-gchat-bot#3). The old
+CLI deploy shipped a template without that hook; the current CLI (google-adk
+2.x) would rebuild the engine as an api_server container with unpinned deps.
+Streaming stays **opt-in per call** — callers that don't pass `run_config`
+keep the one-blob behavior, so the debug client and Agentspace are untouched.
+The script refuses to create a new engine (AGENT_ENGINE_ID required) and
+pins the engine's requirements to the deploy environment's versions (the
+cloudpickled app must unpickle against identical libraries).
+`AGENT_STAGING_BUCKET` is a gs:// bucket the SDK stages the pickle through —
+new with this path. Agent names must be valid Python identifiers — no dashes
+(e.g. `gub_pipeline`, not `gub-pipeline`). A transient `code 13 INTERNAL`
+from Agent Engine usually succeeds on a retry.
+
+**Post-deploy cadence gate (gub-gchat-bot#3):** before trusting streaming,
+run the cadence test (`scratchpad/cadence-test.mjs`, kept untracked) against
+the deployed engine: plain `stream_query` must STILL return one blob (proves
+no caller regression), and `stream_query` with
+`run_config={"streaming_mode":"sse","response_modalities":["TEXT"]}` must
+emit multiple `partial=true` events. Only then flip the bot's
+`AGENT_STREAMING` env on.
 
 **Model endpoint vs engine region.** The model (`gemini-3.5-flash`) is served
 only from the Vertex **global** endpoint, so `.env` sets
