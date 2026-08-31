@@ -1,42 +1,36 @@
 #!/bin/sh
 #
-# gitleaks pre-commit hook.
-# Scans staged changes for secrets (API keys, tokens, JSON keys, etc.).
-# Fails the commit on any finding so the secret never lands.
+# GUB pre-commit hook (Python) — fast, staged-only.
+#   1. gitleaks           — block secrets from ever landing
+#   2. ruff check         — lint staged .py
+#   3. ruff format --check — codestyle on staged .py
 #
-# One-time setup per clone (see README "Local setup"):
-#
-#   brew install gitleaks
+# Setup once per clone:
 #   git config core.hooksPath .githooks
 #
-# Escape hatch — set SKIP_GITLEAKS=1 for a one-off commit when you genuinely
-# have to bypass the check (last resort; justify in the commit message):
-#
-#   SKIP_GITLEAKS=1 git commit ...
+# Escape hatch (justify in the commit message):
+#   git commit --no-verify           # skip every hook
+#   SKIP_GITLEAKS=1 git commit ...   # skip only the secret scan
 
+set -e
+
+# ---- 1. secrets -----------------------------------------------------------
 if [ "$SKIP_GITLEAKS" = "1" ]; then
   echo "gitleaks: skipped via SKIP_GITLEAKS=1" >&2
-  exit 0
-fi
-
-if ! command -v gitleaks >/dev/null 2>&1; then
-  cat >&2 <<'MSG'
-gitleaks not installed — refusing to commit.
-
-Install it:
-  brew install gitleaks        # macOS
-  # or see: https://github.com/gitleaks/gitleaks#installation
-
-Then confirm the hook is wired up for this clone:
-  git config core.hooksPath .githooks
-
-If you genuinely have to bypass for a one-off commit:
-  SKIP_GITLEAKS=1 git commit ...
-MSG
+elif command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --staged --redact --no-banner
+else
+  echo "gitleaks not installed — refusing to commit." >&2
+  echo "  install: https://github.com/gitleaks/gitleaks#installation" >&2
+  echo "  bypass:  SKIP_GITLEAKS=1 git commit ..." >&2
   exit 1
 fi
 
-# --redact masks any detected secret in the output so the scan report itself
-# doesn't leak. gitleaks v8: `git --staged` scans staged changes (the v7
-# `protect --staged` command was renamed).
-gitleaks git --staged --redact --no-banner
+# ---- 2/3. staged lint + codestyle (skips cleanly if ruff not installed) ---
+PY=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)
+if [ -n "$PY" ] && command -v ruff >/dev/null 2>&1; then
+  echo "pre-commit: ruff check (staged)"
+  printf '%s\n' "$PY" | xargs ruff check
+  echo "pre-commit: ruff format --check (staged)"
+  printf '%s\n' "$PY" | xargs ruff format --check
+fi

@@ -1,0 +1,20 @@
+#!/bin/sh
+#
+# GUB pre-push hook (Python) — heavy checks on push, not on every commit.
+#   - ruff check .   (full lint)
+#   - pytest         (when pytest is on PATH, i.e. the venv is active)
+#
+# Bypass a blocked push (justify it): git push --no-verify
+
+set -e
+
+if command -v ruff >/dev/null 2>&1; then
+  echo "pre-push: ruff check ."
+  ruff check .
+fi
+if command -v pytest >/dev/null 2>&1; then
+  echo "pre-push: pytest"
+  pytest -q
+else
+  echo "pre-push: pytest not on PATH (activate the venv to run tests) — skipping." >&2
+fi
