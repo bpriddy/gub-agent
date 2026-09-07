@@ -241,10 +241,18 @@ async def test_temperature_out_of_range_is_not_clamped(sandbox_on):
 
 
 async def test_unknown_variant_does_not_fall_back_to_baseline(sandbox_on):
-    """No registry in this build (or no such name) → the run fails rather than
-    quietly running the baseline prompt."""
+    """A name the registry doesn't hold (or a build with no registry at all)
+    fails the run rather than quietly running the baseline prompt. Validated
+    eagerly, at read time — not on the fourth model call of the answer."""
     with pytest.raises(ValueError, match="variant"):
-        read_overrides({"sandbox": {"executor_variant": "v2_concise"}})
+        read_overrides({"sandbox": {"executor_variant": "v9_does_not_exist"}})
+
+
+async def test_registered_variant_resolves(sandbox_on):
+    """The other half of the above: a real registry name passes validation, so
+    the no-fallback rule can't be satisfied by rejecting everything."""
+    overrides = read_overrides({"sandbox": {"executor_variant": "v2_concise"}})
+    assert overrides.executor_variant == "v2_concise"
 
 
 # ── 7. unknown key ────────────────────────────────────────────────────────────
