@@ -21,6 +21,10 @@ Two things to keep in mind when editing any prompt here:
 2. Don't hardcode a date. The current date is injected per-request by
    `with_current_date()` (see `instruction_utils.py`) and appended to whatever
    string you write here.
+
+The modules here are what PRODUCTION runs. Experimental rewrites live in
+`variants/` and are selected per call by name (`state["sandbox"]`); a variant
+that wins is promoted into this file by hand, in an ordinary pull request.
 """
 
 from .critic import CRITIC_INSTRUCTION

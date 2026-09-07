@@ -65,11 +65,28 @@ SANDBOX_ENABLED: bool = os.environ.get("SANDBOX_ENABLED", "false").lower() in (
 # `llm_request.model` is swapped inside the SAME genai client (Vertex, global
 # endpoint — pinned above), so only models that client can serve are valid; a
 # cross-provider model needs a different BaseLlm and is out of scope.
+# The default holds only ids verified to answer from this project's global
+# endpoint (2026-09-07): `gemini-3.5-pro` 404s there AND in us-central1, and a
+# 404 inside the engine surfaces to the caller as an EMPTY 200 stream — so an
+# unservable id in the allowlist is a silent failure, not a loud one.
 SANDBOX_MODEL_ALLOWLIST: tuple[str, ...] = tuple(
     name.strip()
-    for name in os.environ.get("SANDBOX_MODEL_ALLOWLIST", "gemini-3.5-flash,gemini-3.5-pro").split(
+    for name in os.environ.get("SANDBOX_MODEL_ALLOWLIST", "gemini-3.5-flash,gemini-2.5-pro").split(
         ","
     )
+    if name.strip()
+)
+
+# Models that accept a NAMED thinking level (`thinking_level=LOW|MEDIUM|HIGH`, the
+# 3-series knob). Any other allowlisted model rejects it with 400 INVALID_ARGUMENT
+# — verified live 2026-09-07 with gemini-2.5-pro — and inside the engine that 400
+# reaches the caller as an empty 200 stream. The baseline planners pin MEDIUM
+# (executor) and LOW (critic), so a sandbox run that swaps to a model outside this
+# set must ALSO set both roles to DYNAMIC (`thinking_budget=-1`); sandbox.py
+# refuses the run up front otherwise.
+SANDBOX_THINKING_LEVEL_MODELS: tuple[str, ...] = tuple(
+    name.strip()
+    for name in os.environ.get("SANDBOX_THINKING_LEVEL_MODELS", "gemini-3.5-flash").split(",")
     if name.strip()
 )
 

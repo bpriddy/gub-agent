@@ -131,9 +131,10 @@ on every call:
 
 ```python
 create_session(state={"sandbox": {
-    "model": "gemini-3.5-pro",          # allowlist: SANDBOX_MODEL_ALLOWLIST
-    "thinking_level": "LOW",            # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC
-    "critic_thinking_level": "MINIMAL",
+    "model": "gemini-2.5-pro",          # allowlist: SANDBOX_MODEL_ALLOWLIST
+    "thinking_level": "DYNAMIC",        # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC — named
+    "critic_thinking_level": "DYNAMIC", #   levels are 3-series only; a 2.5 model
+                                        #   needs DYNAMIC on both roles (enforced)
     "temperature": 0.2,
     "executor_instruction": "<full prompt text>",   # or executor_variant
     "critic_instruction": "<full prompt text>",     # or critic_variant
@@ -158,6 +159,28 @@ Two rules the design keeps:
   of a known key (model off the allowlist, temperature outside 0.0-2.0, prompt
   over 64 KB, unknown variant name) fails the run. An A/B that quietly ran the
   baseline in both arms is worse than one that didn't run.
+
+#### Prompt variants
+
+`executor_variant` / `critic_variant` name an entry in
+`gub_agent/prompts/variants/` — Python modules, like the baseline prompts, so
+`adk deploy` cannot drop them from the bundle. `resolve_variant(name, role)`
+returns the text or raises listing what exists; `baseline` resolves to the
+**live** `EXECUTOR_INSTRUCTION` / `CRITIC_INSTRUCTION` object, not a copy, so
+the baseline arm of an A/B can never drift from production.
+
+| role | name | what it tests |
+|---|---|---|
+| executor | `baseline` | the deployed prompt, byte-identical |
+| executor | `v2_concise` | hard word budgets per closure type (answers run long) |
+| executor | `v3_grounding` | grounding as a procedure: pre-write check, field-based attribution, audit pass (the agent invents facts) |
+| critic | `baseline` | the deployed critic prompt |
+
+The two starter variants are `EXECUTOR_INSTRUCTION` **plus one appended block**
+rather than standalone rewrites — one variable under test, and the tool
+documentation cannot drift from the baseline. A variant that wins is promoted
+into `prompts/executor.py` by hand, in an ordinary PR; nothing does that
+automatically.
 
 ## Local setup
 
@@ -227,6 +250,149 @@ decomposition trace (per-iteration tool calls, the two-axis critic verdict,
 sources). Sign in with Google, ask a question, watch how the agent turns it
 into queries. See `debug_client/README.md`. It calls Vertex AI server-side via
 ADC; it never deploys.
+
+## Sandbox engine
+
+Until the sandbox epic there was exactly one Agent Engine — the
+`9136379226620952576` above — and the Chat bot, the debug client and the
+Gemini Enterprise registration all point at it. Every prompt or model
+experiment therefore deployed into production. The sandbox engine is a
+**second engine from the same package**; the only difference is the env file
+baked in at deploy time, and that difference is what isolates experiments from
+live users:
+
+| env file | baked into | `SANDBOX_ENABLED` | `EMIT_THINKING` |
+|---|---|---|---|
+| `deploy-dev.env` | the **production** engine (`deploy.yml` passes it as `--env_file`) — the name predates the split | `0`, explicit | `1` |
+| `deploy-sandbox.env` | the sandbox engine (`deployment/deploy-sandbox.sh`) | `1` | `1` |
+
+With the flag off, `state["sandbox"]` is ignored outright — no warn, no error,
+no extra event — so an override aimed at an experiment can never take effect on
+the engine serving the Chat bot (see "Sandbox — per-call …" above). CI pins
+this: `tests/unit/test_deploy_env_isolation.py` reads the file `deploy.yml`
+deploys and fails the build if it enables the sandbox.
+
+### Deploy
+
+```bash
+pip install -e ".[deploy]"                  # google-cloud-aiplatform; not in the base deps
+deployment/deploy-sandbox.sh "what changed"  # description is optional
+```
+
+The first run has no `SANDBOX_AGENT_ENGINE_ID` and **creates** a new engine;
+the script prints the ID and the line to append to `deploy-sandbox.env`. Record
+it — every later run then updates that engine in place (`--agent_engine_id`)
+instead of creating, and billing, another one. The script refuses to run if
+`deploy-sandbox.env` does not enable the sandbox, and refuses to address the
+production ID however it got there. It never calls `register_agent.py`: the
+sandbox engine must not be registered in Gemini Enterprise, or real users would
+be routed to whatever prompt an experiment left behind.
+
+Deploy takes ~10 minutes. `adk deploy` works in a `gub_agent_tmp<timestamp>/`
+folder under the repo root (gitignored) and removes it afterwards.
+
+### Verify you are addressing the sandbox, not prod
+
+The two engines run the same code, so a wrong `AGENT_ENGINE_ID` in a caller is
+invisible from the answers. Check the ID, not the behaviour:
+
+```bash
+# 1. The engine your caller targets must NOT be 9136379226620952576.
+grep SANDBOX_AGENT_ENGINE_ID deploy-sandbox.env
+
+# 2. Both engines, with the env each one was deployed with.
+TOKEN=$(gcloud auth print-access-token)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://us-central1-aiplatform.googleapis.com/v1/projects/os-test-491819/locations/us-central1/reasoningEngines" \
+  | python3 -c 'import json,sys
+for e in json.load(sys.stdin)["reasoningEngines"]:
+    env = {v["name"]: v.get("value") for v in e["spec"].get("deploymentSpec", {}).get("env", [])}
+    print(e["name"].rsplit("/", 1)[1], e["displayName"], env)'
+
+# 3. Not registered: the Gemini Enterprise list shows only gub-agent.
+python deployment/register_agent.py --list
+```
+
+A sandbox run also proves itself from the inside: with `SANDBOX_ENABLED` on and
+a non-empty `state["sandbox"]`, the first event of the run carries a
+`sandbox_resolved` state delta. The prod engine never emits one.
+
+Live smoke (2026-09-07, four verdicts, all held): sandbox + `state.sandbox` →
+`sandbox_resolved` with the requested model/thinking/label, then the full
+executor → critic → escalator run; sandbox without the key → no echo event;
+**prod + the same `state.sandbox` → no echo, ordinary answer** (inert by deploy
+flag); unknown variant name → the run fails.
+
+**How a failed sandbox run looks from the outside.** Agent Engine does not turn
+an exception inside the run into an error event: the caller gets **HTTP 200 and
+an empty (or truncated) stream**. Both an invalid override (unknown variant,
+model off the allowlist) and a model the project cannot serve look identical
+from the client — `sandbox_echo` may have fired, then nothing. Treat "no
+executor event" as a failure and read the reason from the engine logs:
+
+```bash
+# reason for the last failed sandbox run (ValueError / genai ClientError)
+gcloud logging read 'resource.type="aiplatform.googleapis.com/ReasoningEngine"
+  AND resource.labels.reasoning_engine_id="<SANDBOX_AGENT_ENGINE_ID>"
+  AND severity>=ERROR' --limit=5 --freshness=30m --format='value(textPayload)'
+```
+
+Two things the logs will show that are not bugs in this repo: every completed
+stream on an ADK 2.6.1 engine is followed by `RuntimeError: coroutine raised
+StopIteration` from `google/adk/cli/fast_api.py` (end-of-stream artifact of the
+api_server template; the client already has the full stream; the older prod
+build does not log it), and `gemini-3.5-pro` returns 404 from this project on
+both `global` and `us-central1` — it is not in the default allowlist for that
+reason; `gemini-2.5-pro` answers from `global`.
+
+One more live-verified trap, now caught up front: a **named `thinking_level`
+is a 3-series knob**. `gemini-2.5-pro` rejects it with 400, and the baseline
+planners pin MEDIUM / LOW — so `{"model": "gemini-2.5-pro"}` alone would die
+silently. `read_overrides` refuses such a run unless `thinking_level` (and
+`critic_thinking_level`, while the critic is on) is `DYNAMIC`; the set of
+models that do accept named levels is `SANDBOX_THINKING_LEVEL_MODELS`.
+
+### Billing
+
+Agent Engine bills per deployed engine for as long as it exists, whether or not
+it serves traffic. Tear the sandbox down when an experiment series is over and
+recreate it from the current commit when the next one starts — the deploy is
+reproducible, the engine holds no state worth keeping.
+
+### Tear down
+
+```bash
+deployment/teardown-sandbox.sh           # ID from deploy-sandbox.env; asks for confirmation
+deployment/teardown-sandbox.sh <id>      # explicit
+```
+
+Shows the engine's display name before deleting, refuses the production ID, and
+deletes with `force=true` (sessions the engine owns go with it). There is no
+`gcloud` surface for reasoning engines, so it calls the Vertex REST API directly.
+Afterwards blank `SANDBOX_AGENT_ENGINE_ID` in `deploy-sandbox.env`, or the next
+deploy fails on a 404 instead of creating a fresh engine.
+
+### Known deviations from the deploy section above
+
+- **A relative `--env_file` path is silently ignored.** `adk deploy`
+  `chdir()`s into its `gub_agent_tmp…/` folder *before* it reads the env file
+  (ADK 2.6.1 `cli_deploy.py:1000` vs `:1094`), so `--env_file=deploy-dev.env`
+  is looked up in the wrong directory, found missing, and skipped with no
+  message — the engine comes up with **no env at all**. This is why the
+  production engine's `deploymentSpec` is empty today: the `EMIT_THINKING=1`
+  the Deploy workflow has passed since the file existed has never reached it,
+  and prod runs entirely on `config.py` defaults. `deploy-sandbox.sh` passes an
+  absolute path and reads the env back from the deployed resource afterwards,
+  failing if `SANDBOX_ENABLED` is not there. `deploy.yml` still passes the
+  relative path — fixing it (`--env_file="$GITHUB_WORKSPACE/deploy-dev.env"`)
+  would, as a side effect, switch thinking summaries ON in production on the
+  next deploy; decide that before changing it.
+- **`--env_file` is deprecated** in ADK 2.6.1 (it warns and still works — it
+  populates the deploy's `env_vars`). Its successor is an `env_vars` block in
+  an `.agent_engine_config.json` passed via `--agent_engine_config_file`.
+  Whichever flag, keep the env in a **per-deploy file outside `gub_agent/`**:
+  a config file committed inside the package is picked up by default by
+  *every* deploy, including production.
 
 ## Security
 

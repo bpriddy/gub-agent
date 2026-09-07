@@ -7,7 +7,7 @@ means editing code or env and running `adk deploy agent_engine`: 10-15 minutes
 per iteration, into the same engine that serves the live Chat bot. This module
 moves those four knobs into ONE session-state key, read fresh on every call:
 
-    create_session(state={"sandbox": {"model": "gemini-3.5-pro",
+    create_session(state={"sandbox": {"model": "gemini-2.5-pro",
                                       "thinking_level": "LOW",
                                       "executor_instruction": "<text>"}})
 
@@ -71,8 +71,8 @@ logger = logging.getLogger(__name__)
 STATE_KEY = "sandbox"
 RESOLVED_STATE_KEY = "sandbox_resolved"
 
-# Prompts above this go through the variant registry (02/#31) instead of the
-# wire: a session-state payload is not a document store.
+# Prompts above this go through the variant registry (`prompts/variants/`)
+# instead of the wire: a session-state payload is not a document store.
 MAX_PROMPT_BYTES = 64 * 1024
 
 Role = Literal["executor", "critic"]
@@ -139,14 +139,20 @@ def _explain(exc: ValidationError) -> str:
 
 
 def _resolve_variant(name: str, role: Role) -> str:
-    """Text for a registry variant name (registry lands with 02/#31).
+    """Text for a registry variant name (`prompts/variants/`).
 
     An unknown name — or a build with no registry at all — is an ERROR, never a
     fall back to baseline: otherwise an A/B would compare the baseline against
     itself and report a tie.
+
+    The import is local and the ImportError branch is kept even though the
+    registry now ships in-tree: `adk deploy agent_engine` bundles the package,
+    and a registry missing from the deployed image is precisely the failure this
+    must not paper over — the run would look fine and compare two identical
+    prompts.
     """
     try:
-        from .prompts.variants import resolve_variant  # noqa: PLC0415 — optional (02/#31)
+        from .prompts.variants import resolve_variant  # noqa: PLC0415 — see docstring
     except ImportError as exc:
         raise ValueError(
             f"sandbox: {role}_variant={name!r} requested, but the prompt-variant "
@@ -175,6 +181,25 @@ def _validate(overrides: SandboxOverrides) -> None:
             f"sandbox: model {overrides.model!r} is not allowed. Allowed models: "
             f"{allowed} (set SANDBOX_MODEL_ALLOWLIST to widen)."
         )
+    if overrides.model is not None and overrides.model not in config.SANDBOX_THINKING_LEVEL_MODELS:
+        # A named thinking_level is a 3-series knob; other models return 400 for
+        # it — and the baseline planners carry a named level, so "model only" is
+        # not a valid override for such a model. Verified live (gemini-2.5-pro).
+        executor_level = overrides.thinking_level or EXECUTOR_THINKING_LEVEL
+        critic_level = overrides.critic_thinking_level or CRITIC_THINKING_LEVEL
+        offending = []
+        if executor_level != "DYNAMIC":
+            offending.append(f"thinking_level={executor_level}")
+        if overrides.critic_enabled and critic_level != "DYNAMIC":
+            offending.append(f"critic_thinking_level={critic_level}")
+        if offending:
+            raise ValueError(
+                f"sandbox: model {overrides.model!r} does not accept a named thinking level "
+                f"(Vertex answers 400 INVALID_ARGUMENT), but {', '.join(offending)} would apply "
+                "to this run. Set thinking_level (and critic_thinking_level, unless "
+                "critic_enabled is false) to DYNAMIC for this model — or add the model to "
+                "SANDBOX_THINKING_LEVEL_MODELS if it does accept named levels."
+            )
     if overrides.temperature is not None and not 0.0 <= overrides.temperature <= 2.0:
         raise ValueError(
             f"sandbox: temperature {overrides.temperature} is outside 0.0..2.0. "

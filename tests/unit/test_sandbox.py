@@ -41,7 +41,8 @@ from gub_agent.sandbox import (
     sandbox_instruction,
 )
 
-ALLOWLIST = ("gemini-3.5-flash", "gemini-3.5-pro")
+ALLOWLIST = ("gemini-3.5-flash", "gemini-2.5-pro")
+THINKING_LEVEL_MODELS = ("gemini-3.5-flash",)
 
 # Identity sentinel: the planner assigns its own long-lived ThinkingConfig into
 # the request, so "unchanged" means the SAME object, not an equal one.
@@ -54,6 +55,7 @@ def sandbox_on(monkeypatch):
     what the error messages are expected to say."""
     monkeypatch.setattr(config, "SANDBOX_ENABLED", True)
     monkeypatch.setattr(config, "SANDBOX_MODEL_ALLOWLIST", ALLOWLIST)
+    monkeypatch.setattr(config, "SANDBOX_THINKING_LEVEL_MODELS", THINKING_LEVEL_MODELS)
 
 
 @pytest.fixture
@@ -162,9 +164,36 @@ async def test_model_override_reaches_the_request(sandbox_on):
     so overwriting that field in before_model_callback changes which model
     answers — no redeploy."""
     req = _req()
-    sandbox_before_model(_ctx_for({"sandbox": {"model": "gemini-3.5-pro"}}), req, role="executor")
-    assert req.model == "gemini-3.5-pro"
+    sandbox_before_model(_ctx_for({"sandbox": {"model": "gemini-3.5-flash"}}), req, role="executor")
+    assert req.model == "gemini-3.5-flash"
     assert req.config.thinking_config is BASE_THINKING  # untouched knobs stay untouched
+
+
+async def test_model_without_named_thinking_support_needs_dynamic(sandbox_on):
+    """Live-verified trap: gemini-2.5-pro rejects `thinking_level` with 400, and
+    inside the engine that 400 is an EMPTY 200 stream for the caller. The
+    baseline planners carry named levels, so `model` alone is not a valid
+    override for such a model — refuse up front, with the fix in the message."""
+    with pytest.raises(ValueError, match="DYNAMIC") as exc:
+        read_overrides({"sandbox": {"model": "gemini-2.5-pro"}})
+    assert "thinking_level=MEDIUM" in str(exc.value)  # the baseline that would apply
+    assert "critic_thinking_level=LOW" in str(exc.value)
+
+    # One role fixed is not enough while the critic still runs.
+    with pytest.raises(ValueError, match="critic_thinking_level=LOW"):
+        read_overrides({"sandbox": {"model": "gemini-2.5-pro", "thinking_level": "DYNAMIC"}})
+
+
+async def test_dynamic_on_both_roles_unlocks_such_a_model(sandbox_on):
+    both = {
+        "model": "gemini-2.5-pro",
+        "thinking_level": "DYNAMIC",
+        "critic_thinking_level": "DYNAMIC",
+    }
+    assert read_overrides({"sandbox": both}).model == "gemini-2.5-pro"
+    # With the critic off, its level is irrelevant.
+    no_critic = {"model": "gemini-2.5-pro", "thinking_level": "DYNAMIC", "critic_enabled": False}
+    assert read_overrides({"sandbox": no_critic}).critic_enabled is False
 
 
 # ── 4. DYNAMIC thinking ───────────────────────────────────────────────────────
@@ -241,10 +270,18 @@ async def test_temperature_out_of_range_is_not_clamped(sandbox_on):
 
 
 async def test_unknown_variant_does_not_fall_back_to_baseline(sandbox_on):
-    """No registry in this build (or no such name) → the run fails rather than
-    quietly running the baseline prompt."""
+    """A name the registry doesn't hold (or a build with no registry at all)
+    fails the run rather than quietly running the baseline prompt. Validated
+    eagerly, at read time — not on the fourth model call of the answer."""
     with pytest.raises(ValueError, match="variant"):
-        read_overrides({"sandbox": {"executor_variant": "v2_concise"}})
+        read_overrides({"sandbox": {"executor_variant": "v9_does_not_exist"}})
+
+
+async def test_registered_variant_resolves(sandbox_on):
+    """The other half of the above: a real registry name passes validation, so
+    the no-fallback rule can't be satisfied by rejecting everything."""
+    overrides = read_overrides({"sandbox": {"executor_variant": "v2_concise"}})
+    assert overrides.executor_variant == "v2_concise"
 
 
 # ── 7. unknown key ────────────────────────────────────────────────────────────
@@ -253,12 +290,19 @@ async def test_unknown_variant_does_not_fall_back_to_baseline(sandbox_on):
 async def test_unknown_key_warns_and_the_run_continues(sandbox_on, caplog):
     """Callers evolve faster than the engine redeploys: a key this build doesn't
     know must not kill the run — but must not pass unnoticed either."""
-    state = {"sandbox": {"model": "gemini-3.5-pro", "top_k": 7}}
+    state = {
+        "sandbox": {
+            "model": "gemini-2.5-pro",
+            "thinking_level": "DYNAMIC",
+            "critic_thinking_level": "DYNAMIC",
+            "top_k": 7,
+        }
+    }
     req = _req()
     with caplog.at_level(logging.WARNING, logger="gub_agent.sandbox"):
         sandbox_before_model(_ctx_for(state), req, role="executor")
 
-    assert req.model == "gemini-3.5-pro"  # the known key still applied
+    assert req.model == "gemini-2.5-pro"  # the known key still applied
     assert any("top_k" in record.getMessage() for record in caplog.records)
 
 
@@ -316,7 +360,7 @@ async def test_resolved_config_reports_what_actually_ran(sandbox_on):
     flat and JSON-safe, so the batch runner can write one row per run."""
     state = {
         "sandbox": {
-            "model": "gemini-3.5-pro",
+            "model": "gemini-3.5-flash",  # a model that accepts the named level below
             "thinking_level": "LOW",
             "temperature": 0.2,
             "executor_instruction": "OVERRIDE",
@@ -325,7 +369,7 @@ async def test_resolved_config_reports_what_actually_ran(sandbox_on):
     }
     resolved = resolved_config(read_overrides(state))
 
-    assert resolved["model"] == "gemini-3.5-pro"
+    assert resolved["model"] == "gemini-3.5-flash"
     assert resolved["thinking_level"] == "LOW"
     assert resolved["critic_thinking_level"] == "LOW"  # untouched baseline
     assert resolved["temperature"] == 0.2
@@ -348,11 +392,20 @@ async def test_echo_emits_the_provenance_event(sandbox_on):
     write: flat writes there don't survive between calls (which is why
     round_limiter keeps its own dict), and the event stream is what the batch
     runner reads."""
-    ctx = await _real_ctx({"sandbox": {"model": "gemini-3.5-pro", "label": "run-7"}})
+    ctx = await _real_ctx(
+        {
+            "sandbox": {
+                "model": "gemini-2.5-pro",
+                "thinking_level": "DYNAMIC",
+                "critic_thinking_level": "DYNAMIC",
+                "label": "run-7",
+            }
+        }
+    )
 
     events = [event async for event in SandboxEcho(name="sandbox_echo").run_async(ctx)]
 
     assert len(events) == 1
     resolved = events[0].actions.state_delta["sandbox_resolved"]
-    assert resolved["model"] == "gemini-3.5-pro"
+    assert resolved["model"] == "gemini-2.5-pro"
     assert resolved["label"] == "run-7"
