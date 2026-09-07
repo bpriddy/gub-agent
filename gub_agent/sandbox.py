@@ -181,6 +181,25 @@ def _validate(overrides: SandboxOverrides) -> None:
             f"sandbox: model {overrides.model!r} is not allowed. Allowed models: "
             f"{allowed} (set SANDBOX_MODEL_ALLOWLIST to widen)."
         )
+    if overrides.model is not None and overrides.model not in config.SANDBOX_THINKING_LEVEL_MODELS:
+        # A named thinking_level is a 3-series knob; other models return 400 for
+        # it — and the baseline planners carry a named level, so "model only" is
+        # not a valid override for such a model. Verified live (gemini-2.5-pro).
+        executor_level = overrides.thinking_level or EXECUTOR_THINKING_LEVEL
+        critic_level = overrides.critic_thinking_level or CRITIC_THINKING_LEVEL
+        offending = []
+        if executor_level != "DYNAMIC":
+            offending.append(f"thinking_level={executor_level}")
+        if overrides.critic_enabled and critic_level != "DYNAMIC":
+            offending.append(f"critic_thinking_level={critic_level}")
+        if offending:
+            raise ValueError(
+                f"sandbox: model {overrides.model!r} does not accept a named thinking level "
+                f"(Vertex answers 400 INVALID_ARGUMENT), but {', '.join(offending)} would apply "
+                "to this run. Set thinking_level (and critic_thinking_level, unless "
+                "critic_enabled is false) to DYNAMIC for this model — or add the model to "
+                "SANDBOX_THINKING_LEVEL_MODELS if it does accept named levels."
+            )
     if overrides.temperature is not None and not 0.0 <= overrides.temperature <= 2.0:
         raise ValueError(
             f"sandbox: temperature {overrides.temperature} is outside 0.0..2.0. "

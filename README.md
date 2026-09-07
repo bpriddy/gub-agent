@@ -132,8 +132,9 @@ on every call:
 ```python
 create_session(state={"sandbox": {
     "model": "gemini-2.5-pro",          # allowlist: SANDBOX_MODEL_ALLOWLIST
-    "thinking_level": "LOW",            # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC
-    "critic_thinking_level": "MINIMAL",
+    "thinking_level": "DYNAMIC",        # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC — named
+    "critic_thinking_level": "DYNAMIC", #   levels are 3-series only; a 2.5 model
+                                        #   needs DYNAMIC on both roles (enforced)
     "temperature": 0.2,
     "executor_instruction": "<full prompt text>",   # or executor_variant
     "critic_instruction": "<full prompt text>",     # or critic_variant
@@ -343,6 +344,13 @@ api_server template; the client already has the full stream; the older prod
 build does not log it), and `gemini-3.5-pro` returns 404 from this project on
 both `global` and `us-central1` — it is not in the default allowlist for that
 reason; `gemini-2.5-pro` answers from `global`.
+
+One more live-verified trap, now caught up front: a **named `thinking_level`
+is a 3-series knob**. `gemini-2.5-pro` rejects it with 400, and the baseline
+planners pin MEDIUM / LOW — so `{"model": "gemini-2.5-pro"}` alone would die
+silently. `read_overrides` refuses such a run unless `thinking_level` (and
+`critic_thinking_level`, while the critic is on) is `DYNAMIC`; the set of
+models that do accept named levels is `SANDBOX_THINKING_LEVEL_MODELS`.
 
 ### Billing
 
