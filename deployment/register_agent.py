@@ -9,8 +9,9 @@ Prerequisites:
   1. `adk deploy agent_engine` has been run and AGENT_ENGINE_ID is set in .env
   2. The running identity has roles/discoveryengine.admin on the project
   3. The Gemini Enterprise service account has been granted aiplatform.user:
+       SA=service-$PROJECT_NUMBER@gcp-sa-discoveryengine.iam.gserviceaccount.com
        gcloud projects add-iam-policy-binding $PROJECT_ID \\
-         --member="serviceAccount:service-$PROJECT_NUMBER@gcp-sa-discoveryengine.iam.gserviceaccount.com" \\
+         --member="serviceAccount:$SA" \\
          --role="roles/aiplatform.user"
 
 Usage:
@@ -23,7 +24,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -36,12 +36,12 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PROJECT_ID     = os.environ["GCP_PROJECT_ID"]
+PROJECT_ID = os.environ["GCP_PROJECT_ID"]
 PROJECT_NUMBER = os.environ.get("GCP_PROJECT_NUMBER", PROJECT_ID)  # numeric, e.g. 843516467880
-REGION         = os.environ.get("GCP_REGION", "global")
-APP_ID         = os.environ["GEMINI_APP_ID"]
-ENGINE_ID      = os.environ.get("AGENT_ENGINE_ID", "")
-AGENT_NAME     = os.environ.get("AGENT_NAME", "gub-agent")
+REGION = os.environ.get("GCP_REGION", "global")
+APP_ID = os.environ["GEMINI_APP_ID"]
+ENGINE_ID = os.environ.get("AGENT_ENGINE_ID", "")
+AGENT_NAME = os.environ.get("AGENT_NAME", "gub-agent")
 
 TOOL_DESCRIPTION = (
     "Use this agent to answer questions about the agency's operations. "
@@ -61,17 +61,21 @@ DE_BASE = (
 # Full Vertex AI Agent Engine resource path — MUST use project NUMBER not ID
 REASONING_ENGINE = (
     f"projects/{PROJECT_NUMBER}/locations/us-central1/reasoningEngines/{ENGINE_ID}"
-    if ENGINE_ID else ""
+    if ENGINE_ID
+    else ""
 )
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+
 def get_access_token() -> str:
     """Get a GCP access token via the active gcloud identity."""
     result = subprocess.run(
         ["gcloud", "auth", "print-access-token"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return result.stdout.strip()
 
@@ -84,6 +88,7 @@ def headers() -> dict:
 
 
 # ── Operations ────────────────────────────────────────────────────────────────
+
 
 def list_agents() -> None:
     resp = requests.get(DE_BASE, headers=headers(), timeout=30)
@@ -165,12 +170,13 @@ def delete_agent(agent_id: str) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Register the GUB agent with Gemini Enterprise")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--list",   action="store_true", help="List registered agents")
-    group.add_argument("--update", metavar="AGENT_ID",  help="Update an existing agent registration")
-    group.add_argument("--delete", metavar="AGENT_ID",  help="Delete an agent registration")
+    group.add_argument("--list", action="store_true", help="List registered agents")
+    group.add_argument("--update", metavar="AGENT_ID", help="Update an existing registration")
+    group.add_argument("--delete", metavar="AGENT_ID", help="Delete an agent registration")
     args = parser.parse_args()
 
     if args.list:

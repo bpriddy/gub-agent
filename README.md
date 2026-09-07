@@ -107,12 +107,57 @@ and critic use an ADK **`InstructionProvider`** (a *callable* instruction,
 deterministic, never stale, no tool, no caller coupling. This is what makes
 "recent" / "this week" reliable.
 
-> **ADK brace trap:** ADK runs `{var}` session-state injection over instruction
-> strings (including an InstructionProvider's *output*). Any literal `{anything}`
-> that isn't a real state key crashes the run with `KeyError` before the LLM is
-> called — visible only in the Reasoning Engine logs. Grep prompts for `{`
-> before every `adk deploy`. (f-string interpolations like `f"{base}"` are safe
-> because they don't emit literal braces.)
+> **ADK brace trap — and why a callable instruction escapes it:** ADK runs
+> `{var}` session-state injection over instruction strings, and any literal
+> `{anything}` that isn't a real state key crashes the run with `KeyError`
+> before the LLM is called — visible only in the Reasoning Engine logs.
+> That pass is **skipped for callable instructions**: `canonical_instruction`
+> returns `bypass_state_injection=True` for an InstructionProvider
+> (`llm_agent.py:692-698`), so `inject_session_state` never runs over its output
+> (`flows/llm_flows/instructions.py:51-59`, ADK 2.6.1 — verified). Both agents
+> here use callables, so braces in `prompts/` are in fact safe today, and a
+> prompt arriving from session state (see the sandbox below) may contain them.
+> The trap is real the moment an `instruction=` becomes a plain string — keep
+> them callables. (f-string interpolations like `f"{base}"` were never at risk:
+> they don't emit literal braces.)
+
+### Sandbox — per-call prompt / model / thinking / temperature
+
+Both agents are built at module import, so changing a prompt, a model or a
+thinking level used to mean a code edit plus `adk deploy agent_engine`: 10-15
+minutes per iteration, into the engine that serves the Chat bot.
+`gub_agent/sandbox.py` moves those knobs into one session-state key, read fresh
+on every call:
+
+```python
+create_session(state={"sandbox": {
+    "model": "gemini-3.5-pro",          # allowlist: SANDBOX_MODEL_ALLOWLIST
+    "thinking_level": "LOW",            # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC
+    "critic_thinking_level": "MINIMAL",
+    "temperature": 0.2,
+    "executor_instruction": "<full prompt text>",   # or executor_variant
+    "critic_instruction": "<full prompt text>",     # or critic_variant
+    "critic_enabled": False,            # measure the executor alone
+    "label": "concise-v2",              # free-form, provenance only
+}})
+```
+
+Three application points: the instruction providers (prompt), the
+`before_model_callback` chain (model / thinking / temperature, by overwriting
+`llm_request.model` and `llm_request.config`) and `CriticGate` (`critic_enabled`).
+`sandbox_echo` — the pipeline's first sub-agent — emits the resolved config
+(model, thinking, temperature, prompt source, `sha256[:12]`, label) as a
+`sandbox_resolved` state delta the caller's event stream carries.
+
+Two rules the design keeps:
+
+- **`SANDBOX_ENABLED=false` (the default, and prod) makes the whole thing
+  inert** — a `sandbox` key is ignored with no warn and no error, and no extra
+  event enters the trace. Set the flag only on the sandbox engine.
+- **No silent fallbacks.** An unknown key warns and is ignored; an invalid value
+  of a known key (model off the allowlist, temperature outside 0.0-2.0, prompt
+  over 64 KB, unknown variant name) fails the run. An A/B that quietly ran the
+  baseline in both arms is worse than one that didn't run.
 
 ## Local setup
 

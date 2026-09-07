@@ -50,6 +50,29 @@ AGENT_NAME: str = os.environ.get("AGENT_NAME", "gub_agent")
 # internal reasoning never reaches end users.
 EMIT_THINKING: bool = os.environ.get("EMIT_THINKING", "false").lower() in ("1", "true", "yes")
 
+# ── Sandbox (per-call overrides) ───────────────────────────────────────────────
+# Master switch for the experiment sandbox (sandbox.py): when false, a `sandbox`
+# key in session state is ignored completely — no warn, no error, nothing logged.
+# Set it ONLY on the dev/sandbox engine; the prod engine must stay inert so an
+# override aimed at a sandbox run can never reach the engine serving the Chat bot.
+SANDBOX_ENABLED: bool = os.environ.get("SANDBOX_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Models a sandbox run may select. An allowlist rather than a free-text field:
+# `llm_request.model` is swapped inside the SAME genai client (Vertex, global
+# endpoint — pinned above), so only models that client can serve are valid; a
+# cross-provider model needs a different BaseLlm and is out of scope.
+SANDBOX_MODEL_ALLOWLIST: tuple[str, ...] = tuple(
+    name.strip()
+    for name in os.environ.get("SANDBOX_MODEL_ALLOWLIST", "gemini-3.5-flash,gemini-3.5-pro").split(
+        ","
+    )
+    if name.strip()
+)
+
 
 def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
     """Native thinking planner shared by the executor and critic.

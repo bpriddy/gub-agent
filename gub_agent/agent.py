@@ -4,6 +4,8 @@ agent.py — GUB AI Agent pipeline.
 The agent is a small multi-agent pipeline (Phase C):
 
   LoopAgent(max_iterations=2)
+    ├─ sandbox_echo — records the resolved sandbox config on experiment runs
+    │                  (silent on ordinary ones); see sandbox.py
     ├─ executor_agent — runs the existing tool-using LLM
     ├─ critic_agent — evaluates the executor's response; emits structured
     │                  verdict {sufficient, reason, feedback} into state
@@ -20,6 +22,10 @@ external interface — multi-agent pipeline is invisible at the boundary.
 
 The executor's instruction text lives in `prompts/executor.py` (edit it
 there); the critic's lives in `prompts/critic.py`.
+
+Prompt, model, thinking level and temperature are overridable per call from
+`state["sandbox"]` (`sandbox.py`) so experiments need no redeploy. With no
+such key every override point is a no-op.
 """
 
 from google.adk.agents import Agent, LoopAgent
@@ -31,6 +37,12 @@ from .agents.round_limiter import reset_rounds, round_limit
 from .config import AGENT_NAME, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
 from .prompts import EXECUTOR_INSTRUCTION
+from .sandbox import (
+    EXECUTOR_THINKING_LEVEL,
+    sandbox_before_model,
+    sandbox_echo,
+    sandbox_instruction,
+)
 from .tools import ALL_TOOLS
 
 
@@ -46,9 +58,16 @@ def _before_agent(callback_context):
 
 
 def _before_model(callback_context, llm_request):
-    """Chain the model-level guards: prune prior-turn tool payloads, mask
-    `_sources` citation plumbing from current-turn results, then cap ReAct
-    rounds (strip tools past the budget)."""
+    """Chain the model-level guards: apply any sandbox overrides (model,
+    thinking, temperature), prune prior-turn tool payloads, mask `_sources`
+    citation plumbing from current-turn results, then cap ReAct rounds (strip
+    tools past the budget).
+
+    Sandbox first, deliberately: it only writes `llm_request.model` and fields
+    of `config`, while the round limiter may clear `config.tools` — neither can
+    undo the other. With no `sandbox` key in state it is a no-op.
+    """
+    sandbox_before_model(callback_context, llm_request, role="executor")
     strip_prior_turn_tool_parts(callback_context, llm_request)
     strip_source_metadata(callback_context, llm_request)
     return round_limit(callback_context, llm_request)
@@ -60,12 +79,17 @@ executor_agent = Agent(
     model=build_model(),
     name=AGENT_NAME,
     # InstructionProvider — appends today's date deterministically per request.
-    instruction=with_current_date(EXECUTOR_INSTRUCTION),
+    # Wrapped for the sandbox: a run carrying state["sandbox"].executor_instruction
+    # (or .executor_variant) swaps the prompt for that call only, with no redeploy;
+    # without one, the base provider's text is returned unchanged.
+    instruction=sandbox_instruction(with_current_date(EXECUTOR_INSTRUCTION), role="executor"),
     # Native thinking capped at MEDIUM. Unbounded (dynamic) thinking was the top
     # latency driver (thinking_tokens ↔ elapsed r=0.86): hard questions ran away
     # to 9-13k thought tokens / one 40s pause per step (pitch 70s @ 2 calls,
     # chevy 77s). MEDIUM keeps room to reason while cutting the runaway tail.
-    planner=build_thinking_planner("MEDIUM"),
+    # (EXECUTOR_THINKING_LEVEL, so the sandbox provenance can't drift from what
+    # actually runs; a sandbox run overrides it per call in _before_model.)
+    planner=build_thinking_planner(EXECUTOR_THINKING_LEVEL),
     tools=ALL_TOOLS,
     # Reset the per-pass round + tool budgets at the start of each executor pass
     # (so critic-requested retries aren't born over budget). See _before_agent.
@@ -84,8 +108,13 @@ executor_agent = Agent(
 # sufficient=true, escalator triggers loop exit after one iteration. On
 # flagged failures, the executor runs again seeing the critic's feedback in
 # session state. Capped at 2 iterations.
+#
+# sandbox_echo leads the pipeline: on an experiment run it records what the run
+# resolved to (model, thinking, temperature, prompt hash) as a state_delta the
+# caller's event stream carries. On an ordinary run it emits nothing at all, so
+# the trace shape is byte-for-byte today's.
 root_agent = LoopAgent(
     name="gub_pipeline",
-    sub_agents=[executor_agent, critic_gate, escalator_agent],
+    sub_agents=[sandbox_echo, executor_agent, critic_gate, escalator_agent],
     max_iterations=2,
 )

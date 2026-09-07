@@ -6,7 +6,7 @@ This function 302-redirects to Google's OAuth endpoint with the full query strin
 """
 
 import functions_framework
-from flask import redirect, request
+from flask import redirect  # `request` is the handler's parameter, not the flask global
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 
