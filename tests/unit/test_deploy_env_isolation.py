@@ -5,10 +5,11 @@ There is one production engine; the Chat bot and the Gemini Enterprise
 registration point at it. Its isolation from experiments rests on a single
 fact: the env file the production deploy bakes in has SANDBOX_ENABLED off, and
 only the sandbox deploy's env file has it on. Both files are plain text that
-anyone can edit, and the production deploy's file is called `deploy-dev.env` —
-a name that has already invited exactly the mistake this pins (adding the flag
-"to the dev file"). So the check lives in CI: read the workflow, find the file
-it deploys, and refuse a build that would arm the sandbox in production.
+anyone can edit, and production's used to be called `deploy-dev.env` — a name
+that invited exactly the mistake this pins (adding a flag "to the dev file").
+So the check lives in CI: read the workflow, find the file it deploys, and
+refuse a build that would arm the sandbox in production, name the file "dev"
+again, or pass a relative --env_file that would be silently skipped.
 """
 
 from __future__ import annotations
@@ -43,7 +44,10 @@ def _flag_on(values: dict[str, str], key: str) -> bool:
 def _env_file_named_in(text: str) -> Path:
     found = re.findall(r"--env_file=(\S+)", text)
     assert len(found) == 1, f"expected exactly one --env_file in {text[:60]!r}..., got {found}"
-    return REPO / found[0].strip("'\"")
+    named = found[0].strip("'\"")
+    # The workflow anchors the path on $GITHUB_WORKSPACE (see the absolute-path
+    # test below); resolve it against the repo the same way the runner would.
+    return REPO / named.removeprefix("$GITHUB_WORKSPACE/")
 
 
 def _prod_env_file() -> Path:
@@ -111,3 +115,48 @@ async def test_sandbox_script_does_not_register_with_gemini_enterprise():
 async def test_sandbox_script_refuses_the_production_engine_id():
     """The literal guard must be in the script, not only in the reviewer's head."""
     assert PROD_ENGINE_ID in SANDBOX_SCRIPT.read_text()
+
+
+async def test_production_workflow_passes_an_absolute_env_file_path():
+    """The bug this pins is silent, not loud: `adk deploy` chdir()s into its
+    staging folder before reading --env_file, so a relative path resolves in
+    the wrong directory and is skipped with no error. The engine then runs on
+    config.py defaults and looks like a successful deploy — which is what
+    happened to production for a month. Absolute, or the build fails."""
+    text = DEPLOY_WORKFLOW.read_text()
+    found = re.findall(r"--env_file=(\S+)", text)
+    assert len(found) == 1, found
+    named = found[0].strip("'\"")
+    assert named.startswith(("$GITHUB_WORKSPACE/", "/")), (
+        f"--env_file={named} is relative and would be silently dropped"
+    )
+
+
+async def test_production_env_file_is_not_named_dev():
+    """The name is load-bearing documentation: for a month this file was called
+    deploy-dev.env while being the file the PRODUCTION deploy bakes in."""
+    name = _prod_env_file().name
+    assert "dev" not in name.lower(), (
+        f"{name} is deployed to production ({PROD_ENGINE_ID}) — a 'dev' name "
+        "invites edits meant for a test engine"
+    )
+
+
+async def test_production_deploy_declares_emit_thinking_explicitly():
+    """EMIT_THINKING sat at 1 in this file for its whole life and never reached
+    the engine, so production has always run with thought summaries off. The
+    key stays explicit so that whoever changes it is choosing, not discovering."""
+    values = _env(_prod_env_file())
+    assert "EMIT_THINKING" in values, (
+        f"{_prod_env_file().name}: keep EMIT_THINKING explicit — the fix to the "
+        "env_file path means its value now actually reaches production"
+    )
+
+
+async def test_production_deploy_verifies_the_env_landed():
+    """A deploy that cannot fail on a skipped env file will hide the next one."""
+    text = DEPLOY_WORKFLOW.read_text()
+    assert "verify-engine-env.sh" in text, (
+        "deploy.yml must read the env back off the engine after deploying"
+    )
+    assert (REPO / "deployment" / "verify-engine-env.sh").exists()
