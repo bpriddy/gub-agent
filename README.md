@@ -263,7 +263,7 @@ live users:
 
 | env file | baked into | `SANDBOX_ENABLED` | `EMIT_THINKING` |
 |---|---|---|---|
-| `deploy-dev.env` | the **production** engine (`deploy.yml` passes it as `--env_file`) — the name predates the split | `0`, explicit | `1` |
+| `deploy-prod.env` | the **production** engine (`deploy.yml` passes it as an absolute `--env_file`) — renamed from `deploy-dev.env`, whose name predated the split | `0`, explicit | `1` |
 | `deploy-sandbox.env` | the sandbox engine (`deployment/deploy-sandbox.sh`) | `1` | `1` |
 
 With the flag off, `state["sandbox"]` is ignored outright — no warn, no error,
@@ -376,17 +376,26 @@ deploy fails on a 404 instead of creating a fresh engine.
 
 - **A relative `--env_file` path is silently ignored.** `adk deploy`
   `chdir()`s into its `gub_agent_tmp…/` folder *before* it reads the env file
-  (ADK 2.6.1 `cli_deploy.py:1000` vs `:1094`), so `--env_file=deploy-dev.env`
-  is looked up in the wrong directory, found missing, and skipped with no
-  message — the engine comes up with **no env at all**. This is why the
-  production engine's `deploymentSpec` is empty today: the `EMIT_THINKING=1`
-  the Deploy workflow has passed since the file existed has never reached it,
-  and prod runs entirely on `config.py` defaults. `deploy-sandbox.sh` passes an
-  absolute path and reads the env back from the deployed resource afterwards,
-  failing if `SANDBOX_ENABLED` is not there. `deploy.yml` still passes the
-  relative path — fixing it (`--env_file="$GITHUB_WORKSPACE/deploy-dev.env"`)
-  would, as a side effect, switch thinking summaries ON in production on the
-  next deploy; decide that before changing it.
+  (ADK 2.6.1 `cli_deploy.py:1000` vs `:1094`), so a relative
+  `--env_file=deploy-prod.env` is looked up in the wrong directory, found
+  missing, and skipped with no message — the engine comes up with **no env at
+  all**. This is why the production engine's `deploymentSpec` was empty for a
+  month: the `EMIT_THINKING=1` the Deploy workflow passed from 2026-08-10
+  never reached it, and prod ran entirely on `config.py` defaults.
+
+  **Fixed:** both deploys now pass an absolute path (`deploy.yml` via
+  `$GITHUB_WORKSPACE`, `deploy-sandbox.sh` via `$REPO_ROOT`) and both read the
+  env back off the deployed resource afterwards
+  (`deployment/verify-engine-env.sh`), failing the deploy if a key never
+  landed. CI pins the absolute path
+  (`tests/unit/test_deploy_env_isolation.py`).
+
+  Because the fix means the file's values now actually reach production,
+  `EMIT_THINKING` was pinned to `0` in `deploy-prod.env` — production keeps the
+  behavior it has had all along. Flipping it to `1` is a deliberate decision:
+  the Chat bot filters thought parts (`src/agent/client.ts:336`) so chat users
+  would see nothing new, but the summaries would reach every other consumer of
+  the engine, Gemini Enterprise included, and enlarge every event payload.
 - **`--env_file` is deprecated** in ADK 2.6.1 (it warns and still works — it
   populates the deploy's `env_vars`). Its successor is an `env_vars` block in
   an `.agent_engine_config.json` passed via `--agent_engine_config_file`.

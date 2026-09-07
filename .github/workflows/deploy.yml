@@ -59,10 +59,15 @@ jobs:
       - name: Install deploy dependencies
         run: pip install -e ".[deploy]"
 
-      # --env_file bakes deploy-dev.env (EMIT_THINKING=1) into the engine,
-      # matching the current dev deploy convention. --region controls where
-      # the engine RESOURCE lives; model calls stay on the global endpoint
-      # via config (see README "Model endpoint vs engine region").
+      # --env_file bakes deploy-prod.env into the engine. The path is
+      # ABSOLUTE on purpose: `adk deploy` chdir()s into its staging folder
+      # BEFORE it reads --env_file (ADK 2.6.1 cli_deploy.py:1000 vs :1094), so
+      # a relative path is looked up in the wrong directory and SILENTLY
+      # skipped — which is how this engine ran for a month on config.py
+      # defaults with an empty deploymentSpec. The verify step below is the
+      # tripwire. --region controls where the engine RESOURCE lives; model
+      # calls stay on the global endpoint via config (see README "Model
+      # endpoint vs engine region").
       - name: Deploy to Vertex AI Agent Engine
         # The dispatch input is passed as an ENV VALUE, never interpolated into
         # the script text — otherwise a crafted `description` (workflow_dispatch
@@ -79,5 +84,14 @@ jobs:
             --agent_engine_id="${{ vars.AGENT_ENGINE_ID }}" \
             --display_name="gub-agent" \
             --description="$DESC" \
-            --env_file=deploy-dev.env \
+            --env_file="$GITHUB_WORKSPACE/deploy-prod.env" \
             gub_agent
+
+      # A skipped env file leaves a healthy engine running on defaults, which
+      # looks exactly like a successful deploy. Read it back and fail loudly.
+      - name: Verify the env reached the engine
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          AGENT_ENGINE_ID: ${{ vars.AGENT_ENGINE_ID }}
+        run: deployment/verify-engine-env.sh "$GITHUB_WORKSPACE/deploy-prod.env"

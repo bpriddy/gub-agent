@@ -28,8 +28,9 @@ cd "$REPO_ROOT"
 # ABSOLUTE on purpose: `adk deploy` chdir()s into its temp folder BEFORE it
 # reads --env_file (ADK 2.6.1 cli_deploy.py:1000 vs :1094), so a relative path
 # is looked up in the wrong directory and SILENTLY skipped — the engine comes up
-# with no env at all. That is exactly how the production engine ended up with
-# an empty deploymentSpec despite deploy.yml passing --env_file=deploy-dev.env.
+# with no env at all. That is exactly how the production engine ended up with an
+# empty deploymentSpec while deploy.yml passed a relative --env_file (fixed:
+# deploy.yml now passes $GITHUB_WORKSPACE/deploy-prod.env and verifies it).
 ENV_FILE="$REPO_ROOT/deploy-sandbox.env"
 AGENT_PACKAGE="gub_agent"          # the package exporting root_agent
 DISPLAY_NAME="gub-agent-sandbox"
