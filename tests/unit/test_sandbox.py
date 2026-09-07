@@ -41,7 +41,7 @@ from gub_agent.sandbox import (
     sandbox_instruction,
 )
 
-ALLOWLIST = ("gemini-3.5-flash", "gemini-3.5-pro")
+ALLOWLIST = ("gemini-3.5-flash", "gemini-2.5-pro")
 
 # Identity sentinel: the planner assigns its own long-lived ThinkingConfig into
 # the request, so "unchanged" means the SAME object, not an equal one.
@@ -162,8 +162,8 @@ async def test_model_override_reaches_the_request(sandbox_on):
     so overwriting that field in before_model_callback changes which model
     answers — no redeploy."""
     req = _req()
-    sandbox_before_model(_ctx_for({"sandbox": {"model": "gemini-3.5-pro"}}), req, role="executor")
-    assert req.model == "gemini-3.5-pro"
+    sandbox_before_model(_ctx_for({"sandbox": {"model": "gemini-2.5-pro"}}), req, role="executor")
+    assert req.model == "gemini-2.5-pro"
     assert req.config.thinking_config is BASE_THINKING  # untouched knobs stay untouched
 
 
@@ -261,12 +261,12 @@ async def test_registered_variant_resolves(sandbox_on):
 async def test_unknown_key_warns_and_the_run_continues(sandbox_on, caplog):
     """Callers evolve faster than the engine redeploys: a key this build doesn't
     know must not kill the run — but must not pass unnoticed either."""
-    state = {"sandbox": {"model": "gemini-3.5-pro", "top_k": 7}}
+    state = {"sandbox": {"model": "gemini-2.5-pro", "top_k": 7}}
     req = _req()
     with caplog.at_level(logging.WARNING, logger="gub_agent.sandbox"):
         sandbox_before_model(_ctx_for(state), req, role="executor")
 
-    assert req.model == "gemini-3.5-pro"  # the known key still applied
+    assert req.model == "gemini-2.5-pro"  # the known key still applied
     assert any("top_k" in record.getMessage() for record in caplog.records)
 
 
@@ -324,7 +324,7 @@ async def test_resolved_config_reports_what_actually_ran(sandbox_on):
     flat and JSON-safe, so the batch runner can write one row per run."""
     state = {
         "sandbox": {
-            "model": "gemini-3.5-pro",
+            "model": "gemini-2.5-pro",
             "thinking_level": "LOW",
             "temperature": 0.2,
             "executor_instruction": "OVERRIDE",
@@ -333,7 +333,7 @@ async def test_resolved_config_reports_what_actually_ran(sandbox_on):
     }
     resolved = resolved_config(read_overrides(state))
 
-    assert resolved["model"] == "gemini-3.5-pro"
+    assert resolved["model"] == "gemini-2.5-pro"
     assert resolved["thinking_level"] == "LOW"
     assert resolved["critic_thinking_level"] == "LOW"  # untouched baseline
     assert resolved["temperature"] == 0.2
@@ -356,11 +356,11 @@ async def test_echo_emits_the_provenance_event(sandbox_on):
     write: flat writes there don't survive between calls (which is why
     round_limiter keeps its own dict), and the event stream is what the batch
     runner reads."""
-    ctx = await _real_ctx({"sandbox": {"model": "gemini-3.5-pro", "label": "run-7"}})
+    ctx = await _real_ctx({"sandbox": {"model": "gemini-2.5-pro", "label": "run-7"}})
 
     events = [event async for event in SandboxEcho(name="sandbox_echo").run_async(ctx)]
 
     assert len(events) == 1
     resolved = events[0].actions.state_delta["sandbox_resolved"]
-    assert resolved["model"] == "gemini-3.5-pro"
+    assert resolved["model"] == "gemini-2.5-pro"
     assert resolved["label"] == "run-7"

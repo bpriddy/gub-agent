@@ -7,7 +7,7 @@ means editing code or env and running `adk deploy agent_engine`: 10-15 minutes
 per iteration, into the same engine that serves the live Chat bot. This module
 moves those four knobs into ONE session-state key, read fresh on every call:
 
-    create_session(state={"sandbox": {"model": "gemini-3.5-pro",
+    create_session(state={"sandbox": {"model": "gemini-2.5-pro",
                                       "thinking_level": "LOW",
                                       "executor_instruction": "<text>"}})
 

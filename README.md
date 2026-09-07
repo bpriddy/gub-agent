@@ -131,7 +131,7 @@ on every call:
 
 ```python
 create_session(state={"sandbox": {
-    "model": "gemini-3.5-pro",          # allowlist: SANDBOX_MODEL_ALLOWLIST
+    "model": "gemini-2.5-pro",          # allowlist: SANDBOX_MODEL_ALLOWLIST
     "thinking_level": "LOW",            # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC
     "critic_thinking_level": "MINIMAL",
     "temperature": 0.2,
@@ -315,6 +315,34 @@ python deployment/register_agent.py --list
 A sandbox run also proves itself from the inside: with `SANDBOX_ENABLED` on and
 a non-empty `state["sandbox"]`, the first event of the run carries a
 `sandbox_resolved` state delta. The prod engine never emits one.
+
+Live smoke (2026-09-07, four verdicts, all held): sandbox + `state.sandbox` →
+`sandbox_resolved` with the requested model/thinking/label, then the full
+executor → critic → escalator run; sandbox without the key → no echo event;
+**prod + the same `state.sandbox` → no echo, ordinary answer** (inert by deploy
+flag); unknown variant name → the run fails.
+
+**How a failed sandbox run looks from the outside.** Agent Engine does not turn
+an exception inside the run into an error event: the caller gets **HTTP 200 and
+an empty (or truncated) stream**. Both an invalid override (unknown variant,
+model off the allowlist) and a model the project cannot serve look identical
+from the client — `sandbox_echo` may have fired, then nothing. Treat "no
+executor event" as a failure and read the reason from the engine logs:
+
+```bash
+# reason for the last failed sandbox run (ValueError / genai ClientError)
+gcloud logging read 'resource.type="aiplatform.googleapis.com/ReasoningEngine"
+  AND resource.labels.reasoning_engine_id="<SANDBOX_AGENT_ENGINE_ID>"
+  AND severity>=ERROR' --limit=5 --freshness=30m --format='value(textPayload)'
+```
+
+Two things the logs will show that are not bugs in this repo: every completed
+stream on an ADK 2.6.1 engine is followed by `RuntimeError: coroutine raised
+StopIteration` from `google/adk/cli/fast_api.py` (end-of-stream artifact of the
+api_server template; the client already has the full stream; the older prod
+build does not log it), and `gemini-3.5-pro` returns 404 from this project on
+both `global` and `us-central1` — it is not in the default allowlist for that
+reason; `gemini-2.5-pro` answers from `global`.
 
 ### Billing
 
