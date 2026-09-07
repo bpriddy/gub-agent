@@ -132,11 +132,11 @@ if [[ "$status" -eq 0 ]]; then
   TOKEN="$(gcloud auth application-default print-access-token 2>/dev/null || gcloud auth print-access-token)"
   ENGINE_ENV="$(curl -sfS -H "Authorization: Bearer $TOKEN" \
       "https://$REGION-aiplatform.googleapis.com/v1/$RESOURCE" \
-    | python3 -c 'import json,sys
+    | python3 -c 'import json, sys
 e = json.load(sys.stdin)
 spec = e.get("spec", {}).get("deploymentSpec", {})
-env = spec.get("env") or []
-print(" ".join(f"{v[\"name\"]}={v.get(\"value\", \"\")}" for v in env) or f"<none: deploymentSpec={json.dumps(spec)}>")')"
+pairs = [v["name"] + "=" + str(v.get("value", "")) for v in (spec.get("env") or [])]
+print(" ".join(pairs) if pairs else "<none: deploymentSpec=" + json.dumps(spec) + ">")')"
   echo "  engine env: $ENGINE_ENV"
   if [[ "$ENGINE_ENV" != *"SANDBOX_ENABLED="* ]]; then
     echo "error: SANDBOX_ENABLED did not reach the engine — the env file was not baked in." >&2
