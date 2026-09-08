@@ -14,6 +14,7 @@ build/
 .env
 .env.*
 !.env.example
+!debug_client/.env.local.example
 
 # Secrets — service account JSON, private keys, certs
 secrets/
