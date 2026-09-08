@@ -1,7 +1,3 @@
 node_modules/
 .next/
-out/
-.env.local
 *.tsbuildinfo
-next-env.d.ts.bak
-.DS_Store
