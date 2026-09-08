@@ -4,14 +4,23 @@
  * the client components (rendering).
  *
  * The agent is a LoopAgent(max_iterations=2) emitting events per iteration:
+ *   sandbox_echo state_delta.sandbox_resolved (sandbox runs ONLY)  author=sandbox_echo
  *   executor function_call(s) / function_response(s) / text   author=gub_agent
  *   critic structured verdict                                 author=critic
  *   loop_escalator (no payload)                               author=loop_escalator
  * We split iterations on each critic event.
+ *
+ * The echo event is emitted once, first, and only when `state["sandbox"]`
+ * changed something (gub_agent/sandbox.py `SandboxEcho`). A run with no
+ * overrides has NO such event — `resolved: null` means "baseline", not
+ * "broken".
  */
+import type { SandboxResolved } from './sandbox';
 
 const CRITIC_AUTHOR = 'critic';
 const ESCALATOR_AUTHOR = 'loop_escalator';
+const SANDBOX_ECHO_AUTHOR = 'sandbox_echo';
+const RESOLVED_STATE_KEY = 'sandbox_resolved';
 
 export interface AgentSource {
   fileId: string;
@@ -51,12 +60,19 @@ export interface AgentTrace {
   text: string;
   iterations: AgentIteration[];
   sources: AgentSource[];
+  /** `sandbox_resolved` provenance; null for a run with no overrides. */
+  resolved: SandboxResolved | null;
+  /** Whitespace-separated words in the final answer. */
+  answerWordCount: number;
+  /** Tool calls across all iterations. */
+  toolCallCount: number;
 }
 
 interface Accumulator {
   iterations: AgentIteration[];
   current: AgentIteration;
   sourcesByFileId: Map<string, AgentSource>;
+  resolved: SandboxResolved | null;
 }
 
 function newIteration(index: number): AgentIteration {
@@ -68,6 +84,7 @@ export function buildTrace(events: unknown[]): AgentTrace {
     iterations: [],
     current: newIteration(1),
     sourcesByFileId: new Map(),
+    resolved: null,
   };
 
   for (const evt of events) consumeEvent(evt, acc);
@@ -76,11 +93,20 @@ export function buildTrace(events: unknown[]): AgentTrace {
     acc.iterations.push(acc.current);
   }
 
+  const text = finalAnswer(acc.iterations);
   return {
-    text: finalAnswer(acc.iterations),
+    text,
     iterations: acc.iterations,
     sources: Array.from(acc.sourcesByFileId.values()),
+    resolved: acc.resolved,
+    answerWordCount: wordCount(text),
+    toolCallCount: acc.iterations.reduce((n, it) => n + it.toolCalls.length, 0),
   };
+}
+
+export function wordCount(text: string): number {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
 }
 
 function consumeEvent(evt: unknown, acc: Accumulator): void {
@@ -89,6 +115,10 @@ function consumeEvent(evt: unknown, acc: Accumulator): void {
   const author = typeof e.author === 'string' ? e.author : null;
 
   if (author === ESCALATOR_AUTHOR) return;
+
+  const resolved = extractResolved(e);
+  if (resolved) acc.resolved = resolved;
+  if (author === SANDBOX_ECHO_AUTHOR) return;
 
   if (author === CRITIC_AUTHOR) {
     const verdict = extractCriticVerdict(e);
@@ -138,6 +168,29 @@ function consumeEvent(evt: unknown, acc: Accumulator): void {
       }
     }
   }
+}
+
+/** `actions.state_delta.sandbox_resolved` (ADK dumps snake_case; camelCase accepted defensively). */
+function extractResolved(evt: Record<string, unknown>): SandboxResolved | null {
+  const actions = evt.actions as Record<string, unknown> | undefined;
+  const delta = (actions?.state_delta ?? actions?.stateDelta) as Record<string, unknown> | undefined;
+  const raw = delta?.[RESOLVED_STATE_KEY];
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.model !== 'string') return null;
+  return {
+    label: typeof r.label === 'string' ? r.label : null,
+    model: r.model,
+    temperature: typeof r.temperature === 'number' ? r.temperature : null,
+    thinking_level: r.thinking_level as SandboxResolved['thinking_level'],
+    critic_thinking_level: r.critic_thinking_level as SandboxResolved['critic_thinking_level'],
+    critic_enabled: r.critic_enabled !== false,
+    executor_prompt_source: typeof r.executor_prompt_source === 'string' ? r.executor_prompt_source : 'baseline',
+    executor_prompt_sha256: typeof r.executor_prompt_sha256 === 'string' ? r.executor_prompt_sha256 : null,
+    critic_prompt_source: typeof r.critic_prompt_source === 'string' ? r.critic_prompt_source : 'baseline',
+    critic_prompt_sha256: typeof r.critic_prompt_sha256 === 'string' ? r.critic_prompt_sha256 : null,
+    overridden_keys: Array.isArray(r.overridden_keys) ? r.overridden_keys.filter((k): k is string => typeof k === 'string') : [],
+  };
 }
 
 function extractCriticVerdict(evt: Record<string, unknown>): AgentCriticVerdict | null {
