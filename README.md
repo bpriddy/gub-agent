@@ -237,19 +237,20 @@ independent of `--region=us-central1` above, which controls only where the
 Agent Engine *resource* lives — `--region` overrides `GOOGLE_CLOUD_LOCATION`
 for the deploy target, while the baked runtime env keeps model calls on
 `global`. Do **not** pass `--region=global` (Agent Engine isn't deployable
-there). Callers (`debug_client`, gchat bot) keep `GCP_REGION=us-central1` —
+there). Callers (gub-sandbox-ui, gchat bot) keep `GCP_REGION=us-central1` —
 they address the regional engine resource, not the model.
 
 Then `register_agent.py` (see `deployment/`) registers the deployed engine
 with the Gemini Enterprise app — a separate, occasional step.
 
-### Debug client
+### Debug client → gub-sandbox-ui
 
-`debug_client/` is a local-only Next.js tool for inspecting the agent's
-decomposition trace (per-iteration tool calls, the two-axis critic verdict,
-sources). Sign in with Google, ask a question, watch how the agent turns it
-into queries. See `debug_client/README.md`. It calls Vertex AI server-side via
-ADC; it never deploys.
+The debug client — trace inspection, the sandbox config panel and A/B
+compare (#32), the batch runner (#33) — moved to its own repository,
+**Anomaly-Technology/gub-sandbox-ui**, where it runs as the QA sandbox UI on
+Cloud Run behind Cloud IAP (`task-specs/sandbox-07`). `debug_client/README.md`
+here is a pointer. One seam crosses the repos: its `src/lib/sandbox.ts`
+mirrors `gub_agent/sandbox.py` — change the contract in both.
 
 ## Sandbox engine
 

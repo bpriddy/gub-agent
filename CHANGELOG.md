@@ -6,6 +6,13 @@ describe what controls were added; operational detail that could narrow
 an attacker's search space (which values lived where, timing of rotations,
 remaining exposures) lives in internal notes instead of this public log.
 
+### Changed (2026-09-08)
+
+- **`debug_client/` moved** to `Anomaly-Technology/gub-sandbox-ui` (history
+  preserved) and became the QA sandbox UI on Cloud Run behind IAP
+  (`task-specs/sandbox-07`). A pointer README stays; `src/lib/sandbox.ts`
+  there still mirrors `gub_agent/sandbox.py`.
+
 ## [Unreleased]
 
 ### Added (2026-09-04)
