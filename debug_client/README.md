@@ -195,3 +195,35 @@ first.
   executor prompt.
 - The critic passing a bad answer, or nitpicking a good one → critic prompt.
 - A question you can't express at all → missing operator in GUB's catalog.
+
+## Batch runs (`/batch`)
+
+Many questions × many configs → numbers (gub-agent#33, epic #29 step 04). The
+page has three tabs — **questions** (the set, as a table or raw JSONL, validated
+on save), **arms** (the matrix; each arm is the console's config form), **run**
+(pick questions and arms, parallel / timeout / cooldown, whose token, start;
+live grid, per-arm table, latency by kind, provenance, regression lists,
+per-cell detail, and every past run).
+
+It edits the SAME files the headless runner uses — `../scratchpad/questions.jsonl`,
+`configs.json`, `runs/<id>/` (`BATCH_DIR` to relocate) — so a CLI run opens in
+the UI and vice versa. Question sets and runs are local and uncommitted (epic
+invariant 7); `runs/` ignores itself and never holds a token.
+
+Whose token the agent's tools run under:
+
+- **sandbox subject** (default when configured) — set `SANDBOX_JWT_SUBJECT_SA`
+  to a service account your ADC identity may impersonate
+  (`roles/iam.serviceAccountTokenCreator`). The server mints an impersonated
+  token, exchanges it at GUB (`/auth/google/access-token-exchange`), rotates it
+  and revokes the session at the end. Distinct GUB user → its own rate bucket
+  (GUB allows 60 `/org/*` requests per 15 min per subject). The SA needs no GCP
+  role; its GUB user needs visibility from a GUB admin (`is_admin`, or grants).
+- **me** — the signed-in user; the page hands the run its freshest token on every
+  poll, so keep the tab open. The run spends your bucket.
+
+Server: `src/lib/batch/` (types, metrics, store, auth, engine, runner) and
+`src/app/api/batch/*` (`questions`, `configs`, `runs`, `runs/[id]`,
+`runs/[id]/stop`, `runs/[id]/csv`, `subject`). One run at a time; the prod
+engine id is refused; a cell whose tool results carry HTTP 429 is
+`rate_limited`, pauses every worker for the cooldown and is retried once.

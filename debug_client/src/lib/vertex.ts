@@ -171,6 +171,14 @@ export async function streamQueryCollect(args: {
   return events;
 }
 
+/**
+ * Exported for the batch runner (`lib/batch/engine.ts`), which needs raw
+ * status codes and per-cell abort signals that the two helpers above do not
+ * expose. Same bearer, same base URL — one place decides how Vertex is called.
+ */
+export const vertexHeaders = bearer;
+export const engineBaseUrl = engineBase;
+
 export interface EngineDescription {
   displayName: string | null;
   /** Deploy-time env baked into the engine (`spec.deploymentSpec.env`). */

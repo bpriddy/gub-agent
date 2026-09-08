@@ -205,6 +205,7 @@ function Console({ auth }: { auth: ReturnType<typeof useAuth> }) {
             <input type="checkbox" checked={abMode} onChange={(e) => setAbMode(e.target.checked)} />
             A/B
           </label>
+          <a href="/batch" style={S.navLink} title="Batch runs: many questions × many configs → numbers (gub-agent#33)">batch</a>
           <span style={S.userEmail}>{auth.user?.email}</span>
           <button onClick={() => void auth.logout()} style={S.signOut}>sign out</button>
         </div>
@@ -365,6 +366,7 @@ const S: Record<string, React.CSSProperties> = {
   headerRight: { display: 'flex', alignItems: 'center', gap: '0.75rem', flexShrink: 0 },
   userEmail: { fontSize: '0.8125rem', color: '#7d8590' },
   signOut: { background: 'transparent', color: '#7d8590', border: '1px solid #30363d', borderRadius: '4px', padding: '0.25rem 0.625rem', fontSize: '0.75rem', cursor: 'pointer' },
+  navLink: { color: '#79c0ff', fontSize: '0.8125rem', textDecoration: 'none', border: '1px solid #30363d', borderRadius: '4px', padding: '0.25rem 0.625rem' },
   smallBtn: { background: 'transparent', color: '#79c0ff', border: '1px solid #30363d', borderRadius: '4px', padding: '0.125rem 0.5rem', fontSize: '0.6875rem', cursor: 'pointer' },
 
   twoCol: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '1rem', alignItems: 'start' },
