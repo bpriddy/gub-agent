@@ -349,7 +349,7 @@ in the allowlist for that reason. Probed 2026-09-09 from `global`:
 `gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` answer; that is
 the Gemini half of the sandbox allowlist (`deploy-sandbox.env`).
 
-**Claude arms (Anthropic on Vertex).** A sandbox run may also select a
+**Claude arms (Anthropic on Vertex).** *Temporarily out of the sandbox allowlist since 2026-09-09 (`deploy-sandbox.env`, user decision: a model that can only 404 confuses testers) until the models are enabled for the project in Model Garden; the router and its tests stay.* A sandbox run may also select a
 `claude-*` id (`claude-sonnet-5`, `claude-haiku-4-5`). `gub_agent/models.py`
 wraps the Gemini client in a `VendorRouter`: the id the sandbox wrote into
 `llm_request.model` decides whether the request goes to Gemini or to ADK's
