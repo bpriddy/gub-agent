@@ -8,6 +8,7 @@ import os
 
 from dotenv import load_dotenv
 from google.adk.models import Gemini
+from google.adk.models.base_llm import BaseLlm
 from google.adk.planners import BuiltInPlanner
 from google.genai import types as genai_types
 
@@ -115,8 +116,20 @@ def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
     )
 
 
-def build_model() -> Gemini:
-    """Gemini model wired with truncated exponential backoff + jitter on 429/5xx.
+# Where Anthropic models are served for a sandbox run that selects a `claude-*`
+# id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
+# the genai client's own GOOGLE_CLOUD_LOCATION pin above is a separate thing.
+CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
+
+
+def build_model() -> BaseLlm:
+    """The agents' model object: a VendorRouter (gub_agent/models.py) over a
+    Gemini client, so a sandbox run that writes a `claude-*` id into
+    `llm_request.model` reaches Anthropic on Vertex while every other request —
+    and every prod request, where the sandbox never writes the field — goes to
+    the same Gemini client as before.
+
+    Gemini model wired with truncated exponential backoff + jitter on 429/5xx.
 
     gemini-3.5-flash on Vertex is served via Dynamic Shared Quota: a transient
     429 RESOURCE_EXHAUSTED reflects shared-pool congestion, NOT a project quota
@@ -137,7 +150,9 @@ def build_model() -> Gemini:
     NOT retried. Retries are logged by genai at INFO (before_sleep); a dedicated
     retry counter is a worthwhile follow-up for prod visibility.
     """
-    return Gemini(
+    from .models import VendorRouter  # noqa: PLC0415 — models.py imports config
+
+    gemini = Gemini(
         model=GEMINI_MODEL,
         retry_options=genai_types.HttpRetryOptions(
             attempts=3,
@@ -147,3 +162,4 @@ def build_model() -> Gemini:
             jitter=1.0,
         ),
     )
+    return VendorRouter(model=GEMINI_MODEL, gemini=gemini, claude_location=CLAUDE_VERTEX_LOCATION)
