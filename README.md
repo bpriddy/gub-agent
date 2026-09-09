@@ -342,9 +342,12 @@ Two things the logs will show that are not bugs in this repo: every completed
 stream on an ADK 2.6.1 engine is followed by `RuntimeError: coroutine raised
 StopIteration` from `google/adk/cli/fast_api.py` (end-of-stream artifact of the
 api_server template; the client already has the full stream; the older prod
-build does not log it), and `gemini-3.5-pro` returns 404 from this project on
-both `global` and `us-central1` — it is not in the default allowlist for that
-reason; `gemini-2.5-pro` answers from `global`.
+build does not log it), and `gemini-3.5-pro` (like every `gemini-3-pro*` id and
+the non-preview `gemini-3-flash`) returns 404 from this project — they are not
+in the allowlist for that reason. Probed 2026-09-09 from `global`:
+`gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3-flash-preview`,
+`gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` answer; that is
+the sandbox allowlist (`deploy-sandbox.env`).
 
 One more live-verified trap, now caught up front: a **named `thinking_level`
 is a 3-series knob**. `gemini-2.5-pro` rejects it with 400, and the baseline
