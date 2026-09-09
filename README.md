@@ -423,6 +423,32 @@ deploy fails on a 404 instead of creating a fresh engine.
   a config file committed inside the package is picked up by default by
   *every* deploy, including production.
 
+### End-to-end: every allowed model, live
+
+`tests/e2e` runs the deployed sandbox engine for real — a session with the
+shared sandbox subject's GUB JWT and `state.sandbox`, one reference question,
+every model on the engine's **own** allowlist (read from its env, so the
+parametrisation follows the deploy). Per model it asserts the two things a QA
+run must be able to trust: `sandbox_resolved.model` equals the model that was
+asked for, and the executor produced visible text (an exception inside the
+engine is an empty 200 stream, so "no text" is how a broken id looks from
+outside). Two guard rails: a baseline run emits no provenance, and a named
+thinking level on a DYNAMIC-only model is refused before any model call.
+Claude cases skip until Anthropic is enabled for the project; models known
+to be servable but too weak to finish the question are non-strict xfails
+(`SANDBOX_E2E_XFAIL_MODELS`, default `gemini-2.5-flash-lite`).
+
+Opt-in — it costs tokens (~$0.05–0.15 per model) and minutes; CI and the hooks
+skip it:
+
+```bash
+SANDBOX_E2E=1 .venv/bin/pytest tests/e2e -q -rsxX
+```
+
+Needs ADC with `roles/aiplatform.user` and `roles/iam.serviceAccountTokenCreator`
+on `sa-gub-sandbox` (terraform `sandbox_operators`). Run it after a sandbox
+redeploy or an allowlist change.
+
 ## Security
 
 Credentials live in `.env` locally and in GCP Secret Manager in deployed

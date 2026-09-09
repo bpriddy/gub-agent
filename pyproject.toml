@@ -32,6 +32,8 @@ packages = ["gub_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# tests/e2e talk to the deployed sandbox engine and cost tokens; they skip
+# themselves unless SANDBOX_E2E=1 (tests/e2e/conftest.py).
 
 [tool.ruff]
 line-length = 100
