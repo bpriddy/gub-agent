@@ -40,13 +40,13 @@ def _fast_retry_args() -> dict:
     """genai's own retry config for our options, with the real backoff swapped
     for a near-zero sleep so the test is instant. Keeps the real stop (attempt
     cap) and retry predicate (which codes retry)."""
-    args = dict(genai_api_client.retry_args(build_model().retry_options))
+    args = dict(genai_api_client.retry_args(build_model().gemini.retry_options))
     args["wait"] = tenacity.wait_fixed(0)
     return args
 
 
 async def test_build_model_enables_retry_with_429():
-    opts = build_model().retry_options
+    opts = build_model().gemini.retry_options
     assert opts is not None, "retries disabled — a single transient 429 would kill the turn"
     # None http_status_codes → genai's default set, which includes 429.
     assert opts.http_status_codes is None or 429 in opts.http_status_codes
@@ -100,4 +100,4 @@ async def test_persistent_429_stops_at_attempt_cap():
         reraised = True
 
     assert reraised, "cap reached should reraise, not swallow"
-    assert calls["n"] == build_model().retry_options.attempts
+    assert calls["n"] == build_model().gemini.retry_options.attempts

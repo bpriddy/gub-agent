@@ -193,9 +193,14 @@ def _validate(overrides: SandboxOverrides) -> None:
         if overrides.critic_enabled and critic_level != "DYNAMIC":
             offending.append(f"critic_thinking_level={critic_level}")
         if offending:
+            why = (
+                "(Claude thinks adaptively; Anthropic has no named levels)"
+                if overrides.model.startswith("claude-")
+                else "(Vertex answers 400 INVALID_ARGUMENT)"
+            )
             raise ValueError(
                 f"sandbox: model {overrides.model!r} does not accept a named thinking level "
-                f"(Vertex answers 400 INVALID_ARGUMENT), but {', '.join(offending)} would apply "
+                f"{why}, but {', '.join(offending)} would apply "
                 "to this run. Set thinking_level (and critic_thinking_level, unless "
                 "critic_enabled is false) to DYNAMIC for this model — or add the model to "
                 "SANDBOX_THINKING_LEVEL_MODELS if it does accept named levels."

@@ -347,7 +347,23 @@ the non-preview `gemini-3-flash`) returns 404 from this project — they are not
 in the allowlist for that reason. Probed 2026-09-09 from `global`:
 `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3-flash-preview`,
 `gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` answer; that is
-the sandbox allowlist (`deploy-sandbox.env`).
+the Gemini half of the sandbox allowlist (`deploy-sandbox.env`).
+
+**Claude arms (Anthropic on Vertex).** A sandbox run may also select a
+`claude-*` id (`claude-sonnet-5`, `claude-haiku-4-5`). `gub_agent/models.py`
+wraps the Gemini client in a `VendorRouter`: the id the sandbox wrote into
+`llm_request.model` decides whether the request goes to Gemini or to ADK's
+`Claude` client (Anthropic on Vertex, location `CLAUDE_VERTEX_LOCATION`,
+default `global`). Three things differ for a Claude arm, all handled in the
+router: Anthropic has no named thinking levels, so the validator's DYNAMIC rule
+applies (DYNAMIC = adaptive thinking); the critic's `output_schema` is restated
+as an instruction because the Anthropic path ignores Gemini's native JSON mode;
+and `temperature` is inert while thinking is on (Anthropic rejects sampling
+parameters there) — logged, not silently applied. Prerequisites: the Anthropic
+models must be **enabled for the project in Model Garden** (a console step —
+until then Vertex answers 404 "does not have access" and the run is an empty
+stream), and `anthropic[vertex]` is in `gub_agent/requirements.txt`. Prod is
+untouched: with `SANDBOX_ENABLED=0` the sandbox never writes the model field.
 
 One more live-verified trap, now caught up front: a **named `thinking_level`
 is a 3-series knob**. `gemini-2.5-pro` rejects it with 400, and the baseline
@@ -406,6 +422,32 @@ deploy fails on a 404 instead of creating a fresh engine.
   Whichever flag, keep the env in a **per-deploy file outside `gub_agent/`**:
   a config file committed inside the package is picked up by default by
   *every* deploy, including production.
+
+### End-to-end: every allowed model, live
+
+`tests/e2e` runs the deployed sandbox engine for real — a session with the
+shared sandbox subject's GUB JWT and `state.sandbox`, one reference question,
+every model on the engine's **own** allowlist (read from its env, so the
+parametrisation follows the deploy). Per model it asserts the two things a QA
+run must be able to trust: `sandbox_resolved.model` equals the model that was
+asked for, and the executor produced visible text (an exception inside the
+engine is an empty 200 stream, so "no text" is how a broken id looks from
+outside). Two guard rails: a baseline run emits no provenance, and a named
+thinking level on a DYNAMIC-only model is refused before any model call.
+Claude cases skip until Anthropic is enabled for the project; models known
+to be servable but too weak to finish the question are non-strict xfails
+(`SANDBOX_E2E_XFAIL_MODELS`, default `gemini-2.5-flash-lite`).
+
+Opt-in — it costs tokens (~$0.05–0.15 per model) and minutes; CI and the hooks
+skip it:
+
+```bash
+SANDBOX_E2E=1 .venv/bin/pytest tests/e2e -q -rsxX
+```
+
+Needs ADC with `roles/aiplatform.user` and `roles/iam.serviceAccountTokenCreator`
+on `sa-gub-sandbox` (terraform `sandbox_operators`). Run it after a sandbox
+redeploy or an allowlist change.
 
 ## Security
 
