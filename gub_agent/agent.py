@@ -7,7 +7,10 @@ The agent is a small multi-agent pipeline (Phase C):
     ├─ sandbox_echo — records the resolved sandbox config on experiment runs
     │                  (silent on ordinary ones); see sandbox.py
     ├─ executor_agent — runs the existing tool-using LLM
-    ├─ critic_agent — evaluates the executor's response; emits structured
+    ├─ format_gate — renders the executor's answer into the typed
+    │                  AnswerPayload (agents/formatter.py) and enforces the
+    │                  contract in code (agents/format_gate.py, blend 03)
+    ├─ critic_gate — evaluates information sufficiency; emits structured
     │                  verdict {sufficient, reason, feedback} into state
     └─ loop_escalator — exits the loop early when critic verdict is sufficient
 
@@ -33,6 +36,8 @@ from google.adk.agents import Agent, LoopAgent
 from .agents.circuit_breaker import circuit_breaker, reset_tool_budget
 from .agents.context_pruning import strip_prior_turn_tool_parts, strip_source_metadata
 from .agents.critic import critic_gate, escalator_agent
+from .agents.evidence_index import record_evidence, reset_evidence_index
+from .agents.format_gate import format_gate
 from .agents.round_limiter import reset_rounds, round_limit
 from .config import AGENT_NAME, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
@@ -51,9 +56,12 @@ def _before_agent(callback_context):
     executor's run_async each iteration). Reset the per-pass round + tool budgets
     so a critic-requested retry starts fresh instead of inheriting the previous
     pass's counts (which would open the retry already at the cap, tools stripped,
-    unable to make the call the critic asked for)."""
+    unable to make the call the critic asked for). The evidence index resets on
+    the same cadence: the formatter grounds against what THIS pass retrieved
+    (the executor's own doctrine is to re-query, never answer from prior data)."""
     reset_rounds(callback_context)
     reset_tool_budget(callback_context)
+    reset_evidence_index(callback_context)
     return None
 
 
@@ -100,21 +108,30 @@ executor_agent = Agent(
     # Dedupe repeated calls + per-turn tool budget (circuit_breaker.py) —
     # reliability guard against true loops / runaway fan-out.
     before_tool_callback=circuit_breaker,
+    # Build the turn's citable evidence index from every tool result
+    # (evidence_index.py) — what the formatter may cite and the format gate
+    # grounds numbers/entities against.
+    after_tool_callback=record_evidence,
 )
 
-# Wrap [executor → critic-gate → escalator] in a LoopAgent. The gate skips
-# the critic LLM deterministically for exact abstentions (NO_COMPANY_RECORDS)
-# and runs the critic for everything else. On clean answers the critic emits
-# sufficient=true, escalator triggers loop exit after one iteration. On
-# flagged failures, the executor runs again seeing the critic's feedback in
-# session state. Capped at 2 iterations.
+# Wrap [executor → format-gate → critic-gate → escalator] in a LoopAgent.
+# The format gate (blend 03) turns the executor's prose into the typed
+# AnswerPayload and enforces the contract in code — validation retries happen
+# INSIDE the gate, never through this loop. The critic gate then judges
+# information sufficiency only (its old shape axis moved into the format
+# gate); it skips its LLM deterministically for abstentions — the bare
+# NO_COMPANY_RECORDS marker or an abstain payload. On clean answers the
+# critic emits sufficient=true, escalator triggers loop exit after one
+# iteration. On flagged failures, the executor runs again seeing the critic's
+# feedback in session state. Capped at 2 iterations.
 #
-# sandbox_echo leads the pipeline: on an experiment run it records what the run
-# resolved to (model, thinking, temperature, prompt hash) as a state_delta the
-# caller's event stream carries. On an ordinary run it emits nothing at all, so
-# the trace shape is byte-for-byte today's.
+# sandbox_echo leads the pipeline — the provenance event must precede any
+# work: on an experiment run it records what the run resolved to (model,
+# thinking, temperature, prompt hashes) as a state_delta the caller's event
+# stream carries. On an ordinary run it emits nothing at all, so the trace
+# shape is today's plus only the formatter stage.
 root_agent = LoopAgent(
     name="gub_pipeline",
-    sub_agents=[sandbox_echo, executor_agent, critic_gate, escalator_agent],
+    sub_agents=[sandbox_echo, executor_agent, format_gate, critic_gate, escalator_agent],
     max_iterations=2,
 )

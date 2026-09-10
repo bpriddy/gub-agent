@@ -29,5 +29,6 @@ that wins is promoted into this file by hand, in an ordinary pull request.
 
 from .critic import CRITIC_INSTRUCTION
 from .executor import EXECUTOR_INSTRUCTION
+from .formatter import FORMATTER_INSTRUCTION
 
-__all__ = ["CRITIC_INSTRUCTION", "EXECUTOR_INSTRUCTION"]
+__all__ = ["CRITIC_INSTRUCTION", "EXECUTOR_INSTRUCTION", "FORMATTER_INSTRUCTION"]

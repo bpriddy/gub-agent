@@ -75,14 +75,16 @@ RESOLVED_STATE_KEY = "sandbox_resolved"
 # instead of the wire: a session-state payload is not a document store.
 MAX_PROMPT_BYTES = 64 * 1024
 
-Role = Literal["executor", "critic"]
+Role = Literal["executor", "critic", "formatter"]
 ThinkingLevel = Literal["MINIMAL", "LOW", "MEDIUM", "HIGH", "DYNAMIC"]
 
 # Baseline thinking levels, reported in the provenance when nothing overrides
-# them. Imported by the construction sites (agent.py, agents/critic.py) so the
-# provenance can never drift from what actually runs.
+# them. Imported by the construction sites (agent.py, agents/critic.py,
+# agents/formatter.py) so the provenance can never drift from what actually
+# runs.
 EXECUTOR_THINKING_LEVEL = "MEDIUM"
 CRITIC_THINKING_LEVEL = "LOW"
+FORMATTER_THINKING_LEVEL = "LOW"
 
 
 class SandboxOverrides(BaseModel):
@@ -99,9 +101,12 @@ class SandboxOverrides(BaseModel):
     executor_variant: str | None = None
     critic_instruction: str | None = None
     critic_variant: str | None = None
+    formatter_instruction: str | None = None
+    formatter_variant: str | None = None
     model: str | None = None
     thinking_level: ThinkingLevel | None = None
     critic_thinking_level: ThinkingLevel | None = None
+    formatter_thinking_level: ThinkingLevel | None = None
     temperature: float | None = None
     critic_enabled: bool = True
     label: str | None = None
@@ -187,11 +192,14 @@ def _validate(overrides: SandboxOverrides) -> None:
         # not a valid override for such a model. Verified live (gemini-2.5-pro).
         executor_level = overrides.thinking_level or EXECUTOR_THINKING_LEVEL
         critic_level = overrides.critic_thinking_level or CRITIC_THINKING_LEVEL
+        formatter_level = overrides.formatter_thinking_level or FORMATTER_THINKING_LEVEL
         offending = []
         if executor_level != "DYNAMIC":
             offending.append(f"thinking_level={executor_level}")
         if overrides.critic_enabled and critic_level != "DYNAMIC":
             offending.append(f"critic_thinking_level={critic_level}")
+        if formatter_level != "DYNAMIC":
+            offending.append(f"formatter_thinking_level={formatter_level}")
         if offending:
             why = (
                 "(Claude thinks adaptively; Anthropic has no named levels)"
@@ -201,9 +209,10 @@ def _validate(overrides: SandboxOverrides) -> None:
             raise ValueError(
                 f"sandbox: model {overrides.model!r} does not accept a named thinking level "
                 f"{why}, but {', '.join(offending)} would apply "
-                "to this run. Set thinking_level (and critic_thinking_level, unless "
-                "critic_enabled is false) to DYNAMIC for this model — or add the model to "
-                "SANDBOX_THINKING_LEVEL_MODELS if it does accept named levels."
+                "to this run. Set thinking_level, formatter_thinking_level (and "
+                "critic_thinking_level, unless critic_enabled is false) to DYNAMIC for this "
+                "model — or add the model to SANDBOX_THINKING_LEVEL_MODELS if it does accept "
+                "named levels."
             )
     if overrides.temperature is not None and not 0.0 <= overrides.temperature <= 2.0:
         raise ValueError(
@@ -214,9 +223,11 @@ def _validate(overrides: SandboxOverrides) -> None:
         _check_prompt_size(overrides.executor_instruction, "executor_instruction")
     if overrides.critic_instruction is not None:
         _check_prompt_size(overrides.critic_instruction, "critic_instruction")
+    if overrides.formatter_instruction is not None:
+        _check_prompt_size(overrides.formatter_instruction, "formatter_instruction")
     # Variant names are resolved (and so validated) eagerly: a bad name must
     # fail the run, not the fourth model call halfway through an answer.
-    for role in ("executor", "critic"):
+    for role in ("executor", "critic", "formatter"):
         name = getattr(overrides, f"{role}_variant")
         if name is not None:
             _resolve_variant(name, role)  # type: ignore[arg-type]
@@ -345,7 +356,12 @@ def sandbox_before_model(callback_context: Any, llm_request: Any, *, role: Role)
     if overrides.model is not None:
         llm_request.model = overrides.model
 
-    level = overrides.thinking_level if role == "executor" else overrides.critic_thinking_level
+    if role == "executor":
+        level = overrides.thinking_level
+    elif role == "critic":
+        level = overrides.critic_thinking_level
+    else:
+        level = overrides.formatter_thinking_level
     if level is not None or overrides.temperature is not None:
         cfg = getattr(llm_request, "config", None)
         if cfg is None:
@@ -370,6 +386,7 @@ def resolved_config(overrides: SandboxOverrides) -> dict[str, Any]:
     """
     executor_text, executor_source = _prompt_for(overrides, "executor")
     critic_text, critic_source = _prompt_for(overrides, "critic")
+    formatter_text, formatter_source = _prompt_for(overrides, "formatter")
 
     def _sha(text: str | None) -> str | None:
         if text is None:
@@ -382,11 +399,14 @@ def resolved_config(overrides: SandboxOverrides) -> dict[str, Any]:
         "temperature": overrides.temperature,
         "thinking_level": overrides.thinking_level or EXECUTOR_THINKING_LEVEL,
         "critic_thinking_level": overrides.critic_thinking_level or CRITIC_THINKING_LEVEL,
+        "formatter_thinking_level": overrides.formatter_thinking_level or FORMATTER_THINKING_LEVEL,
         "critic_enabled": overrides.critic_enabled,
         "executor_prompt_source": executor_source,
         "executor_prompt_sha256": _sha(executor_text),
         "critic_prompt_source": critic_source,
         "critic_prompt_sha256": _sha(critic_text),
+        "formatter_prompt_source": formatter_source,
+        "formatter_prompt_sha256": _sha(formatter_text),
         "overridden_keys": overrides.overridden_keys(),
     }
 
