@@ -179,6 +179,7 @@ async def test_model_without_named_thinking_support_needs_dynamic(sandbox_on):
     assert "thinking_level=MEDIUM" in str(exc.value)  # the baseline that would apply
     assert "critic_thinking_level=LOW" in str(exc.value)
     assert "formatter_thinking_level=LOW" in str(exc.value)
+    assert "router_thinking_level=LOW" in str(exc.value)
 
     # One role fixed is not enough while the critic still runs.
     with pytest.raises(ValueError, match="critic_thinking_level=LOW"):
@@ -196,6 +197,20 @@ async def test_model_without_named_thinking_support_needs_dynamic(sandbox_on):
             }
         )
 
+    # And so does the router (blend 04) — it runs BEFORE any retrieval, so its
+    # 400 would empty the stream before the turn had done anything at all.
+    with pytest.raises(ValueError, match="router_thinking_level=LOW"):
+        read_overrides(
+            {
+                "sandbox": {
+                    "model": "gemini-2.5-pro",
+                    "thinking_level": "DYNAMIC",
+                    "critic_thinking_level": "DYNAMIC",
+                    "formatter_thinking_level": "DYNAMIC",
+                }
+            }
+        )
+
 
 async def test_dynamic_on_all_roles_unlocks_such_a_model(sandbox_on):
     all_roles = {
@@ -203,6 +218,7 @@ async def test_dynamic_on_all_roles_unlocks_such_a_model(sandbox_on):
         "thinking_level": "DYNAMIC",
         "critic_thinking_level": "DYNAMIC",
         "formatter_thinking_level": "DYNAMIC",
+        "router_thinking_level": "DYNAMIC",
     }
     assert read_overrides({"sandbox": all_roles}).model == "gemini-2.5-pro"
     # With the critic off, its level is irrelevant.
@@ -210,6 +226,7 @@ async def test_dynamic_on_all_roles_unlocks_such_a_model(sandbox_on):
         "model": "gemini-2.5-pro",
         "thinking_level": "DYNAMIC",
         "formatter_thinking_level": "DYNAMIC",
+        "router_thinking_level": "DYNAMIC",
         "critic_enabled": False,
     }
     assert read_overrides({"sandbox": no_critic}).critic_enabled is False
@@ -256,6 +273,46 @@ async def test_formatter_thinking_is_its_own_knob(sandbox_on):
         _ctx_for({"sandbox": {"critic_thinking_level": "HIGH"}}), untouched, role="formatter"
     )
     assert untouched.config.thinking_config is BASE_THINKING
+
+
+async def test_router_thinking_is_its_own_knob(sandbox_on):
+    """Blend 04's role: the router reads router_thinking_level only, and with
+    no router key a router request is untouched even when every other role is
+    overridden (the per-role no-op invariant)."""
+    state = {"sandbox": {"thinking_level": "HIGH", "router_thinking_level": "MINIMAL"}}
+    router_req, executor_req = _req(), _req()
+    sandbox_before_model(_ctx_for(state), router_req, role="router")
+    sandbox_before_model(_ctx_for(state), executor_req, role="executor")
+    assert router_req.config.thinking_config.thinking_level == "MINIMAL"
+    assert executor_req.config.thinking_config.thinking_level == "HIGH"
+
+    untouched = _req()
+    sandbox_before_model(
+        _ctx_for({"sandbox": {"formatter_thinking_level": "HIGH"}}), untouched, role="router"
+    )
+    assert untouched.config.thinking_config is BASE_THINKING
+
+
+async def test_the_router_prompt_is_tunable_per_call(sandbox_on):
+    """The point of the role: the misroute rate is driven down by editing this
+    prompt from the sandbox UI, not by a redeploy."""
+    provider = sandbox_instruction(_base_provider(), role="router")
+    text = provider(_ctx_for({"sandbox": {"router_instruction": "ROUTE LIKE THIS"}}))
+    assert text.startswith("ROUTE LIKE THIS")
+    assert "Current date" in text  # the date block is not part of the experiment
+    # A router override leaves the executor's prompt alone.
+    executor = sandbox_instruction(_base_provider(), role="executor")
+    assert executor(_ctx_for({"sandbox": {"router_instruction": "ROUTE LIKE THIS"}})) == (
+        _base_provider()(_ctx_for({}))
+    )
+
+
+async def test_the_router_has_a_baseline_variant(sandbox_on):
+    """Registry role wiring: `router_variant` resolves, and an unknown name
+    still refuses to fall back to the baseline."""
+    assert read_overrides({"sandbox": {"router_variant": "baseline"}}).router_variant == "baseline"
+    with pytest.raises(ValueError, match="router prompt variant"):
+        read_overrides({"sandbox": {"router_variant": "v9_nope"}})
 
 
 # ── 5. a prompt with literal braces ───────────────────────────────────────────
@@ -333,6 +390,7 @@ async def test_unknown_key_warns_and_the_run_continues(sandbox_on, caplog):
             "thinking_level": "DYNAMIC",
             "critic_thinking_level": "DYNAMIC",
             "formatter_thinking_level": "DYNAMIC",
+            "router_thinking_level": "DYNAMIC",
             "top_k": 7,
         }
     }
@@ -419,6 +477,9 @@ async def test_resolved_config_reports_what_actually_ran(sandbox_on):
     assert resolved["formatter_thinking_level"] == "LOW"  # untouched baseline
     assert resolved["formatter_prompt_source"] == "baseline"
     assert resolved["formatter_prompt_sha256"] is None
+    assert resolved["router_thinking_level"] == "LOW"  # untouched baseline
+    assert resolved["router_prompt_source"] == "baseline"
+    assert resolved["router_prompt_sha256"] is None
     assert resolved["overridden_keys"] == [
         "executor_instruction",
         "label",
@@ -440,6 +501,7 @@ async def test_echo_emits_the_provenance_event(sandbox_on):
                 "thinking_level": "DYNAMIC",
                 "critic_thinking_level": "DYNAMIC",
                 "formatter_thinking_level": "DYNAMIC",
+                "router_thinking_level": "DYNAMIC",
                 "label": "run-7",
             }
         }

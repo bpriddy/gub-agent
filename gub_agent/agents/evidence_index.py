@@ -24,6 +24,13 @@ prior turns).
 The gate's retry feedback travels the same way (`set_format_feedback` /
 `take_format_feedback`): it also goes out as a `state_delta` event for trace
 visibility, but the formatter's next run reads it from here, deterministically.
+
+`set_answer_draft` is the fast path's entry point into the same machinery
+(blend 04): the fast path has no executor prose for the gate to render, so it
+leaves its deterministic draft here and the gate prefers it over the
+executor's last text. It is cleared by the reset below, which means a fast
+path that gave up and fell through to the deep path cannot leave its draft
+behind for the executor's pass to render instead of its own answer.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ MAX_ENTITY_VALUE_CHARS = 2_000
 _INDEX: OrderedDict[str, dict[str, dict[str, Any]]] = OrderedDict()
 _FEEDBACK: OrderedDict[str, str] = OrderedDict()
 _BRIEF: OrderedDict[str, str] = OrderedDict()
+_DRAFT: OrderedDict[str, str] = OrderedDict()
 _MAX_TRACKED = 256
 
 
@@ -66,6 +74,7 @@ def reset_evidence_index(callback_context: Any) -> None:
     _INDEX.pop(invocation_id, None)
     _FEEDBACK.pop(invocation_id, None)
     _BRIEF.pop(invocation_id, None)
+    _DRAFT.pop(invocation_id, None)
     return None
 
 
@@ -98,6 +107,24 @@ def set_formatter_brief(invocation_id: str, brief: str) -> None:
 
 def formatter_brief(invocation_id: str) -> str:
     return _BRIEF.get(invocation_id, "")
+
+
+def set_answer_draft(invocation_id: str, text: str) -> None:
+    """The text the format gate should render for this invocation INSTEAD of
+    the executor's last message (blend 04). The fast path
+    (`agents/fast_path.py`) writes the deterministic result of its one lookup
+    here; nothing else writes it, so on the deep path the gate reads the
+    executor exactly as before.
+
+    Not an event: emitting the draft would put engine-internal prose on the
+    wire, and the bot renders any author outside its answer channel as the
+    user's bubble text (`gub-gchat-bot/src/agent/client.ts:209-217`)."""
+    _bucket(_DRAFT, invocation_id, "")
+    _DRAFT[invocation_id] = text
+
+
+def answer_draft(invocation_id: str) -> str:
+    return _DRAFT.get(invocation_id, "")
 
 
 def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any) -> None:

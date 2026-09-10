@@ -39,21 +39,49 @@ Two open threads, both needing one live Gemini Enterprise session to close:
 
 ## Architecture
 
-`root_agent` is a small multi-agent pipeline, not a single LLM — a deliberate,
-minimal borrowing from the Agentic-RAG "critic-before-commit" pattern:
+`root_agent` is a small multi-agent pipeline, not a single LLM. The question is
+ROUTED first (blend 04) and only then answered:
 
 ```
-LoopAgent(max_iterations=2)
-  ├─ executor   — the tool-using LLM (gub_agent/agent.py)
-  ├─ critic     — evaluates the executor's answer (gub_agent/agents/critic.py)
-  └─ escalator  — exits the loop early when the critic is satisfied
+SequentialAgent("gub_root")
+  ├─ sandbox_echo — resolved experiment config, silent on ordinary runs
+  │                 (gub_agent/sandbox.py)
+  ├─ router       — one LLM call, no tools, typed RouterDecision
+  │                 (gub_agent/agents/router.py)
+  └─ dispatcher   — picks ONE branch, in code (gub_agent/agents/dispatcher.py):
+                    · workspace_personal → abstain  (0 model, 0 tool calls)
+                    · smalltalk          → template (0 model, 0 tool calls)
+                    · low confidence     → ask which question was meant
+                    · a FACT intent with a known entity → fast_path
+                    · everything else    → deep_agent
+
+fast_path (gub_agent/agents/fast_path.py)
+  one deterministic tool call → the evidence index → format_gate. No executor,
+  no critic; an ambiguous entity or an empty result falls through to the deep
+  path once, a 403/404 is answered immediately.
+
+deep_agent = LoopAgent("gub_pipeline", max_iterations=2)
+  ├─ executor    — the tool-using LLM (gub_agent/agent.py)
+  ├─ format_gate — renders the typed AnswerPayload and enforces the answer
+  │                contract in code (gub_agent/agents/format_gate.py)
+  ├─ critic      — evaluates information sufficiency
+  │                (gub_agent/agents/critic.py)
+  └─ escalator   — exits the loop early when the critic is satisfied
 ```
 
-On a clean answer the loop exits after one pass; on a flagged answer the
-executor runs again, sees the critic's feedback in session state, and fixes
-it. We keep just this one specialist (critic), not a planner/rewriter/fanout
-fleet — at our scale the critic is the single piece that materially improves
-dependability.
+The deep path is the Agentic-RAG "critic-before-commit" pattern: on a clean
+answer the loop exits after one pass; on a flagged answer the executor runs
+again, sees the critic's feedback in session state, and fixes it. We keep just
+this one specialist (critic), not a planner/rewriter/fanout fleet — at our
+scale the critic is the single piece that materially improves dependability.
+
+What routing adds is the option to skip it. Latency is model turns (thinking
+tokens ↔ elapsed, r=0.86), so a fact question with a known entity — one HTTP
+call's worth of information — is answered with two model calls (router,
+formatter) instead of 1-3 executor rounds plus a critic pass.
+
+The engine id, the `stream_query` shape and the author-routed answer channel
+are unchanged: callers see no difference at the boundary.
 
 ### Tools
 

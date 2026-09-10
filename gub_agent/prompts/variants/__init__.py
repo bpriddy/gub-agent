@@ -46,14 +46,15 @@ from typing import Literal
 from ..critic import CRITIC_INSTRUCTION
 from ..executor import EXECUTOR_INSTRUCTION
 from ..formatter import FORMATTER_INSTRUCTION
+from ..router import ROUTER_INSTRUCTION
 from .executor_v2_concise import EXECUTOR_V2_CONCISE
 from .executor_v3_grounding import EXECUTOR_V3_GROUNDING
 
 # Mirrors `sandbox.Role`. Declared locally rather than imported so that
 # `prompts/` stays a leaf package with no dependency on the agent wiring.
-Role = Literal["executor", "critic", "formatter"]
+Role = Literal["executor", "critic", "formatter", "router"]
 
-ROLES: tuple[str, ...] = ("executor", "critic", "formatter")
+ROLES: tuple[str, ...] = ("executor", "critic", "formatter", "router")
 
 # The name every role reserves for "what production runs right now".
 BASELINE = "baseline"
@@ -66,6 +67,7 @@ VARIANTS: dict[str, str] = {
     "executor/v3_grounding": EXECUTOR_V3_GROUNDING,
     "critic/baseline": CRITIC_INSTRUCTION,
     "formatter/baseline": FORMATTER_INSTRUCTION,
+    "router/baseline": ROUTER_INSTRUCTION,
 }
 
 
