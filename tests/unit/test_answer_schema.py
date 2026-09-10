@@ -169,6 +169,20 @@ async def test_candidates_only_on_clarify():
         AnswerPayload.model_validate(_answer(candidates=[candidate]))
 
 
+async def test_payload_converts_to_a_genai_response_schema():
+    """The formatter runs with output_schema=AnswerPayload, so the genai SDK
+    must be able to turn the model into a Vertex Schema. A discriminated union
+    (oneOf + discriminator) fails this conversion with extra_forbidden — the
+    formatter then dies CLIENT-side in ~200ms on every attempt and the gate
+    only ever ships template renders (live-verified 2026-09-10). The Block
+    union must stay a plain union (anyOf)."""
+    from google.genai import _transformers
+
+    schema = _transformers.t_schema(None, AnswerPayload)
+    assert schema.properties["blocks"].items.any_of is not None
+    assert len(schema.properties["blocks"].items.any_of) == 3
+
+
 async def test_count_words_matches_the_eval_definition():
     """Tokens need a letter or digit to count — same rule as metrics.ts."""
     assert count_words("chevy has 7 live campaigns") == 5

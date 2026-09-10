@@ -36,7 +36,7 @@ wire changes — change all three together.
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -142,7 +142,13 @@ class Candidate(BaseModel):
     hint: str | None = None
 
 
-Block = Annotated[TableBlock | BulletBlock | TextBlock, Field(discriminator="kind")]
+# A PLAIN union on purpose, not Annotated[..., Field(discriminator="kind")]:
+# a discriminated union serializes as `oneOf` + `discriminator`, which the
+# genai SDK's Schema type rejects (extra_forbidden) — the formatter's model
+# call then dies CLIENT-side in ~200ms on every attempt and the gate only ever
+# ships templates. A plain union serializes as `anyOf`, which Vertex
+# structured output accepts; the `kind` literals still disambiguate parsing.
+Block = TableBlock | BulletBlock | TextBlock
 
 
 class AnswerPayload(BaseModel):

@@ -169,6 +169,8 @@ def _index_response(tool_name: str, response: dict[str, Any], index: dict) -> No
 
     row_counter = 0
     for key, value in response.items():
+        if key.startswith("_"):
+            continue  # _sources and friends are attribution plumbing, not evidence
         if isinstance(value, list):
             for item in value:
                 if isinstance(item, dict):

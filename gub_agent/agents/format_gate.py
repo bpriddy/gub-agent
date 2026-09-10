@@ -37,6 +37,7 @@ it does not have is a bug, not a style choice.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import AsyncGenerator
 
@@ -51,6 +52,8 @@ from ..schemas.answer import HEADLINE_MAX_WORDS
 from .critic import _last_executor_text
 from .evidence_index import evidence_index, set_format_feedback, set_formatter_brief
 from .formatter import ANSWER_STATE_KEY, formatter_agent
+
+logger = logging.getLogger(__name__)
 
 # Initial run + at most two feedback-driven retries, then the template.
 MAX_FORMAT_ATTEMPTS = 3
@@ -215,6 +218,9 @@ def template_payload(executor_text: str, index: dict[str, dict]) -> AnswerPayloa
         (line.strip() for line in executor_text.splitlines() if line.strip()),
         "Company-records answer",
     )
+    # The executor writes Markdown; a headline is styled by the renderer, so
+    # emphasis/heading markers here would render as literal asterisks.
+    first_line = first_line.strip("*#_ ").strip()
     headline = " ".join(first_line.split()[:HEADLINE_MAX_WORDS])
 
     entity_rows = [(eid, e) for eid, e in index.items() if e.get("field") is None]
@@ -318,6 +324,13 @@ class FormatGate(BaseAgent):
                         captured = delta[ANSWER_STATE_KEY]
                     yield event
             except ValidationError as exc:
+                if exc.title != AnswerPayload.__name__:
+                    # Not the contract speaking — some OTHER pydantic model
+                    # failed inside the formatter run (live case: the genai
+                    # SDK's Schema type rejecting the response_schema).
+                    # Retrying would loop on an infra bug and mislabel it as
+                    # payload feedback; fail the turn loudly instead.
+                    raise
                 # output_schema validation failed INSIDE the formatter run —
                 # the contract's own validators (filler, budgets, table shape)
                 # speaking. Same retry path as a grounding failure.
@@ -335,6 +348,12 @@ class FormatGate(BaseAgent):
             if attempt + 1 >= MAX_FORMAT_ATTEMPTS:
                 break
 
+            logger.warning(
+                "format_gate: attempt %d rejected (inv=%s) — %s",
+                attempt + 1,
+                ctx.invocation_id,
+                feedback,
+            )
             # Feedback travels twice on purpose: the state_delta event makes
             # the rejection visible in the trace (and to the batch runner);
             # the in-process store is what the next formatter run's brief
@@ -350,6 +369,11 @@ class FormatGate(BaseAgent):
         # Two retries spent — deterministic template render, authored by the
         # gate. Later than every failed formatter event, so the bot's
         # last-payload-wins routing picks it up.
+        logger.warning(
+            "format_gate: %d attempts spent (inv=%s) — emitting the template render",
+            MAX_FORMAT_ATTEMPTS,
+            ctx.invocation_id,
+        )
         yield self._payload_event(ctx, template_payload(executor_text, index))
 
 
