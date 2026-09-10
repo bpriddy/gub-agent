@@ -75,16 +75,19 @@ RESOLVED_STATE_KEY = "sandbox_resolved"
 # instead of the wire: a session-state payload is not a document store.
 MAX_PROMPT_BYTES = 64 * 1024
 
-Role = Literal["executor", "critic", "formatter"]
+Role = Literal["executor", "critic", "formatter", "router"]
 ThinkingLevel = Literal["MINIMAL", "LOW", "MEDIUM", "HIGH", "DYNAMIC"]
 
 # Baseline thinking levels, reported in the provenance when nothing overrides
 # them. Imported by the construction sites (agent.py, agents/critic.py,
-# agents/formatter.py) so the provenance can never drift from what actually
-# runs.
+# agents/formatter.py, agents/router.py) so the provenance can never drift
+# from what actually runs.
 EXECUTOR_THINKING_LEVEL = "MEDIUM"
 CRITIC_THINKING_LEVEL = "LOW"
 FORMATTER_THINKING_LEVEL = "LOW"
+# The router classifies and stops (blend 04); a deliberation budget here would
+# spend the latency the fast path exists to save.
+ROUTER_THINKING_LEVEL = "LOW"
 
 
 class SandboxOverrides(BaseModel):
@@ -103,10 +106,13 @@ class SandboxOverrides(BaseModel):
     critic_variant: str | None = None
     formatter_instruction: str | None = None
     formatter_variant: str | None = None
+    router_instruction: str | None = None
+    router_variant: str | None = None
     model: str | None = None
     thinking_level: ThinkingLevel | None = None
     critic_thinking_level: ThinkingLevel | None = None
     formatter_thinking_level: ThinkingLevel | None = None
+    router_thinking_level: ThinkingLevel | None = None
     temperature: float | None = None
     critic_enabled: bool = True
     label: str | None = None
@@ -193,6 +199,7 @@ def _validate(overrides: SandboxOverrides) -> None:
         executor_level = overrides.thinking_level or EXECUTOR_THINKING_LEVEL
         critic_level = overrides.critic_thinking_level or CRITIC_THINKING_LEVEL
         formatter_level = overrides.formatter_thinking_level or FORMATTER_THINKING_LEVEL
+        router_level = overrides.router_thinking_level or ROUTER_THINKING_LEVEL
         offending = []
         if executor_level != "DYNAMIC":
             offending.append(f"thinking_level={executor_level}")
@@ -200,6 +207,11 @@ def _validate(overrides: SandboxOverrides) -> None:
             offending.append(f"critic_thinking_level={critic_level}")
         if formatter_level != "DYNAMIC":
             offending.append(f"formatter_thinking_level={formatter_level}")
+        # The router runs on EVERY turn since blend 04, so its level is not
+        # optional for such a model — a 400 here is an empty 200 stream for the
+        # caller before any retrieval has even happened.
+        if router_level != "DYNAMIC":
+            offending.append(f"router_thinking_level={router_level}")
         if offending:
             why = (
                 "(Claude thinks adaptively; Anthropic has no named levels)"
@@ -209,7 +221,8 @@ def _validate(overrides: SandboxOverrides) -> None:
             raise ValueError(
                 f"sandbox: model {overrides.model!r} does not accept a named thinking level "
                 f"{why}, but {', '.join(offending)} would apply "
-                "to this run. Set thinking_level, formatter_thinking_level (and "
+                "to this run. Set thinking_level, formatter_thinking_level, "
+                "router_thinking_level (and "
                 "critic_thinking_level, unless critic_enabled is false) to DYNAMIC for this "
                 "model — or add the model to SANDBOX_THINKING_LEVEL_MODELS if it does accept "
                 "named levels."
@@ -225,9 +238,11 @@ def _validate(overrides: SandboxOverrides) -> None:
         _check_prompt_size(overrides.critic_instruction, "critic_instruction")
     if overrides.formatter_instruction is not None:
         _check_prompt_size(overrides.formatter_instruction, "formatter_instruction")
+    if overrides.router_instruction is not None:
+        _check_prompt_size(overrides.router_instruction, "router_instruction")
     # Variant names are resolved (and so validated) eagerly: a bad name must
     # fail the run, not the fourth model call halfway through an answer.
-    for role in ("executor", "critic", "formatter"):
+    for role in ("executor", "critic", "formatter", "router"):
         name = getattr(overrides, f"{role}_variant")
         if name is not None:
             _resolve_variant(name, role)  # type: ignore[arg-type]
@@ -360,6 +375,8 @@ def sandbox_before_model(callback_context: Any, llm_request: Any, *, role: Role)
         level = overrides.thinking_level
     elif role == "critic":
         level = overrides.critic_thinking_level
+    elif role == "router":
+        level = overrides.router_thinking_level
     else:
         level = overrides.formatter_thinking_level
     if level is not None or overrides.temperature is not None:
@@ -387,6 +404,7 @@ def resolved_config(overrides: SandboxOverrides) -> dict[str, Any]:
     executor_text, executor_source = _prompt_for(overrides, "executor")
     critic_text, critic_source = _prompt_for(overrides, "critic")
     formatter_text, formatter_source = _prompt_for(overrides, "formatter")
+    router_text, router_source = _prompt_for(overrides, "router")
 
     def _sha(text: str | None) -> str | None:
         if text is None:
@@ -400,6 +418,7 @@ def resolved_config(overrides: SandboxOverrides) -> dict[str, Any]:
         "thinking_level": overrides.thinking_level or EXECUTOR_THINKING_LEVEL,
         "critic_thinking_level": overrides.critic_thinking_level or CRITIC_THINKING_LEVEL,
         "formatter_thinking_level": overrides.formatter_thinking_level or FORMATTER_THINKING_LEVEL,
+        "router_thinking_level": overrides.router_thinking_level or ROUTER_THINKING_LEVEL,
         "critic_enabled": overrides.critic_enabled,
         "executor_prompt_source": executor_source,
         "executor_prompt_sha256": _sha(executor_text),
@@ -407,6 +426,8 @@ def resolved_config(overrides: SandboxOverrides) -> dict[str, Any]:
         "critic_prompt_sha256": _sha(critic_text),
         "formatter_prompt_source": formatter_source,
         "formatter_prompt_sha256": _sha(formatter_text),
+        "router_prompt_source": router_source,
+        "router_prompt_sha256": _sha(router_text),
         "overridden_keys": overrides.overridden_keys(),
     }
 

@@ -50,7 +50,12 @@ from pydantic import ValidationError
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
 from ..schemas.answer import HEADLINE_MAX_WORDS
 from .critic import _last_executor_text
-from .evidence_index import evidence_index, set_format_feedback, set_formatter_brief
+from .evidence_index import (
+    answer_draft,
+    evidence_index,
+    set_format_feedback,
+    set_formatter_brief,
+)
 from .formatter import ANSWER_STATE_KEY, formatter_agent
 
 logger = logging.getLogger(__name__)
@@ -298,7 +303,12 @@ class FormatGate(BaseAgent):
         self,
         ctx: InvocationContext,
     ) -> AsyncGenerator[Event, None]:
-        executor_text = _last_executor_text(ctx)
+        # The fast path (blend 04) has no executor prose — it leaves its
+        # deterministic draft in the per-invocation store and calls this gate,
+        # which is the ONLY way an AnswerPayload leaves that path. On the deep
+        # path there is no draft and the executor's last text is read exactly
+        # as before.
+        executor_text = answer_draft(ctx.invocation_id) or _last_executor_text(ctx)
         if not executor_text.strip():
             # A run that produced no executor text (died inside the engine) —
             # nothing to format; emit nothing so the trace shows the failure
