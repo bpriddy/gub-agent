@@ -12,9 +12,11 @@ conversation + executor's response and emits a structured verdict
                      the issue
 
 The critic is deliberately narrow: it doesn't second-guess data values
-it can't verify. It only checks the SHAPE of the executor's behavior
-against known failure modes (counting in the LLM, wrong tool choice,
-missing multi-entity decomposition, leaked IDs, ignored statusMarkdown).
+it can't verify, and — since the answer contract (blend 03) — it doesn't
+judge the answer's shape or grounding either: those are enforced in code
+by the format gate (agents/format_gate.py). What remains is the one
+judgement that needs an LLM: information sufficiency (wrong tool choice,
+missing multi-entity decomposition, no tool call where data was needed).
 
 This is the load-bearing critic-before-commit pattern from the Agentic
 RAG architecture; we keep just this one specialist instead of the full
@@ -45,12 +47,14 @@ from .context_pruning import strip_prior_turn_tool_parts
 
 
 class CriticVerdict(BaseModel):
-    """Critic's two-axis decision on the executor's response.
+    """Critic's decision on the executor's response.
 
-    The critic reasons through its checks (was a tool called, does each
-    question-entity map to a covering call, closure, grounding, recency) in
-    thinking tokens — see the instruction — and emits only this decision, not
-    the intermediate working.
+    One real axis since blend 03 — information sufficiency; the old Axis 2
+    fields remain so the wire shape (and everything reading it: the bot, the
+    batch runner, the debug client) is unchanged. The critic reasons through
+    its checks (was a tool called, does each question-entity map to a covering
+    call) in thinking tokens — see the instruction — and emits only this
+    decision, not the intermediate working.
     """
 
     info_sufficient: bool = Field(
@@ -64,16 +68,13 @@ class CriticVerdict(BaseModel):
     )
     answer_satisfies: bool = Field(
         description=(
-            "Axis 2: does the synthesized answer satisfy this question — "
-            "grounded (every named entity appears in a tool result), "
-            "complete, correctly computed, and correctly formed?"
+            "Set EQUAL to info_sufficient. Answer shape and grounding — the "
+            "old Axis 2 — are enforced in code by the format gate "
+            "(agents/format_gate.py); the field remains for wire compatibility."
         ),
     )
     sufficient: bool = Field(
-        description=(
-            "True ONLY if info_sufficient AND answer_satisfies are both true. "
-            "This gates the loop: false triggers a retry."
-        ),
+        description=("Same value as info_sufficient. This gates the loop: false triggers a retry."),
     )
     reason: str = Field(
         description="One short sentence explaining the verdict.",
@@ -239,6 +240,18 @@ class CriticGate(BaseAgent):
             yield self._pass_event(
                 ctx,
                 "Deterministic pass: exact NO_COMPANY_RECORDS abstention (no critic LLM run).",
+            )
+            return
+
+        # The abstention can also arrive as the answer contract's typed form:
+        # the format gate (which runs before this gate) wrote an
+        # AnswerPayload with kind="abstain" into state. Same deterministic
+        # pass — an abstention needs no information-sufficiency judge.
+        payload = ctx.session.state.get("answer_payload")
+        if isinstance(payload, dict) and payload.get("kind") == "abstain":
+            yield self._pass_event(
+                ctx,
+                "Deterministic pass: abstain AnswerPayload (no critic LLM run).",
             )
             return
         async for event in self.sub_agents[0].run_async(ctx):

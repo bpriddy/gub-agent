@@ -4,13 +4,21 @@ Test doubles shared across the suite.
 MockGub is a real localhost HTTP/1.1 keep-alive server (not a transport mock),
 so tests exercise the actual network path: connection pooling, status codes,
 and request bodies. FakeToolContext stands in for the ADK ToolContext that
-Gemini Enterprise injects at runtime.
+Gemini Enterprise injects at runtime. `invocation_ctx` builds a REAL ADK
+InvocationContext over InMemorySessionService, for the agents whose behaviour
+is control flow over session state and events (the gates, the dispatcher).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+
+from google.adk.agents import BaseAgent
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.events import Event
+from google.adk.sessions import InMemorySessionService
+from google.genai import types as genai_types
 
 
 class MockGub:
@@ -82,3 +90,31 @@ class FakeToolContext:
 
     def __init__(self, **state) -> None:
         self.state = FakeState(state)
+
+
+async def invocation_ctx(
+    *,
+    state: dict | None = None,
+    invocation_id: str = "inv-1",
+    user_text: str | None = None,
+    events: list[Event] | None = None,
+) -> InvocationContext:
+    """A real InvocationContext: session state seeded, optional prior events
+    appended (so `state_delta`s are committed the way the runner commits
+    them), and `user_content` set to the question under test."""
+    service = InMemorySessionService()
+    session = await service.create_session(app_name="gub", user_id="u", state=state or {})
+    for event in events or []:
+        await service.append_event(session, event)
+    content = (
+        genai_types.Content(role="user", parts=[genai_types.Part(text=user_text)])
+        if user_text is not None
+        else None
+    )
+    return InvocationContext(
+        session_service=service,
+        invocation_id=invocation_id,
+        agent=BaseAgent(name="host"),
+        session=session,
+        user_content=content,
+    )

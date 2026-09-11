@@ -76,6 +76,33 @@ async def test_the_starter_variants_are_registered():
     assert "v3_grounding" in variant_names("executor")
 
 
+async def test_the_contract_era_variants_are_registered():
+    """The variants written after the answer contract + fast-path router: two
+    per role, addressable by name from the sandbox UI's arm list."""
+    assert {"v4_brief", "v5_query_discipline"} <= set(variant_names("executor"))
+    assert {"v2_calibrated", "v3_coverage"} <= set(variant_names("critic"))
+
+
+async def test_composed_variants_carry_the_whole_baseline():
+    """Every variant here is `baseline + one appended block`, and that is the
+    experimental design: the block is the only variable, so the tool
+    documentation, the scope rules and the output contract cannot drift from
+    what production runs. A rewrite that dropped them would still answer —
+    just differently for reasons the A/B would credit to the block."""
+    for name in variant_names("executor"):
+        if name == BASELINE:
+            continue
+        text = resolve_variant(name, "executor")
+        assert text.startswith(EXECUTOR_INSTRUCTION), name
+        assert len(text) > len(EXECUTOR_INSTRUCTION), name
+    for name in variant_names("critic"):
+        if name == BASELINE:
+            continue
+        text = resolve_variant(name, "critic")
+        assert text.startswith(CRITIC_INSTRUCTION), name
+        assert len(text) > len(CRITIC_INSTRUCTION), name
+
+
 async def test_every_variant_is_non_empty_and_substantial():
     for key, text in VARIANTS.items():
         assert isinstance(text, str), key

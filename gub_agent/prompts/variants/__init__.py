@@ -45,14 +45,20 @@ from typing import Literal
 
 from ..critic import CRITIC_INSTRUCTION
 from ..executor import EXECUTOR_INSTRUCTION
+from ..formatter import FORMATTER_INSTRUCTION
+from ..router import ROUTER_INSTRUCTION
+from .critic_v2_calibrated import CRITIC_V2_CALIBRATED
+from .critic_v3_coverage import CRITIC_V3_COVERAGE
 from .executor_v2_concise import EXECUTOR_V2_CONCISE
 from .executor_v3_grounding import EXECUTOR_V3_GROUNDING
+from .executor_v4_brief import EXECUTOR_V4_BRIEF
+from .executor_v5_query_discipline import EXECUTOR_V5_QUERY_DISCIPLINE
 
 # Mirrors `sandbox.Role`. Declared locally rather than imported so that
 # `prompts/` stays a leaf package with no dependency on the agent wiring.
-Role = Literal["executor", "critic"]
+Role = Literal["executor", "critic", "formatter", "router"]
 
-ROLES: tuple[str, ...] = ("executor", "critic")
+ROLES: tuple[str, ...] = ("executor", "critic", "formatter", "router")
 
 # The name every role reserves for "what production runs right now".
 BASELINE = "baseline"
@@ -63,7 +69,13 @@ VARIANTS: dict[str, str] = {
     "executor/baseline": EXECUTOR_INSTRUCTION,
     "executor/v2_concise": EXECUTOR_V2_CONCISE,
     "executor/v3_grounding": EXECUTOR_V3_GROUNDING,
+    "executor/v4_brief": EXECUTOR_V4_BRIEF,
+    "executor/v5_query_discipline": EXECUTOR_V5_QUERY_DISCIPLINE,
     "critic/baseline": CRITIC_INSTRUCTION,
+    "critic/v2_calibrated": CRITIC_V2_CALIBRATED,
+    "critic/v3_coverage": CRITIC_V3_COVERAGE,
+    "formatter/baseline": FORMATTER_INSTRUCTION,
+    "router/baseline": ROUTER_INSTRUCTION,
 }
 
 
@@ -99,8 +111,12 @@ def resolve_variant(name: str, role: Role) -> str:
 
 __all__ = [
     "BASELINE",
+    "CRITIC_V2_CALIBRATED",
+    "CRITIC_V3_COVERAGE",
     "EXECUTOR_V2_CONCISE",
     "EXECUTOR_V3_GROUNDING",
+    "EXECUTOR_V4_BRIEF",
+    "EXECUTOR_V5_QUERY_DISCIPLINE",
     "ROLES",
     "VARIANTS",
     "Role",

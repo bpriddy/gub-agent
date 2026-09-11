@@ -231,13 +231,16 @@ def test_validator_message_names_adaptive_thinking_for_claude(monkeypatch):
     monkeypatch.setattr(config, "SANDBOX_THINKING_LEVEL_MODELS", ("gemini-3.5-flash",))
     with pytest.raises(ValueError, match="Claude thinks adaptively"):
         read_overrides({"sandbox": {"model": "claude-sonnet-5"}})
-    # DYNAMIC on both roles is accepted.
+    # DYNAMIC on all four roles is accepted (the formatter, blend 03, and the
+    # router, blend 04, both always run and carry named-level baselines).
     ov = read_overrides(
         {
             "sandbox": {
                 "model": "claude-sonnet-5",
                 "thinking_level": "DYNAMIC",
                 "critic_thinking_level": "DYNAMIC",
+                "formatter_thinking_level": "DYNAMIC",
+                "router_thinking_level": "DYNAMIC",
             }
         }
     )
