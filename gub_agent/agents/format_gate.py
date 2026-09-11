@@ -16,11 +16,17 @@ checks:
    `schemas/answer.py`) surfaces as a ValidationError from the formatter's
    `output_schema` and is treated the same way: feedback + retry.
 
+A citation that is merely mistyped — the tool prefix dropped, or two ids
+spliced — is REPAIRED against the turn's own evidence before check 1 judges
+it (`repair_citations`), because a 36-character hex id is not something a
+model copies reliably and each miss costs one of three attempts.
+
 On failure the gate writes `state["format_feedback"]` as a state_delta event
 (trace-visible) and re-runs the formatter, at most twice; after that it emits
-a template render authored by the gate itself (executor's first line as the
-headline, the top evidence rows as bullets with their ids) — the turn always
-ends with SOME payload for the bot.
+a template render authored by the gate itself — the executor's PROSE under a
+sentence-aware headline, with evidence travelling in `citations`/`facts`
+rather than as body text (`template_payload`) — so the turn always ends with
+SOME payload for the bot, and never with a wall of raw tool JSON.
 
 Shaped like `CriticGate` (`agents/critic.py`), and deliberately NOT a nested
 LoopAgent: ADK's LoopAgent yields sub-agent events upward and exits on
@@ -122,25 +128,150 @@ def _numbers_of(text: str) -> set[str]:
 
 def _entity_runs(text: str) -> list[str]:
     """Candidate entity names: runs of capitalized words, stopwords trimmed
-    from the edges, single sentence-openers skipped."""
+    from the edges, sentence-openers skipped."""
     runs: list[str] = []
     for match in _CAP_RUN_RE.finditer(text):
         words = match.group(0).split()
+        # A capitalized word that merely opens a sentence (or a bullet — the
+        # newline counts as a boundary) is grammar, not a name. This applies to
+        # the FIRST word of a run of any length, not only to a lone word:
+        # "While Chevy", "Although Budweiser" and "Two Chevrolet" were all
+        # rejected as ungrounded entities in live turns whose actual entity
+        # ("Chevy", "Budweiser", "Chevrolet") was grounded — the opener was the
+        # only thing that did not appear in a tool result (2026-09-10 logs).
+        before = text[: match.start()].rstrip(" \t")
+        at_sentence_start = (not before) or before[-1] in ".!?:;•-—\n"
+        trimmed_opener = False
+        if at_sentence_start and len(words) > 1:
+            words = words[1:]
+            trimmed_opener = True
         while words and words[0].lower() in _STOPWORDS:
             words = words[1:]
         while words and words[-1].lower() in _STOPWORDS:
             words = words[:-1]
         if not words:
             continue
-        if len(words) == 1:
-            # A lone capitalized word that merely opens a sentence (or a
-            # bullet — the newline counts as a boundary) is grammar, not
-            # necessarily a name.
-            before = text[: match.start()].rstrip(" \t")
-            if not before or before[-1] in ".!?:;•-—\n":
-                continue
+        # Only the word that actually opened the sentence gets the grammar
+        # exemption. Once it has been trimmed, what is left is a name and must
+        # still be grounded — otherwise "While Tesla dominates" would smuggle
+        # a fabricated entity through the hole this trim opens.
+        if len(words) == 1 and at_sentence_start and not trimmed_opener:
+            continue
         runs.append(" ".join(words))
     return runs
+
+
+def _ground_forms(word: str) -> set[str]:
+    """The spellings of one word that count as the same entity.
+
+    A possessive is the same name ("Chevrolet's" ← Chevrolet) and so is a
+    plural ("EVs" ← EV), but the evidence carries only the base form, so the
+    grounding check rejected both. Across the 2026-09-10 engine logs that was
+    the largest single class of false `ungrounded entity` rejections —
+    `Chevrolet's`, `Chevy's`, `Chevy's Silverado`, `EVs`, `Blazer EV's` — and
+    every one of them burned a formatter attempt.
+    """
+    low = word.lower().strip(".,;:!?()")
+    forms = {low}
+    stripped = re.sub(r"['’]s$", "", low)
+    forms.add(stripped)
+    # "EVs" → "ev" needs a threshold of 3, not 4; a grounding check that is a
+    # little permissive about plurals costs nothing, since it can only match a
+    # spelling a tool actually returned.
+    if len(stripped) > 2 and stripped.endswith("s"):
+        forms.add(stripped[:-1])
+    return {f for f in forms if f}
+
+
+def _is_grounded(run: str, blob: str) -> bool:
+    """Whether a candidate name appears in this turn's evidence, allowing for
+    possessive and plural spellings."""
+    if run.lower() in blob:
+        return True
+    words = run.split()
+    if words and all(any(form in blob for form in _ground_forms(w)) for w in words):
+        return True
+    # The run as a whole, with each word reduced to its base spelling.
+    base = " ".join(re.sub(r"['’]s$", "", w.lower()) for w in words)
+    return bool(base) and base in blob
+
+
+_HEX8_RE = re.compile(r"[0-9a-f]{8}", re.I)
+
+
+def _repair_one(citation: str, index: dict[str, dict]) -> str | None:
+    """The evidence id a near-miss citation unambiguously meant, or None.
+
+    Only ever returns an id THIS TURN produced, and only when the match is
+    unique — a repair that had to guess between two rows would be a fabricated
+    attribution, which is worse than the rejection it replaces.
+    """
+
+    def pick(hits: list[str]) -> str | None:
+        if len(hits) == 1:
+            return hits[0]
+        # One row plus its own per-field rows ("org_query:a1" alongside
+        # "org_query:a1:name"): a citation naming the id meant the ROW, so the
+        # entity row wins. Genuinely different rows stay ambiguous.
+        entity_rows = [eid for eid in hits if index[eid].get("field") is None]
+        return entity_rows[0] if len(entity_rows) == 1 else None
+
+    low = citation.lower()
+    # The bare row id with the tool prefix dropped: "0f1bd315-…" for
+    # "org_query:0f1bd315-…".
+    fixed = pick([eid for eid in index if low in eid.lower()])
+    if fixed:
+        return fixed
+    # A spliced id — head of one row, tail of another. The leading 8 hex are
+    # effectively unique inside one turn's index.
+    head = _HEX8_RE.search(low)
+    if head:
+        return pick([eid for eid in index if head.group(0).lower() in eid.lower()])
+    return None
+
+
+def repair_citations(
+    payload: AnswerPayload, index: dict[str, dict]
+) -> tuple[AnswerPayload, list[str]]:
+    """Fix citations the formatter got nearly right, and report what changed.
+
+    A 36-character random hex id is not something a language model copies
+    reliably, and `unknown citation` was 11 of 88 gate rejections on
+    2026-09-10. Both live failure shapes are mechanically recoverable: one
+    turn cited a bare campaign id with the `org_query:` prefix missing, the
+    next spliced two UUIDs together (head of one row, tail of another). Each
+    resolves to exactly one row the turn retrieved, so the repair is a lookup
+    rather than a guess — and a citation that does NOT resolve uniquely is
+    left alone for `gate_problems` to reject as before.
+
+    `facts` carry the same ids and the contract validates the two against each
+    other in both directions, so they are remapped together.
+    """
+    mapping: dict[str, str] = {}
+    for citation in payload.citations:
+        if citation in index:
+            continue
+        fixed = _repair_one(citation, index)
+        if fixed and fixed != citation:
+            mapping[citation] = fixed
+    if not mapping:
+        return payload, []
+
+    seen: set[str] = set()
+    citations: list[str] = []
+    for citation in payload.citations:
+        resolved = mapping.get(citation, citation)
+        if resolved not in seen:
+            seen.add(resolved)
+            citations.append(resolved)
+    facts = [
+        fact.model_copy(update={"evidence_id": mapping[fact.evidence_id]})
+        if fact.evidence_id in mapping
+        else fact
+        for fact in payload.facts
+    ]
+    repaired = [f"{before} -> {after}" for before, after in sorted(mapping.items())]
+    return payload.model_copy(update={"citations": citations, "facts": facts}), repaired
 
 
 def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
@@ -170,11 +301,7 @@ def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
         )
 
     ungrounded_entities = sorted(
-        {
-            run
-            for run in _entity_runs(prose) + _entity_runs(cells)
-            if run.lower() not in blob and not all(w.lower() in blob for w in run.split())
-        }
+        {run for run in _entity_runs(prose) + _entity_runs(cells) if not _is_grounded(run, blob)}
     )
     if ungrounded_entities:
         problems.append(
@@ -415,9 +542,22 @@ class FormatGate(BaseAgent):
                 if captured is None:
                     feedback = "no AnswerPayload was produced — emit exactly one JSON payload"
                 else:
-                    problems = gate_problems(AnswerPayload.model_validate(captured), index)
+                    payload = AnswerPayload.model_validate(captured)
+                    payload, repaired = repair_citations(payload, index)
+                    problems = gate_problems(payload, index)
                     if not problems:
-                        return  # the formatter's own event already carried the payload
+                        if repaired:
+                            # The formatter's own event carries the UNREPAIRED
+                            # json, so the corrected payload has to be emitted
+                            # again — the bot's answer channel takes the last
+                            # parseable one, and format_gate is on it.
+                            logger.info(
+                                "format_gate: repaired citation(s) (inv=%s) — %s",
+                                ctx.invocation_id,
+                                "; ".join(repaired),
+                            )
+                            yield self._payload_event(ctx, payload)
+                        return  # else the formatter's own event already carried it
                     feedback = "; ".join(problems)
 
             if attempt + 1 >= MAX_FORMAT_ATTEMPTS:
