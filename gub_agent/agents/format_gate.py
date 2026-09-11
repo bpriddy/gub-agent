@@ -48,7 +48,7 @@ from google.genai import types as genai_types
 from pydantic import ValidationError
 
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
-from ..schemas.answer import HEADLINE_MAX_WORDS
+from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
 from .critic import _last_executor_text
 from .evidence_index import (
     answer_draft,
@@ -213,47 +213,112 @@ def _shorten(text: str, max_chars: int = 140) -> str:
     return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
 
 
+# Words a truncated headline must not end on — they promise a continuation
+# that the ellipsis cannot supply.
+_DANGLING = frozenset(
+    "a an the and or but with of to in on for from at by as is are was were has have had"
+    " its their his her our that this these those than then over under into".split()
+)
+
+
+def _headline_from(line: str) -> str:
+    """A headline that reads as a finished thought.
+
+    Cutting at word `HEADLINE_MAX_WORDS` mid-clause is what produced live
+    answers ending "...truck portfolio, with a" (2026-09-11). So: the line's
+    first SENTENCE when it fits the budget, otherwise a hard truncation that at
+    least announces itself with an ellipsis.
+    """
+    sentence = re.match(r"\s*(.+?[.!?])(?:\s|$)", line)
+    candidate = sentence.group(1).strip() if sentence else line.strip()
+    words = candidate.split()
+    if words and len(words) <= HEADLINE_MAX_WORDS:
+        return " ".join(words)
+
+    head = line.split()[:HEADLINE_MAX_WORDS]
+    # Prefer a clause boundary inside the budget over the budget's own edge:
+    # cutting at word 20 landed a live answer on "...portfolio, with a".
+    for i in range(len(head) - 1, 0, -1):
+        if head[i].endswith((",", ";", ":")):
+            head = head[: i + 1]
+            head[-1] = head[-1].rstrip(",;:")
+            break
+    else:
+        # No clause break — at least do not end on a dangling function word.
+        while len(head) > 1 and head[-1].lower() in _DANGLING:
+            head.pop()
+    return " ".join(head) + " …"
+
+
 def template_payload(executor_text: str, index: dict[str, dict]) -> AnswerPayload:
-    """The deterministic render used after the formatter failed twice: the
-    executor's first line as the headline, the top evidence rows as bullets
-    with their ids. Built with model_construct — the template quotes the
-    executor and the tools verbatim, so the contract's style validators
-    (filler, word budgets) must not be able to reject the fallback itself."""
-    first_line = next(
-        (line.strip() for line in executor_text.splitlines() if line.strip()),
-        "Company-records answer",
-    )
+    """The deterministic render used after the formatter failed twice.
+
+    The body is the EXECUTOR'S PROSE, not the evidence. The previous version
+    listed the top evidence rows as bullets, and an evidence `value` is the
+    tool's response row, so a real answer reached users as a chopped sentence
+    over a list of raw JSON (`{"id": "...", "accountId": ...` — 2026-09-11).
+    The executor's text in those turns was perfectly good prose; the fallback
+    threw it away. Evidence still travels, in `citations` (the bot's
+    attribution chips) and `facts` (the conflict filter's input, blend 05) —
+    both machine-read, neither rendered as body text.
+
+    Bullets of evidence remain only as a last resort, for a turn that produced
+    no prose at all: something cited beats nothing.
+
+    Built with model_construct: the template quotes the executor and the tools
+    verbatim, so the contract's style validators (filler, word budgets) must
+    not be able to reject the fallback itself.
+    """
+    lines = [line.strip() for line in executor_text.splitlines() if line.strip()]
     # The executor writes Markdown; a headline is styled by the renderer, so
     # emphasis/heading markers here would render as literal asterisks.
-    first_line = first_line.strip("*#_ ").strip()
-    headline = " ".join(first_line.split()[:HEADLINE_MAX_WORDS])
+    first_line = lines[0].strip("*#_ ").strip() if lines else ""
+    headline = _headline_from(first_line) if first_line else "Company-records answer"
+
+    # The body continues AFTER what the headline already said, so the reader is
+    # not handed the same sentence twice: the later lines when there are any,
+    # else whatever is left of the single line once the headline took its first
+    # sentence. `kind="answer"` needs at least one block, so when nothing is
+    # left the line itself is repeated — mild duplication beats both an invalid
+    # payload and a wall of JSON.
+    if len(lines) > 1:
+        rest = " ".join(lines[1:])
+    else:
+        consumed = headline.rstrip(" …")
+        tail = first_line[len(consumed) :] if first_line.startswith(consumed) else first_line
+        rest = tail.strip(" .,;:") or first_line
+    body_words = _strip_markers(rest).split()[:TEXT_BLOCK_MAX_WORDS]
 
     entity_rows = [(eid, e) for eid, e in index.items() if e.get("field") is None]
     if not entity_rows:
         entity_rows = list(index.items())
     entity_rows = entity_rows[:TEMPLATE_ROWS]
 
-    if entity_rows:
-        items = [f"{_shorten(str(e.get('value', '')))} [{eid}]" for eid, e in entity_rows]
-        blocks = [BulletBlock.model_construct(kind="bullets", items=items)]
-        citations = [eid for eid, _ in entity_rows]
-        facts = [
-            Fact(
-                evidence_id=eid,
-                entity_id=e.get("entity_id"),
-                field=e.get("field"),
-                value=_shorten(str(e.get("value", ""))),
+    citations = [eid for eid, _ in entity_rows]
+    facts = [
+        Fact(
+            evidence_id=eid,
+            entity_id=e.get("entity_id"),
+            field=e.get("field"),
+            value=_shorten(str(e.get("value", ""))),
+        )
+        for eid, e in entity_rows
+    ]
+
+    if body_words:
+        blocks = [TextBlock.model_construct(kind="text", text=" ".join(body_words))]
+    elif entity_rows:
+        # The true last resort: the executor produced no prose at all, so cited
+        # rows are the only thing left to show. This is the ONLY path that can
+        # put a tool's raw value in front of a reader.
+        blocks = [
+            BulletBlock.model_construct(
+                kind="bullets",
+                items=[f"{_shorten(str(e.get('value', '')))} [{eid}]" for eid, e in entity_rows],
             )
-            for eid, e in entity_rows
         ]
     else:
-        blocks = [
-            TextBlock.model_construct(
-                kind="text", text=" ".join(_strip_markers(executor_text).split()[:60])
-            )
-        ]
-        citations = []
-        facts = []
+        blocks = [TextBlock.model_construct(kind="text", text=headline)]
 
     return AnswerPayload.model_construct(
         kind="answer",
