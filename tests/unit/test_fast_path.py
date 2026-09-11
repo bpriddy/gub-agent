@@ -113,15 +113,17 @@ def _decision(**over) -> RouterDecision:
     return RouterDecision.model_validate(base)
 
 
-async def _ctx(decision: RouterDecision | None = None):
+async def _ctx(decision: RouterDecision | None = None, question: str = "статус Silverado 2026 Q3"):
     """A context carrying the router's decision in state and a JWT in the
-    session, so no token exchange is attempted."""
+    session, so no token exchange is attempted.
+
+    `question` matters for `count_or_rank`: the builder reads the user's own
+    words to tell a count from a list or a sum (`_asked_shape`).
+    """
     state = {"gub_jwt": "test-jwt"}
     if decision is not None:
         state["router_decision"] = decision.model_dump()
-    return await invocation_ctx(
-        state=state, invocation_id=INV, user_text="статус Silverado 2026 Q3"
-    )
+    return await invocation_ctx(state=state, invocation_id=INV, user_text=question)
 
 
 def _hit(**over) -> dict:
@@ -200,6 +202,7 @@ async def test_a_count_becomes_an_aggregate_query(gub):
             slots={"entity": "campaigns", "status": "live", "complete": True},
         ),
         fp._ToolShim(await _ctx()),
+        "how many campaigns are live?",
     )
     assert args == {
         "entity": "campaigns",
@@ -215,10 +218,14 @@ async def test_a_metric_becomes_a_ranking_with_a_default_limit(gub):
             slots={"entity": "campaigns", "metric": "budget", "complete": True},
         ),
         fp._ToolShim(await _ctx()),
+        "which campaign has the largest budget?",
     )
     assert args["sort"] == [{"field": "budget", "direction": "desc"}]
     assert args["limit"] == 5
     assert "aggregate" not in args
+    # NULL budgets sort FIRST, so a ranking that does not exclude them returns
+    # a row with no budget as the "largest" — live regression `fact-15`.
+    assert args["filter"]["budget"] == {"is_null": False}
 
 
 async def test_a_named_account_is_resolved_to_an_id_never_similar_to(gub):
@@ -234,6 +241,7 @@ async def test_a_named_account_is_resolved_to_an_id_never_similar_to(gub):
             },
         ),
         fp._ToolShim(await _ctx()),
+        "how many live campaigns does chevy have?",
     )
     # id filter, not `similar_to` — which v1 requires to be a call's SOLE
     # filter and could therefore never combine with the status above.
@@ -260,9 +268,51 @@ async def test_a_named_account_is_resolved_to_an_id_never_similar_to(gub):
 )
 async def test_slots_that_do_not_assemble_deterministically_go_deep(gub, slots):
     args = await fp.org_query_args(
-        _decision(intent="count_or_rank", slots=slots), fp._ToolShim(await _ctx())
+        _decision(intent="count_or_rank", slots=slots),
+        fp._ToolShim(await _ctx()),
+        "how many campaigns are live?",
     )
     assert args is None
+
+
+def test_asked_shape_separates_the_eight_cells_the_eval_measured():
+    """The blend-06 eval (2026-09-10) found the fast path served eight FACT
+    cells and got four wrong — all `count_or_rank`, and the split is exactly
+    by what the sentence asked for. `Slots` cannot see that difference, so the
+    builder reads the user's words. This table IS the regression.
+    """
+    served_correctly = [
+        "How many client accounts do we have?",  # fact-02
+        "How many campaigns are currently live?",  # fact-04
+        "How many active staff members do we have?",  # fact-08
+        "How many campaigns are in pitch status?",  # fact-20
+    ]
+    answered_wrongly = [
+        "Which client accounts do we have?",  # fact-01 — got a count
+        "Which campaigns are in the awarded status?",  # fact-05 — got a count
+        "What is the combined budget of all our campaigns?",  # fact-16 — got a ranking
+    ]
+    for question in served_correctly:
+        assert fp._asked_shape(question) == "count", question
+    for question in answered_wrongly:
+        # "other" means the deep path, which answered 11 of 11 FACT cells right
+        assert fp._asked_shape(question) == "other", question
+    # fact-15 stays on the fast path — it IS a ranking — and is correct now
+    # only because the builder excludes NULLs (tested above).
+    assert fp._asked_shape("Which campaign has the largest budget?") == "rank"
+
+
+def test_asked_shape_prefers_the_disqualifying_reading():
+    """An aggregate or an enumeration wins over counting words in the same
+    sentence — the builder can serve neither."""
+    assert fp._asked_shape("list how many we have per office") == "other"
+    assert fp._asked_shape("what is the total number of campaigns") == "other"
+    assert fp._asked_shape("сколько кампаний live?") == "count"
+    assert fp._asked_shape("какие кампании live?") == "other"
+    assert fp._asked_shape("суммарный бюджет кампаний") == "other"
+    assert fp._asked_shape("самая дорогая кампания") == "rank"
+    # Nothing recognisable is a deep-path question, never a guessed count.
+    assert fp._asked_shape("chevy campaigns") == "other"
 
 
 # ── the agent ─────────────────────────────────────────────────────────────────
@@ -408,7 +458,8 @@ async def test_a_count_answers_from_total_not_from_row_arithmetic(gub, gate):
             intent="count_or_rank",
             entity_surface=None,
             slots={"entity": "campaigns", "status": "live", "complete": True},
-        )
+        ),
+        question="сколько кампаний сейчас live?",
     )
 
     [e async for e in fp.fast_path.run_async(ctx)]

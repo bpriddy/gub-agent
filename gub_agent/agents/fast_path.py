@@ -214,6 +214,50 @@ _PERIOD_FIELD = {"campaigns": "awardedAt"}
 # The only numeric metric it will rank by, per entity.
 _METRIC_FIELDS = {"campaigns": {"budget": "budget"}}
 
+# What the sentence asks FOR. Checked against the user's own words because
+# `Slots` has no field for it: a count, a ranking and a sum are three different
+# answers built from identical slots.
+_COUNT_RE = re.compile(
+    r"\b(how many|how much|number of|count of|сколько|количество)\b",
+    re.I,
+)
+_RANK_RE = re.compile(
+    r"\b(largest|biggest|highest|greatest|top|most expensive|smallest|lowest|cheapest"
+    r"|самый|самая|самое|крупнейш\w*|наибольш\w*|наименьш\w*)\b",
+    re.I,
+)
+# Aggregates this builder cannot express, and enumerations it must not answer
+# with a number. Both belong to the deep path.
+_AGGREGATE_RE = re.compile(
+    r"\b(combined|total(?!\s+of\s+\d)|sum|average|mean|median|суммарн\w*|средн\w*|в сумме|итого)\b",
+    re.I,
+)
+_ENUMERATE_RE = re.compile(
+    r"\b(which|what are|list|name the|show me|give me the (?:names|list)"
+    r"|какие|какой из|перечисл\w*|назови|покажи)\b",
+    re.I,
+)
+
+
+def _asked_shape(question: str) -> str:
+    """ "count" | "rank" | "other" — what the sentence wants back.
+
+    Order matters. An enumeration or an aggregate is disqualifying even when
+    counting words are also present ("list how many we have per office"), so
+    those are tested first; a ranking beats a bare count ("which campaign has
+    the largest budget" contains neither "how many" nor a plain list).
+    """
+    if _AGGREGATE_RE.search(question):
+        return "other"
+    if _RANK_RE.search(question):
+        return "rank"
+    if _ENUMERATE_RE.search(question):
+        return "other"
+    if _COUNT_RE.search(question):
+        return "count"
+    return "other"
+
+
 # Fields it will group by, per entity — an FK id group carries its `*Name`
 # companion in the result rows, so a group-by needs no follow-up query.
 _GROUP_FIELDS = {
@@ -251,7 +295,9 @@ def period_range(text: str) -> list[str] | None:
     return None
 
 
-async def org_query_args(decision: RouterDecision, shim: _ToolShim) -> dict[str, Any] | None:
+async def org_query_args(
+    decision: RouterDecision, shim: _ToolShim, question: str
+) -> dict[str, Any] | None:
     """`org_query` kwargs assembled from the router's `slots`, or None → deep
     path.
 
@@ -324,17 +370,41 @@ async def org_query_args(decision: RouterDecision, shim: _ToolShim) -> dict[str,
             return None
         args["limit"] = slots.limit
 
-    if slots.metric:
+    # What SHAPE of answer the sentence asked for. `slots` cannot tell these
+    # apart — "how many campaigns", "which campaigns" and "the combined budget
+    # of the campaigns" all arrive as the same entity/status/metric fields — and
+    # answering one with another is how this builder produced four confidently
+    # wrong answers out of eight in the 2026-09-10 eval: a count for "which
+    # accounts do we have", a ranking for "the combined budget".
+    shape = _asked_shape(question)
+    if shape == "rank":
+        if not slots.metric:
+            return None
         field_name = _METRIC_FIELDS.get(entity, {}).get(slots.metric.strip().lower())
         if field_name is None:
             return None
-        # A ranking: the DB sorts, we take the top rows.
+        # A ranking: the DB sorts, we take the top rows. NULLs must be excluded
+        # or they sort first and the "largest budget" is a row with no budget —
+        # which is exactly what `fact-15` returned.
+        filters[field_name] = {"is_null": False}
+        args["filter"] = filters
         args["sort"] = [{"field": field_name, "direction": "desc"}]
         args.setdefault("limit", 5)
-    else:
+    elif shape == "count":
+        if slots.metric:
+            # A metric with a counting question is an aggregate ("the total
+            # budget"), and this builder cannot express sum/avg — the deep path
+            # can. Never serve a ranking in its place.
+            return None
         # A count: `total` is the real DB count and the aggregate row makes it
         # citable evidence. Never count rows in Python.
         args["aggregate"] = {"count": {"op": "count"}}
+    else:
+        # "which/list" wants rows, an aggregate wants sum/avg, and anything
+        # unrecognised is a shape this builder has not been shown to get right.
+        # All three cost the deep path, per `schemas/router.py`: "an unset flag
+        # must cost the deep path, never a confidently wrong count."
+        return None
 
     return args
 
@@ -368,7 +438,7 @@ def _shortcut(response: dict, decision: RouterDecision) -> Lookup | None:
     return None
 
 
-async def _campaign(decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
+async def _campaign(decision: RouterDecision, shim: _ToolShim, question: str) -> Lookup | None:
     # `entity_id` is the bot's "User selected campaign <uuid>" prefix (blend
     # 02) — a campaign id, so only the campaign intents may use it.
     campaign_id = decision.entity_id
@@ -385,7 +455,7 @@ async def _campaign(decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
     return Lookup(evidence=[("get_campaign", response)], tool="get_campaign")
 
 
-async def _account(decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
+async def _account(decision: RouterDecision, shim: _ToolShim, question: str) -> Lookup | None:
     resolution = await _resolve(decision.entity_surface, ("account",), shim)
     if resolution.kind != "one" or resolution.entity_id is None:
         return None
@@ -397,7 +467,7 @@ async def _account(decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
     return Lookup(evidence=[("get_account_overview", response)], tool="get_account_overview")
 
 
-async def _staff(decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
+async def _staff(decision: RouterDecision, shim: _ToolShim, question: str) -> Lookup | None:
     resolution = await _resolve(decision.entity_surface, ("staff",), shim)
     if resolution.kind == "ambiguous":
         return None
@@ -423,8 +493,8 @@ async def _staff(decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
     return Lookup(evidence=[("search_staff", response)], tool="search_staff")
 
 
-async def _count_or_rank(decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
-    args = await org_query_args(decision, shim)
+async def _count_or_rank(decision: RouterDecision, shim: _ToolShim, question: str) -> Lookup | None:
+    args = await org_query_args(decision, shim, question)
     if args is None:
         return None
     response = await org_query(**args, tool_context=shim)
@@ -514,6 +584,9 @@ class FastPath(BaseAgent):
         _set_outcome(ctx.invocation_id, "deep")  # pessimistic until a payload ships
         decision = decision_from(ctx)
         shim = _ToolShim(ctx)
+        # `Slots` cannot say whether the sentence wanted a count, a list or a
+        # sum, so the count_or_rank builder reads the user's own words.
+        question = user_text(ctx)
 
         # The fast path owns this turn's index: the executor's per-pass reset
         # (`agent.py:_before_agent`) has not run and must not be relied on.
@@ -523,7 +596,7 @@ class FastPath(BaseAgent):
         if lookup_fn is None:
             return
         try:
-            lookup = await lookup_fn(decision, shim)
+            lookup = await lookup_fn(decision, shim, question)
         except Exception:
             # Never fail the turn on the fast path — the deep path is always a
             # correct (if slower) answer to the same question.
@@ -546,7 +619,7 @@ class FastPath(BaseAgent):
             logger.info("fast_path: no citable evidence (inv=%s) — deep path", ctx.invocation_id)
             return
 
-        set_answer_draft(ctx.invocation_id, compose_draft(user_text(ctx), decision, lookup))
+        set_answer_draft(ctx.invocation_id, compose_draft(question, decision, lookup))
         _set_outcome(ctx.invocation_id, "answered")
         # The gate is the deep path's own object, invoked here rather than
         # adopted: ADK allows an agent ONE parent (`base_agent.py:135-145`),
