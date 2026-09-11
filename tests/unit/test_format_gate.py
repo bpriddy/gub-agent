@@ -125,6 +125,40 @@ async def test_ungrounded_entity_is_the_critics_old_hard_fail():
     assert any("ungrounded entity" in p and "Chevrolet" in p for p in problems)
 
 
+async def test_possessives_and_plurals_are_the_same_entity():
+    """The largest class of FALSE `ungrounded entity` rejections in the
+    2026-09-10 engine logs: the evidence carries "chevy", the answer writes
+    "Chevy's", and the turn burned a formatter attempt over an apostrophe."""
+    index = _seed_index()  # evidence says "chevy", "Q3 push"
+    for text in ("chevy's quarter improved.", "the Q3 pushes are live."):
+        problems = gate_problems(_payload(blocks=[{"kind": "text", "text": text}]), index)
+        assert not any("ungrounded entity" in p for p in problems), f"{text!r} -> {problems}"
+
+
+async def test_a_sentence_opener_does_not_drag_a_grounded_name_down():
+    """ "While Chevy...", "Although Budweiser...", "Two Chevrolet..." were all
+    rejected in live turns although the entity itself was grounded — only the
+    opening word was missing from the tool results."""
+    index = _seed_index()
+    problems = gate_problems(
+        _payload(blocks=[{"kind": "text", "text": "While chevy held, the Q3 push stayed live."}]),
+        index,
+    )
+    assert not any("ungrounded entity" in p for p in problems), problems
+
+
+async def test_trimming_an_opener_does_not_smuggle_a_fabricated_name():
+    """The hole the trim above opens, closed: once the opener is gone what is
+    left is a name and must still be grounded."""
+    problems = gate_problems(
+        _payload(
+            blocks=[{"kind": "text", "text": "While Tesla dominates, the Q3 push stayed live."}]
+        ),
+        _seed_index(),
+    )
+    assert any("ungrounded entity" in p and "Tesla" in p for p in problems), problems
+
+
 async def test_grounded_entity_and_sentence_openers_pass():
     problems = gate_problems(
         _payload(

@@ -122,25 +122,72 @@ def _numbers_of(text: str) -> set[str]:
 
 def _entity_runs(text: str) -> list[str]:
     """Candidate entity names: runs of capitalized words, stopwords trimmed
-    from the edges, single sentence-openers skipped."""
+    from the edges, sentence-openers skipped."""
     runs: list[str] = []
     for match in _CAP_RUN_RE.finditer(text):
         words = match.group(0).split()
+        # A capitalized word that merely opens a sentence (or a bullet — the
+        # newline counts as a boundary) is grammar, not a name. This applies to
+        # the FIRST word of a run of any length, not only to a lone word:
+        # "While Chevy", "Although Budweiser" and "Two Chevrolet" were all
+        # rejected as ungrounded entities in live turns whose actual entity
+        # ("Chevy", "Budweiser", "Chevrolet") was grounded — the opener was the
+        # only thing that did not appear in a tool result (2026-09-10 logs).
+        before = text[: match.start()].rstrip(" \t")
+        at_sentence_start = (not before) or before[-1] in ".!?:;•-—\n"
+        trimmed_opener = False
+        if at_sentence_start and len(words) > 1:
+            words = words[1:]
+            trimmed_opener = True
         while words and words[0].lower() in _STOPWORDS:
             words = words[1:]
         while words and words[-1].lower() in _STOPWORDS:
             words = words[:-1]
         if not words:
             continue
-        if len(words) == 1:
-            # A lone capitalized word that merely opens a sentence (or a
-            # bullet — the newline counts as a boundary) is grammar, not
-            # necessarily a name.
-            before = text[: match.start()].rstrip(" \t")
-            if not before or before[-1] in ".!?:;•-—\n":
-                continue
+        # Only the word that actually opened the sentence gets the grammar
+        # exemption. Once it has been trimmed, what is left is a name and must
+        # still be grounded — otherwise "While Tesla dominates" would smuggle
+        # a fabricated entity through the hole this trim opens.
+        if len(words) == 1 and at_sentence_start and not trimmed_opener:
+            continue
         runs.append(" ".join(words))
     return runs
+
+
+def _ground_forms(word: str) -> set[str]:
+    """The spellings of one word that count as the same entity.
+
+    A possessive is the same name ("Chevrolet's" ← Chevrolet) and so is a
+    plural ("EVs" ← EV), but the evidence carries only the base form, so the
+    grounding check rejected both. Across the 2026-09-10 engine logs that was
+    the largest single class of false `ungrounded entity` rejections —
+    `Chevrolet's`, `Chevy's`, `Chevy's Silverado`, `EVs`, `Blazer EV's` — and
+    every one of them burned a formatter attempt.
+    """
+    low = word.lower().strip(".,;:!?()")
+    forms = {low}
+    stripped = re.sub(r"['’]s$", "", low)
+    forms.add(stripped)
+    # "EVs" → "ev" needs a threshold of 3, not 4; a grounding check that is a
+    # little permissive about plurals costs nothing, since it can only match a
+    # spelling a tool actually returned.
+    if len(stripped) > 2 and stripped.endswith("s"):
+        forms.add(stripped[:-1])
+    return {f for f in forms if f}
+
+
+def _is_grounded(run: str, blob: str) -> bool:
+    """Whether a candidate name appears in this turn's evidence, allowing for
+    possessive and plural spellings."""
+    if run.lower() in blob:
+        return True
+    words = run.split()
+    if words and all(any(form in blob for form in _ground_forms(w)) for w in words):
+        return True
+    # The run as a whole, with each word reduced to its base spelling.
+    base = " ".join(re.sub(r"['’]s$", "", w.lower()) for w in words)
+    return bool(base) and base in blob
 
 
 def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
@@ -170,11 +217,7 @@ def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
         )
 
     ungrounded_entities = sorted(
-        {
-            run
-            for run in _entity_runs(prose) + _entity_runs(cells)
-            if run.lower() not in blob and not all(w.lower() in blob for w in run.split())
-        }
+        {run for run in _entity_runs(prose) + _entity_runs(cells) if not _is_grounded(run, blob)}
     )
     if ungrounded_entities:
         problems.append(
