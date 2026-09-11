@@ -33,6 +33,7 @@ from gub_agent.agents.format_gate import (
 )
 from gub_agent.config import AGENT_NAME
 from gub_agent.schemas import AnswerPayload
+from gub_agent.schemas.answer import HEADLINE_MAX_WORDS, count_words
 
 INV = "inv-1"
 
@@ -188,18 +189,55 @@ async def test_brief_carries_answer_evidence_and_feedback():
     assert "FORMAT_FEEDBACK" not in compose_brief("x", index, feedback="")
 
 
-async def test_template_render_is_bullets_of_evidence_rows_with_ids():
+async def test_template_render_shows_executor_prose_not_evidence_rows():
     index = _seed_index()
     payload = template_payload("Here is the long executor answer\nmore detail", index)
     assert payload.kind == "answer"
     assert payload.headline == "Here is the long executor answer"  # verbatim — no filler veto
-    bullets = payload.blocks[0]
-    assert bullets.kind == "bullets"
-    assert all("[" in item for item in bullets.items)
+    # The BODY is the executor's prose. Evidence values are a tool's response
+    # row; rendering them is what shipped raw JSON to users (2026-09-11).
+    body = payload.blocks[0]
+    assert body.kind == "text"
+    assert body.text == "more detail"
+    # Evidence still travels, just not as body text: citations feed the bot's
+    # attribution chips and facts feed the conflict filter (blend 05).
     assert set(payload.citations) == {f.evidence_id for f in payload.facts}
     assert all(cid in index for cid in payload.citations)
     # entity rows preferred over per-field rows
     assert "org_query:a1" in payload.citations
+
+
+async def test_template_never_renders_a_tool_row_when_there_is_prose():
+    """The live regression: good executor prose, evidence values that are
+    serialized tool rows. The reader must see the prose."""
+    index = {
+        "org_query:results0": {
+            "value": '{"count": 1, "totalBudget": "1500000"}',
+            "entity_id": None,
+            "field": None,
+        },
+        "org_query:c1": {
+            "value": '{"id": "c1", "accountId": "a9", "name": "T1-1 HD MCP", "status": "pitch"}',
+            "entity_id": "c1",
+            "field": None,
+        },
+    }
+    prose = (
+        "In the last month, the most significant movement has been centered on Chevy's "
+        "Heavy Duty (HD) truck portfolio, with a new pitch opened.\n"
+        "The T1-1 HD MCP pitch carries a $1.5M budget."
+    )
+    payload = template_payload(prose, index)
+    rendered = (
+        payload.headline
+        + " "
+        + " ".join(getattr(b, "text", " ".join(getattr(b, "items", []))) for b in payload.blocks)
+    )
+    assert '{"id"' not in rendered and '"accountId"' not in rendered
+    assert "T1-1 HD MCP pitch carries" in rendered
+    # and the headline stops at a clause boundary rather than mid-phrase
+    assert not payload.headline.rstrip(" …").endswith(("with a", "with", "a"))
+    assert count_words(payload.headline) <= HEADLINE_MAX_WORDS
 
 
 async def test_template_with_no_evidence_falls_back_to_executor_text():
@@ -207,6 +245,15 @@ async def test_template_with_no_evidence_falls_back_to_executor_text():
     payload = template_payload("nothing was retrieved this turn", {})
     assert payload.blocks[0].kind == "text"
     assert payload.citations == []
+
+
+async def test_template_always_carries_a_block_for_kind_answer():
+    """`kind="answer"` with no block is a contract violation the gate itself
+    must not emit — it is built with model_construct, so nothing would catch
+    it downstream."""
+    for text in ("", "one line only.", "Short.\nmore"):
+        assert template_payload(text, {}).blocks, f"no block for {text!r}"
+        assert template_payload(text, _seed_index()).blocks, f"no block for {text!r}"
 
 
 # ── the gate's control flow, on a real InvocationContext ─────────────────────
