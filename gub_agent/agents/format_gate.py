@@ -304,15 +304,82 @@ def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
         {run for run in _entity_runs(prose) + _entity_runs(cells) if not _is_grounded(run, blob)}
     )
     if ungrounded_entities:
-        problems.append(
-            f"ungrounded entity: {', '.join(ungrounded_entities)} — every named entity must "
-            "appear verbatim in a tool result from this turn; use the exact name the tool "
-            "returned, never complete or translate it"
-        )
+        problems.append(_ungrounded_entity_problem(ungrounded_entities, index))
     return problems
 
 
+def _ungrounded_entity_problem(runs: list[str], index: dict[str, dict]) -> str:
+    """The feedback for check 3, with remedial advice the model can act on.
+
+    "Use the exact name the tool returned" only helps when the run is a
+    MIS-SPELLING of something the turn retrieved. The commonest offender is
+    not that: it is a coined section label — `Net Momentum`, `Truck Trust`,
+    `Softening Brand Health Metrics` (2026-09-10 logs) — for which no
+    tool-returned name exists, so the advice is unfollowable and the model
+    answers it by inventing a DIFFERENT label. The same class then recurs on
+    attempts 2 and 3 until the template ships.
+
+    So the two cases are split by the same test `_repair_one` uses for
+    citations: a run that partially matches a retrieved value is a misspelling
+    and keeps the old advice; a run that matches nothing is an invention and is
+    told to go away.
+    """
+    blob_tokens = set(re.findall(r"[\w'’-]+", _evidence_blob(index)))
+    misspelled = [run for run in runs if _near_miss(run, blob_tokens)]
+    invented = [run for run in runs if run not in misspelled]
+
+    # The label stays "ungrounded entity" for both — it is the taxonomy the
+    # engine logs are read by. Only the remedy differs.
+    parts: list[str] = []
+    if misspelled:
+        parts.append(
+            f"ungrounded entity: {', '.join(misspelled)} — use the exact name the tool "
+            "returned, never complete or translate it"
+        )
+    if invented:
+        parts.append(
+            f"ungrounded entity: {', '.join(invented)} — these appear in no tool result "
+            "and nothing there resembles them. Do not coin section headings or "
+            "`Label: claim` prefixes; start the bullet with the claim, or drop the phrase"
+        )
+    return "; ".join(parts)
+
+
+def _near_miss(run: str, blob_tokens: set[str]) -> bool:
+    """Whether the evidence plausibly holds the name this run was reaching for.
+
+    "Chevrolet" against a tool that returned "chevy" is a misspelling and the
+    old advice ("use the exact name") is exactly right. "Net Momentum" against
+    the same evidence is not reaching for anything — telling it to substitute a
+    name it cannot find is what made the model invent a different label and
+    fail again. A shared four-character prefix separates the two cheaply.
+    """
+    for word in run.lower().split():
+        stem = re.sub(r"['’]s$", "", word)[:4]
+        if len(stem) < 4:
+            continue
+        if any(token.startswith(stem) for token in blob_tokens):
+            return True
+    return False
+
+
 # ── the brief (the formatter's model input) ──────────────────────────────────
+
+
+# What the gate will check, in the gate's own words, stated BEFORE the first
+# attempt. Until 2026-09-11 the brief carried none of this: the formatter first
+# met the rules by failing them, which cost an attempt every time and was the
+# single largest source of retries (`ungrounded entity`, 39 of 88 rejections).
+# Phrased against what `gate_problems` actually tests — any capitalized run —
+# rather than "entity name", which a model does not read a coined heading as.
+_GROUNDING_RULES = """RULES (checked in code — a payload breaking one is rejected):
+- Every number you write must appear verbatim in a value above. Copy it; never
+  reformat, round or recompute.
+- Every capitalized word or phrase you write must appear in a value above —
+  names, places, products alike. If it is not there, do not write it.
+- Do not coin section headings or `Label: claim` bullet prefixes. A bullet
+  starts with the claim. A heading you invented is an ungrounded phrase.
+- Cite only the ids above, and echo each cited id in `facts`."""
 
 
 def compose_brief(executor_text: str, index: dict[str, dict], feedback: str) -> str:
@@ -325,8 +392,18 @@ def compose_brief(executor_text: str, index: dict[str, dict], feedback: str) -> 
     if index:
         for evidence_id, entry in index.items():
             lines.append(f"- {evidence_id} = {entry.get('value', '')}")
+        lines += ["", _GROUNDING_RULES]
     else:
+        # Nothing citable: `kind="answer"` is unsatisfiable by contract
+        # (`schemas/answer.py` requires a citation), so say what IS available
+        # instead of letting three attempts fail at an impossible payload.
         lines.append("(none — this turn retrieved nothing citable)")
+        lines += [
+            "",
+            'RULE: with no citable evidence, kind="answer" is invalid — it requires a '
+            'citation. Emit kind="abstain" (headline NO_COMPANY_RECORDS) if the question '
+            'wanted company records, or kind="clarify" if it needs a question back.',
+        ]
     if feedback:
         lines += ["", f"FORMAT_FEEDBACK (your previous payload was rejected): {feedback}"]
     return "\n".join(lines)
@@ -464,10 +541,28 @@ def _abstain_payload() -> AnswerPayload:
 
 
 def _explain_validation(exc: ValidationError) -> str:
-    parts = []
+    """The retry feedback for a contract violation — the REAL error, not the
+    union's bookkeeping.
+
+    `Block` is a plain union (`schemas/answer.py`), so one bad table reports
+    the table's own error PLUS "Input should be 'bullets'" and "Field required"
+    for each branch it is not. Those filled 4 of the 6 kept slots, and the
+    formatter spent its retries reading about block kinds it never tried to
+    emit. A branch mismatch is dropped unless nothing else survives.
+    """
+    kept: list[str] = []
+    noise: list[str] = []
     for err in exc.errors():
         loc = ".".join(str(item) for item in err.get("loc", ())) or "payload"
-        parts.append(f"{loc}: {err.get('msg', 'invalid')}")
+        msg = err.get("msg", "invalid")
+        line = f"{loc}: {msg}"
+        # `literal_error` on a union member's `kind`, and the `missing` fields
+        # that follow from it, describe the branches the payload is NOT.
+        is_branch_noise = err.get("type") in {"literal_error", "missing"} and (
+            "BulletBlock" in loc or "TextBlock" in loc or "TableBlock" in loc
+        )
+        (noise if is_branch_noise else kept).append(line)
+    parts = kept or noise
     return "invalid payload — " + "; ".join(parts[:6])
 
 
@@ -516,7 +611,16 @@ class FormatGate(BaseAgent):
         index = evidence_index(ctx.invocation_id)
         set_formatter_brief(ctx.invocation_id, compose_brief(executor_text, index, feedback=""))
 
-        for attempt in range(MAX_FORMAT_ATTEMPTS):
+        # With nothing citable, `kind="answer"` CANNOT validate — the contract
+        # requires a citation (`schemas/answer.py`) — so a rejected attempt is
+        # not repairable by feedback and retrying spends model calls on an
+        # impossible payload. This was 20 of 88 rejections on 2026-09-10, all
+        # the same message. The formatter still gets ONE call, because only it
+        # can tell an abstention from a clarification; after that the gate
+        # settles deterministically.
+        attempts = MAX_FORMAT_ATTEMPTS if index else 1
+
+        for attempt in range(attempts):
             captured: dict | None = None
             feedback = ""
             try:
@@ -542,23 +646,36 @@ class FormatGate(BaseAgent):
                 if captured is None:
                     feedback = "no AnswerPayload was produced — emit exactly one JSON payload"
                 else:
-                    payload = AnswerPayload.model_validate(captured)
-                    payload, repaired = repair_citations(payload, index)
-                    problems = gate_problems(payload, index)
-                    if not problems:
-                        if repaired:
-                            # The formatter's own event carries the UNREPAIRED
-                            # json, so the corrected payload has to be emitted
-                            # again — the bot's answer channel takes the last
-                            # parseable one, and format_gate is on it.
-                            logger.info(
-                                "format_gate: repaired citation(s) (inv=%s) — %s",
-                                ctx.invocation_id,
-                                "; ".join(repaired),
-                            )
-                            yield self._payload_event(ctx, payload)
-                        return  # else the formatter's own event already carried it
-                    feedback = "; ".join(problems)
+                    try:
+                        payload = AnswerPayload.model_validate(captured)
+                    except ValidationError as exc:
+                        # The formatter's LlmAgent normally validates against
+                        # `output_schema` and raises inside its own run, which
+                        # the except above catches. A payload that reaches here
+                        # invalid came from somewhere else (a state_delta
+                        # written directly), and crashing the turn over it
+                        # would be worse than the retry every other rejection
+                        # gets.
+                        feedback = _explain_validation(exc)
+                        captured = None
+                    if captured is not None:
+                        payload, repaired = repair_citations(payload, index)
+                        problems = gate_problems(payload, index)
+                        if not problems:
+                            if repaired:
+                                # The formatter's own event carries the
+                                # UNREPAIRED json, so the corrected payload has
+                                # to be emitted again — the bot's answer channel
+                                # takes the last parseable one, and format_gate
+                                # is on it.
+                                logger.info(
+                                    "format_gate: repaired citation(s) (inv=%s) — %s",
+                                    ctx.invocation_id,
+                                    "; ".join(repaired),
+                                )
+                                yield self._payload_event(ctx, payload)
+                            return  # else the formatter's event already carried it
+                        feedback = "; ".join(problems)
 
             if attempt + 1 >= MAX_FORMAT_ATTEMPTS:
                 break

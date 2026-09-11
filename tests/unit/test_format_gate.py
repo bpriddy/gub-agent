@@ -26,6 +26,7 @@ from gub_agent.agents.evidence_index import (
     reset_evidence_index,
 )
 from gub_agent.agents.format_gate import (
+    MAX_FORMAT_ATTEMPTS,
     FormatGate,
     compose_brief,
     gate_problems,
@@ -209,6 +210,51 @@ async def test_table_source_id_cells_do_not_trip_number_grounding():
         ],
     )
     assert gate_problems(payload, index) == []
+
+
+# ── the brief states the rules BEFORE the first attempt ──────────────────────
+
+
+async def test_the_brief_carries_the_grounding_rules_on_attempt_one():
+    """Until 2026-09-11 the brief held no rule at all: the formatter met them
+    only by failing, which cost an attempt every time. `ungrounded entity` was
+    39 of 88 rejections."""
+    brief = compose_brief("chevy is fine.", _seed_index(), feedback="")
+    assert "RULES (checked in code" in brief
+    assert "must appear in a value above" in brief
+    # the specific behaviour that produced the biggest bucket
+    assert "Do not coin section headings" in brief
+
+
+async def test_an_empty_index_tells_the_formatter_to_abstain():
+    """With nothing citable, kind="answer" cannot validate — so say which kinds
+    ARE available instead of letting the attempt fail at an impossible payload."""
+    brief = compose_brief("nothing in our records on that.", {}, feedback="")
+    assert "(none — this turn retrieved nothing citable)" in brief
+    assert 'kind="abstain"' in brief
+    assert "RULES (checked in code" not in brief  # the grounding block is moot
+
+
+async def test_feedback_tells_an_invented_label_to_go_away_not_to_be_renamed():
+    """ "Use the exact name the tool returned" is unfollowable for a coined
+    heading — there is no such name — so the model invented a different label
+    and failed again. Near-misses keep the old advice."""
+    index = _seed_index()  # evidence says "chevy"
+    misspelled = gate_problems(
+        _payload(blocks=[{"kind": "text", "text": "latest from Chevrolet is strong."}]), index
+    )
+    assert any("use the exact name the tool returned" in p for p in misspelled)
+
+    invented = gate_problems(
+        _payload(blocks=[{"kind": "bullets", "items": ["Net Momentum held up this quarter"]}]),
+        index,
+    )
+    # "Net" is trimmed as the bullet's opener, so the run reported is
+    # "Momentum" — partial, but it still names the phrase the model must drop.
+    assert any("Momentum" in p and "no tool result" in p for p in invented)
+    assert any("start the bullet with the claim" in p for p in invented)
+    # the log taxonomy stays "ungrounded entity" for both
+    assert all("ungrounded entity" in p for p in misspelled + invented)
 
 
 # ── citation repair, pure ─────────────────────────────────────────────────────
@@ -451,6 +497,47 @@ async def test_gate_retries_with_feedback_then_accepts():
     assert "unknown citation" in feedback_events[0].actions.state_delta["format_feedback"]
     # last payload-bearing event is the accepted formatter one, not a template
     assert events[-1].author == "formatter"
+
+
+async def test_an_empty_evidence_index_costs_one_attempt_not_three():
+    """The 20-rejection cluster of 2026-09-10, all the same message.
+
+    With nothing citable, `kind="answer"` cannot validate — the contract wants
+    a citation — so feedback cannot repair it and each retry spends a model
+    call on an impossible payload. The formatter still gets ONE call (only it
+    can tell an abstention from a clarification); after that the gate settles.
+    """
+    reset_evidence_index(SimpleNamespace(invocation_id=INV))  # no evidence at all
+    uncitable = {
+        "kind": "answer",
+        "headline": "nothing in our records",
+        "blocks": [],
+        "citations": [],
+    }
+    formatter = _scripted([uncitable])
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    ctx = await _gate_ctx("I have nothing on that in company records.")
+
+    events = [e async for e in gate.run_async(ctx)]
+
+    assert len(formatter.runs) == 1, f"formatter ran {len(formatter.runs)}x — should cost one call"
+    assert len(formatter.runs) < MAX_FORMAT_ATTEMPTS
+    # and the turn still ends with a payload for the bot
+    assert events, "the turn must not end payload-less"
+
+
+async def test_an_empty_index_still_lets_the_formatter_choose_abstain():
+    """The one call it does get is real: a valid abstain passes straight
+    through, no template, no second attempt."""
+    reset_evidence_index(SimpleNamespace(invocation_id=INV))
+    abstain = {"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}
+    formatter = _scripted([abstain])
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    ctx = await _gate_ctx("not in our records.")
+
+    [e async for e in gate.run_async(ctx)]
+
+    assert len(formatter.runs) == 1
 
 
 async def test_gate_emits_template_after_two_failed_retries():
