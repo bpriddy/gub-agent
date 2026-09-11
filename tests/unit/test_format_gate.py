@@ -29,6 +29,7 @@ from gub_agent.agents.format_gate import (
     FormatGate,
     compose_brief,
     gate_problems,
+    repair_citations,
     template_payload,
 )
 from gub_agent.config import AGENT_NAME
@@ -208,6 +209,73 @@ async def test_table_source_id_cells_do_not_trip_number_grounding():
         ],
     )
     assert gate_problems(payload, index) == []
+
+
+# ── citation repair, pure ─────────────────────────────────────────────────────
+
+
+def _cited(*ids) -> AnswerPayload:
+    return AnswerPayload.model_validate(
+        {
+            "kind": "answer",
+            "headline": "the Q3 push is live",
+            "blocks": [{"kind": "text", "text": "the Q3 push is live."}],
+            "citations": list(ids),
+            "facts": [{"evidence_id": i, "value": "live"} for i in ids],
+        }
+    )
+
+
+async def test_repair_restores_a_dropped_tool_prefix():
+    """Live attempt 1 of the reported turn: the bare row id, `org_query:` gone."""
+    index = _seed_index()
+    bare = "a1"  # org_query:a1 is in the index
+    payload, repaired = repair_citations(_cited(bare), index)
+    assert repaired and payload.citations == ["org_query:a1"]
+    # facts carry the same ids and the contract checks both directions
+    assert [f.evidence_id for f in payload.facts] == ["org_query:a1"]
+    assert not any("unknown citation" in p for p in gate_problems(payload, index))
+
+
+async def test_repair_resolves_a_spliced_id_by_its_unique_head():
+    """Live attempt 2: head of one row's id, tail of another's. The leading
+    characters identify one row, so the fix is a lookup, not a guess."""
+    index = {
+        "org_query:4bf32a55-6e79-4f9e-86f8-f6dfd0c776e4": {"value": "see the usa"},
+        "org_query:0f1bd315-6c13-4fea-8dd6-6a93bb0fb6da": {"value": "t1-1 hd mcp"},
+    }
+    spliced = "org_query:4bf32a55-6c13-4fea-8dd6-6a93bb0fb6da"
+    payload, repaired = repair_citations(_cited(spliced), index)
+    assert payload.citations == ["org_query:4bf32a55-6e79-4f9e-86f8-f6dfd0c776e4"]
+    assert repaired
+
+
+async def test_repair_stays_ambiguous_between_two_different_rows():
+    """The entity-row tie-break applies only to a row and its OWN field rows.
+    Two unrelated rows sharing the matched text must stay a rejection."""
+    index = {
+        "org_query:a1": {"value": "one", "field": None},
+        "org_query:a1b": {"value": "two", "field": None},
+    }
+    payload, repaired = repair_citations(_cited("a1"), index)
+    assert repaired == []
+    assert any("unknown citation" in p for p in gate_problems(payload, index))
+
+
+async def test_repair_refuses_to_guess_and_leaves_the_rejection_standing():
+    index = {
+        "org_query:4bf32a55-6e79-4f9e-86f8-f6dfd0c776e4": {"value": "see the usa"},
+    }
+    for invented in ("org_query:deadbeef-0000-0000-0000-000000000000", "totally-made-up"):
+        payload, repaired = repair_citations(_cited(invented), index)
+        assert repaired == []
+        assert any("unknown citation" in p for p in gate_problems(payload, index))
+
+
+async def test_repair_is_a_no_op_on_correct_citations():
+    index = _seed_index()
+    payload, repaired = repair_citations(_cited("org_query:a1"), index)
+    assert repaired == [] and payload.citations == ["org_query:a1"]
 
 
 # ── brief + template, pure ────────────────────────────────────────────────────

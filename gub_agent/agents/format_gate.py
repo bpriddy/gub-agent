@@ -190,6 +190,84 @@ def _is_grounded(run: str, blob: str) -> bool:
     return bool(base) and base in blob
 
 
+_HEX8_RE = re.compile(r"[0-9a-f]{8}", re.I)
+
+
+def _repair_one(citation: str, index: dict[str, dict]) -> str | None:
+    """The evidence id a near-miss citation unambiguously meant, or None.
+
+    Only ever returns an id THIS TURN produced, and only when the match is
+    unique — a repair that had to guess between two rows would be a fabricated
+    attribution, which is worse than the rejection it replaces.
+    """
+
+    def pick(hits: list[str]) -> str | None:
+        if len(hits) == 1:
+            return hits[0]
+        # One row plus its own per-field rows ("org_query:a1" alongside
+        # "org_query:a1:name"): a citation naming the id meant the ROW, so the
+        # entity row wins. Genuinely different rows stay ambiguous.
+        entity_rows = [eid for eid in hits if index[eid].get("field") is None]
+        return entity_rows[0] if len(entity_rows) == 1 else None
+
+    low = citation.lower()
+    # The bare row id with the tool prefix dropped: "0f1bd315-…" for
+    # "org_query:0f1bd315-…".
+    fixed = pick([eid for eid in index if low in eid.lower()])
+    if fixed:
+        return fixed
+    # A spliced id — head of one row, tail of another. The leading 8 hex are
+    # effectively unique inside one turn's index.
+    head = _HEX8_RE.search(low)
+    if head:
+        return pick([eid for eid in index if head.group(0).lower() in eid.lower()])
+    return None
+
+
+def repair_citations(
+    payload: AnswerPayload, index: dict[str, dict]
+) -> tuple[AnswerPayload, list[str]]:
+    """Fix citations the formatter got nearly right, and report what changed.
+
+    A 36-character random hex id is not something a language model copies
+    reliably, and `unknown citation` was 11 of 88 gate rejections on
+    2026-09-10. Both live failure shapes are mechanically recoverable: one
+    turn cited a bare campaign id with the `org_query:` prefix missing, the
+    next spliced two UUIDs together (head of one row, tail of another). Each
+    resolves to exactly one row the turn retrieved, so the repair is a lookup
+    rather than a guess — and a citation that does NOT resolve uniquely is
+    left alone for `gate_problems` to reject as before.
+
+    `facts` carry the same ids and the contract validates the two against each
+    other in both directions, so they are remapped together.
+    """
+    mapping: dict[str, str] = {}
+    for citation in payload.citations:
+        if citation in index:
+            continue
+        fixed = _repair_one(citation, index)
+        if fixed and fixed != citation:
+            mapping[citation] = fixed
+    if not mapping:
+        return payload, []
+
+    seen: set[str] = set()
+    citations: list[str] = []
+    for citation in payload.citations:
+        resolved = mapping.get(citation, citation)
+        if resolved not in seen:
+            seen.add(resolved)
+            citations.append(resolved)
+    facts = [
+        fact.model_copy(update={"evidence_id": mapping[fact.evidence_id]})
+        if fact.evidence_id in mapping
+        else fact
+        for fact in payload.facts
+    ]
+    repaired = [f"{before} -> {after}" for before, after in sorted(mapping.items())]
+    return payload.model_copy(update={"citations": citations, "facts": facts}), repaired
+
+
 def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
     """The deterministic checks — empty list means the payload passes."""
     problems: list[str] = []
@@ -458,9 +536,22 @@ class FormatGate(BaseAgent):
                 if captured is None:
                     feedback = "no AnswerPayload was produced — emit exactly one JSON payload"
                 else:
-                    problems = gate_problems(AnswerPayload.model_validate(captured), index)
+                    payload = AnswerPayload.model_validate(captured)
+                    payload, repaired = repair_citations(payload, index)
+                    problems = gate_problems(payload, index)
                     if not problems:
-                        return  # the formatter's own event already carried the payload
+                        if repaired:
+                            # The formatter's own event carries the UNREPAIRED
+                            # json, so the corrected payload has to be emitted
+                            # again — the bot's answer channel takes the last
+                            # parseable one, and format_gate is on it.
+                            logger.info(
+                                "format_gate: repaired citation(s) (inv=%s) — %s",
+                                ctx.invocation_id,
+                                "; ".join(repaired),
+                            )
+                            yield self._payload_event(ctx, payload)
+                        return  # else the formatter's own event already carried it
                     feedback = "; ".join(problems)
 
             if attempt + 1 >= MAX_FORMAT_ATTEMPTS:
