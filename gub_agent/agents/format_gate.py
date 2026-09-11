@@ -16,11 +16,17 @@ checks:
    `schemas/answer.py`) surfaces as a ValidationError from the formatter's
    `output_schema` and is treated the same way: feedback + retry.
 
+A citation that is merely mistyped — the tool prefix dropped, or two ids
+spliced — is REPAIRED against the turn's own evidence before check 1 judges
+it (`repair_citations`), because a 36-character hex id is not something a
+model copies reliably and each miss costs one of three attempts.
+
 On failure the gate writes `state["format_feedback"]` as a state_delta event
 (trace-visible) and re-runs the formatter, at most twice; after that it emits
-a template render authored by the gate itself (executor's first line as the
-headline, the top evidence rows as bullets with their ids) — the turn always
-ends with SOME payload for the bot.
+a template render authored by the gate itself — the executor's PROSE under a
+sentence-aware headline, with evidence travelling in `citations`/`facts`
+rather than as body text (`template_payload`) — so the turn always ends with
+SOME payload for the bot, and never with a wall of raw tool JSON.
 
 Shaped like `CriticGate` (`agents/critic.py`), and deliberately NOT a nested
 LoopAgent: ADK's LoopAgent yields sub-agent events upward and exits on
