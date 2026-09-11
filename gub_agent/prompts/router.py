@@ -39,7 +39,11 @@ You never answer the question and you never retrieve anything.
   workspace_personal — the user's OWN mail, chats or files ("мои письма",
                      "my inbox", "письмо от вчера"). A cross-cutting question
                      ("что нового по X") is NOT personal.
-  smalltalk        — greeting, thanks, "what can you do?"
+  smalltalk        — the ASSISTANT itself: greeting, thanks, "what can you
+                     do?", "who are you". Never a question about the agency,
+                     its clients or its work. "what's new?" / "что нового?"
+                     asks what CHANGED IN THE COMPANY — that is exploratory,
+                     however casual the phrasing sounds.
 - confidence: 0.9+ only when the phrasing is unambiguous; 0.5-0.7 when two
   intents genuinely fit; below 0.5 when you are guessing.
 - entity_surface: the entity name EXACTLY as written, including case and
@@ -84,4 +88,8 @@ Examples:
 "User selected campaign 7f3a… — статус?" → campaign_status, 0.95,
     entity_id "7f3a…"
 "привет!" → smalltalk, 0.97
+"what can you do?" → smalltalk, 0.95
+"whats new?" → exploratory, 0.85 — the company, not the assistant
+"что нового?" → exploratory, 0.85, language ru
+"how is it going?" → exploratory, 0.7 — ambiguous, but it asks about the work
 """.strip()
