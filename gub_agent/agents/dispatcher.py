@@ -7,7 +7,7 @@ fail slowly.
 
     workspace_personal            → abstain payload      (0 model, 0 tool calls)
     smalltalk                     → template payload     (0 model, 0 tool calls)
-    confidence < CONFIDENCE_FLOOR → clarify payload      (which question?)
+    confidence < ROUTER_CONFIDENCE_FLOOR → clarify payload  (which question?)
     FAST_INTENTS + an entity      → fast_path, deep path if it declines
     otherwise                     → deep_agent           (today's pipeline)
 
@@ -32,8 +32,10 @@ Three details that are decisions, not accidents:
   such a turn takes the deep path and behaves exactly as it does today — blend
   04's edge table, which asks for precisely that.
 
-`CONFIDENCE_FLOOR = 0.70` is provisional — `blend-06-eval-and-thresholds.md`
-ratifies it against a measured misroute rate.
+`ROUTER_CONFIDENCE_FLOOR` (config.py, default 0.70) is still UNRATIFIED. It
+is the one gate in `clarify-01-always-ask-when-unsure.md` that cannot be
+measured without model spend, and the dispatcher log line below is what a
+reliability diagram for it would be built from.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 
+from ..config import ROUTER_CONFIDENCE_FLOOR
 from ..schemas.router import FAST_INTENTS, RouterDecision
 from .answers import (
     abstain_payload,
@@ -56,10 +59,6 @@ from .fast_path import fast_path, outcome
 from .router import decision_from
 
 logger = logging.getLogger(__name__)
-
-# Below this the router is guessing between intents — ask instead of guessing
-# with it. Provisional; blend 06 ratifies it.
-CONFIDENCE_FLOOR = 0.70
 
 # Intents worth ASKING about when the router is unsure. `exploratory` is
 # deliberately absent: it is already the catch-all — the intent the fallback
@@ -87,7 +86,7 @@ def choose(decision: RouterDecision) -> str:
         return ABSTAIN
     if decision.intent == "smalltalk":
         return SMALLTALK
-    if decision.confidence < CONFIDENCE_FLOOR:
+    if decision.confidence < ROUTER_CONFIDENCE_FLOOR:
         # See the module docstring: a resolved entity means the user has
         # already been asked once this turn.
         if decision.entity_id or decision.intent not in CLARIFIABLE_INTENTS:
