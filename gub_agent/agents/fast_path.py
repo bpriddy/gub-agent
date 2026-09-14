@@ -52,6 +52,7 @@ from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 
+from ..config import FAST_TIE_BAND
 from ..schemas import AnswerPayload
 from ..schemas.router import RouterDecision
 from ..tools.accounts import get_account_overview, get_campaign
@@ -69,12 +70,6 @@ from .format_gate import format_gate
 from .router import decision_from, user_text
 
 logger = logging.getLogger(__name__)
-
-# Blend 02's thresholds, same values, same meaning (the bot's
-# CLARIFY_MARGIN_FLOOR / CLARIFY_EXACT_FLOOR defaults). Provisional until
-# blend 06 ratifies them.
-FAST_MARGIN_FLOOR = 0.15
-FAST_EXACT_FLOOR = 0.85
 
 # How much of one tool result the draft quotes. The formatter also receives
 # every indexed value under ALLOWED_EVIDENCE, so the draft is orientation, not
@@ -143,18 +138,23 @@ class Resolution:
 
 
 def resolve_hits(hits: list[dict], surface: str, wanted: tuple[str, ...]) -> Resolution:
-    """The bot's disambiguation rules (`entity/resolve.ts:initialDecision`) as
-    a pure function over `/org/search` hits, restricted to the types this
-    intent can use:
+    """The bot's disambiguation rule (`entity/resolve.ts:initialDecision`) as a
+    pure function over `/org/search` hits, restricted to the types this intent
+    can use:
 
-    - one hit of a wanted type → that one;
-    - exactly one hit whose NAME equals the surface → that one, whatever the
-      margin says;
+    - exactly one hit whose NAME equals the surface → that one, however many
+      others sit beside it;
     - two or more hits with that same exact name → ambiguous (the canonical
       case: three campaigns all called "Silverado");
-    - top − second < margin AND top < exact floor → ambiguous;
-    - otherwise the top hit — a wide margin or a near-exact top hit means the
-      search already has a clear winner.
+    - otherwise build the set TIED at the top (within FAST_TIE_BAND) and take
+      it if it holds one candidate, ask if it holds several.
+
+    The rule this replaces ended `top - second < margin AND top < exact floor`,
+    and the second clause read a high top score as confidence. Since
+    `/org/search` began scoring by WORD match, every candidate a query names
+    equally well scores 1.0 — so that clause fired hardest on the clearest
+    ambiguities and suppressed the question. A tie band cannot invert that way:
+    it asks only how many candidates the search could not separate.
     """
     typed = [
         h
@@ -165,9 +165,6 @@ def resolve_hits(hits: list[dict], surface: str, wanted: tuple[str, ...]) -> Res
         return Resolution("none")
     typed.sort(key=lambda h: float(h.get("similarity") or 0.0), reverse=True)
 
-    if len(typed) == 1:
-        return Resolution("one", typed[0]["id"], typed[0].get("name"))
-
     exact = [h for h in typed if str(h.get("name", "")).lower() == surface.lower()]
     if len(exact) == 1:
         return Resolution("one", exact[0]["id"], exact[0].get("name"))
@@ -175,10 +172,10 @@ def resolve_hits(hits: list[dict], surface: str, wanted: tuple[str, ...]) -> Res
         return Resolution("ambiguous")
 
     top = float(typed[0].get("similarity") or 0.0)
-    second = float(typed[1].get("similarity") or 0.0)
-    if top - second < FAST_MARGIN_FLOOR and top < FAST_EXACT_FLOOR:
-        return Resolution("ambiguous")
-    return Resolution("one", typed[0]["id"], typed[0].get("name"))
+    tied = [h for h in typed if top - float(h.get("similarity") or 0.0) <= FAST_TIE_BAND]
+    if len(tied) == 1:
+        return Resolution("one", tied[0]["id"], tied[0].get("name"))
+    return Resolution("ambiguous")
 
 
 async def _resolve(surface: str | None, wanted: tuple[str, ...], shim: _ToolShim) -> Resolution:
@@ -188,11 +185,22 @@ async def _resolve(surface: str | None, wanted: tuple[str, ...], shim: _ToolShim
     if not surface or not surface.strip():
         return Resolution("none")
     response = await find(surface, shim)
-    if not isinstance(response, dict) or response.get("error"):
+    # `GET /org/search` answers with a BARE ARRAY (org.controller.ts: `res.json(
+    # results)`), and `gub_get` returns `resp.json()` verbatim — so the happy
+    # path here is a list, not a dict. Only the error envelope is a dict. This
+    # used to test `isinstance(response, dict)` FIRST and bail, which made every
+    # real response resolve to "none" and the unreachable `hits` lookup below it
+    # look like the working branch; the unit tests missed it because they stub
+    # `{"hits": [...]}`, a shape GUB has never emitted.
+    if isinstance(response, dict):
+        if response.get("error"):
+            return Resolution("none")
+        hits = response.get("hits")
+        hits = hits if isinstance(hits, list) else []
+    elif isinstance(response, list):
+        hits = response
+    else:
         return Resolution("none")
-    hits = response.get("hits")
-    if not isinstance(hits, list):
-        hits = response if isinstance(response, list) else []
     return resolve_hits(hits, surface.strip(), wanted)
 
 

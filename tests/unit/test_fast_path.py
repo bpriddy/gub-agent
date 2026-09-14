@@ -163,7 +163,7 @@ def test_two_hits_with_the_same_exact_name_are_ambiguous():
     assert fp.resolve_hits(hits, "silverado", ("campaign",)).kind == "ambiguous"
 
 
-def test_a_narrow_margin_below_the_exact_floor_is_ambiguous():
+def test_hits_within_the_tie_band_are_ambiguous():
     hits = [
         _hit(id="a", name="EV One", similarity=0.62),
         _hit(id="b", name="EV Two", similarity=0.60),
@@ -171,7 +171,7 @@ def test_a_narrow_margin_below_the_exact_floor_is_ambiguous():
     assert fp.resolve_hits(hits, "EV", ("campaign",)).kind == "ambiguous"
 
 
-def test_a_wide_margin_resolves_to_the_top_hit():
+def test_hits_outside_the_tie_band_resolve_to_the_top_hit():
     hits = [
         _hit(id="a", name="EV Everywhere", similarity=0.7),
         _hit(id="b", name="Evergreen", similarity=0.3),
@@ -180,9 +180,46 @@ def test_a_wide_margin_resolves_to_the_top_hit():
     assert (r.kind, r.entity_id) == ("one", "a")
 
 
+def test_candidates_all_scoring_1_0_are_ambiguous_not_confident():
+    """The regression clarify-01 was written for. `/org/search` scores by WORD
+    match, so every campaign whose name contains "Silverado" comes back at 1.0.
+    The old rule read that as a near-exact top hit and committed to one of
+    them; a tie band has to call it what it is."""
+    hits = [
+        _hit(id="a", name="Chevrolet | Fall 2024 Silverado + Equinox", similarity=1.0),
+        _hit(id="b", name="Chevrolet | Silverado Post-Produced Retail", similarity=1.0),
+        _hit(id="c", name="Silverado EV // Oregon Triple", similarity=1.0),
+    ]
+    assert fp.resolve_hits(hits, "silverado", ("campaign",)).kind == "ambiguous"
+
+
 def test_hits_of_the_wrong_type_do_not_count():
     hits = [_hit(type="idea", id="i1", similarity=0.99), _hit(type="staff", id="s1")]
     assert fp.resolve_hits(hits, "Silverado", ("campaign",)).kind == "none"
+
+
+async def test_resolve_reads_the_bare_array_gub_actually_returns(monkeypatch):
+    """`GET /org/search` answers with a bare array, not `{"hits": [...]}`. Every
+    other test here stubs the dict shape, which is why `_resolve` could sit in
+    production returning "none" for every surface without one of them failing."""
+    calls: list[str] = []
+
+    async def fake_find(query, tool_context=None):
+        calls.append(query)
+        return [_hit(id="only", name="Daytona", similarity=1.0)]
+
+    monkeypatch.setattr(fp, "find", fake_find)
+    r = await fp._resolve("Daytona", ("campaign",), None)
+    assert calls == ["Daytona"]
+    assert (r.kind, r.entity_id) == ("one", "only")
+
+
+async def test_resolve_still_reads_the_error_envelope(monkeypatch):
+    async def fake_find(query, tool_context=None):
+        return {"error": True, "status": 403, "message": "nope"}
+
+    monkeypatch.setattr(fp, "find", fake_find)
+    assert (await fp._resolve("Daytona", ("campaign",), None)).kind == "none"
 
 
 # ── the org_query builder ─────────────────────────────────────────────────────

@@ -119,6 +119,30 @@ def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
 # id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
 # the genai client's own GOOGLE_CLOUD_LOCATION pin above is a separate thing.
+# The fast path's disambiguation tie band — the agent-side twin of the bot's
+# CLARIFY_TIE_BAND. Two `/org/search` hits whose scores differ by at most this
+# are TIED, and a tie means ask rather than pick. Replaces the module constants
+# FAST_MARGIN_FLOOR / FAST_EXACT_FLOOR, which were a hardcoded copy of the
+# bot's old pair and carried the same inversion: the "top score is high, so we
+# are confident" clause vetoed the question precisely when every candidate
+# matched equally well. See gub-gchat-bot entity/resolve.ts:initialDecision and
+# the Anomaly workspace's task-specs/clarify-01-always-ask-when-unsure.md.
+FAST_TIE_BAND: float = float(os.environ.get("FAST_TIE_BAND", "0.10"))
+
+# Below this the router is guessing between intents — ask instead of guessing
+# with it (agents/dispatcher.py:choose).
+#
+# NOT RATIFIED. Unlike the tie band above, this one cannot be measured without
+# spending model calls: it gates a branch that only exists once the router has
+# run. It is config rather than a constant so it can be moved without a code
+# change, and the dispatcher already logs `intent=… confidence=… branch=…` on
+# every turn, so the reliability diagram this needs can be built from
+# production logs for free:
+#   resource.type="aiplatform.googleapis.com/ReasoningEngine"
+#     AND textPayload:"dispatcher: intent"
+# See the Anomaly workspace's task-specs/clarify-01-always-ask-when-unsure.md.
+ROUTER_CONFIDENCE_FLOOR: float = float(os.environ.get("ROUTER_CONFIDENCE_FLOOR", "0.70"))
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 

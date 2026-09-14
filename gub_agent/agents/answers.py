@@ -220,7 +220,7 @@ def clarify_intent_payload(
     language: Language = "en",
     surface: str | None = None,
 ) -> AnswerPayload:
-    """`confidence < CONFIDENCE_FLOOR`: ask which question was meant instead of
+    """`confidence < ROUTER_CONFIDENCE_FLOOR`: ask which question was meant instead of
     guessing one. The options are BOTH prose (the bullets — what the bot's
     renderer shows) and structured `candidates` (what a future card could
     offer); `entity_type="intent"` distinguishes them from blend 02's entity
