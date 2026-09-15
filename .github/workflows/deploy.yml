@@ -95,3 +95,28 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           AGENT_ENGINE_ID: ${{ vars.AGENT_ENGINE_ID }}
         run: deployment/verify-engine-env.sh "$GITHUB_WORKSPACE/deploy-prod.env"
+
+      # A fresh engine revision answers its FIRST request cold: measured live
+      # 2026-09-15, the router call alone took 32 s two minutes after a deploy
+      # (a warm one takes 2-4 s), so whoever asks first pays ~30 s for our
+      # deploy. Absorb it here instead: one throwaway greeting turn. Cost is
+      # one router call (~$0.001 of Gemini Flash per deploy). Failure is
+      # non-fatal - a cold first turn is slow, not broken.
+      - name: Warm the fresh revision
+        continue-on-error: true
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          AGENT_ENGINE_ID: ${{ vars.AGENT_ENGINE_ID }}
+        run: |
+          BASE="https://$GCP_REGION-aiplatform.googleapis.com/v1/projects/$GCP_PROJECT_ID/locations/$GCP_REGION/reasoningEngines/$AGENT_ENGINE_ID"
+          TOKEN=$(gcloud auth print-access-token)
+          SESSION=$(curl -sS -m 60 -X POST "$BASE:query" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            -d '{"class_method":"create_session","input":{"user_id":"deploy-warmup"}}' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["output"]["id"])')
+          time curl -sS -m 120 -X POST "$BASE:streamQuery" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            -d "{\"class_method\":\"stream_query\",\"input\":{\"user_id\":\"deploy-warmup\",\"session_id\":\"$SESSION\",\"message\":\"hi\"}}" \
+            -o /dev/null
+          echo "engine warmed"
