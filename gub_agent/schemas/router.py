@@ -15,9 +15,11 @@ Two rules this schema encodes, both load-bearing:
   thresholds (`agents/fast_path.py`), and a router that "helpfully" turned
   "chevy" into "Chevrolet" would hand the fast path a name the index cannot
   ground.
-- `entity_id` is only ever copied — from the `"User selected campaign <uuid>"`
-  prefix the bot's disambiguation card writes (blend 02). An id the router
-  invented would send a deterministic lookup at a nonexistent row.
+- `entity_id` is only ever copied — from one of the two prefixes the bot's
+  clarify layer writes (blend 02): `"User selected <type> <uuid>"` when the
+  user picked from a card, `"Best guess: <type> <uuid>"` when the bot resolved
+  it on its own. An id the router invented would send a deterministic lookup
+  at a nonexistent row.
 
 `slots` is a TYPED object, not the free `dict[str, str]` the spec sketched.
 Measured 2026-09-10 on `gemini-3.5-flash`: the free-map shape is accepted by
@@ -114,7 +116,7 @@ class RouterDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     # As the user wrote it. NOT resolved — see the module docstring.
     entity_surface: str | None = None
-    # Copied from the bot's "User selected campaign <uuid>" prefix, never
+    # Copied from the bot's "User selected …" / "Best guess: …" prefix, never
     # invented.
     entity_id: str | None = None
     slots: Slots = Field(default_factory=Slots)
