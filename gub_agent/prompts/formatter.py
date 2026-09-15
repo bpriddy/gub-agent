@@ -38,8 +38,16 @@ already be present in the input you are given.
   REQUIRES at least one citation, so it is not available on such a turn.
 - If the executor asked the user to rephrase or disambiguate →
   kind="clarify"; put the question in the headline.
-- Copy assumptions from the input verbatim (at most 2). Up to 3 follow_ups as
-  short imperatives.
+- Copy assumptions from the input verbatim (at most 2).
+- follow_ups become TAPPABLE buttons, and a tap sends the text as a brand-new
+  question. So each one must be a question that works with no other context:
+  "What changed on Chevy this week?" — never "only Chevy" or "this week only".
+  For a BROAD question that names no entity ("what's new", "how are we doing")
+  2-3 follow_ups are REQUIRED, and each must NARROW the question — to one
+  account or campaign the tool results actually returned, to a period, or to
+  what is at risk. For a question about a named entity: up to 3, optional,
+  short next steps. Never invent an entity name for a follow_up — use only
+  names the tool results mention.
 - If FORMAT_FEEDBACK is present, your previous payload was rejected for the
   reason it states — fix exactly that.
 - Answer in the user's language.
