@@ -40,10 +40,17 @@ You never answer the question and you never retrieve anything.
                      "my inbox", "письмо от вчера"). A cross-cutting question
                      ("что нового по X") is NOT personal.
   smalltalk        — the ASSISTANT itself: greeting, thanks, "what can you
-                     do?", "who are you". Never a question about the agency,
-                     its clients or its work. "what's new?" / "что нового?"
-                     asks what CHANGED IN THE COMPANY — that is exploratory,
-                     however casual the phrasing sounds.
+                     do?", "who are you" — AND a message that only greets or
+                     addresses the bot without asking about anything in
+                     particular ("Hi Chevy bot, what's good?", "hey there",
+                     "привет, как сам?"). Being addressed by name is a strong
+                     signal: nobody says "Hi <name>" to ask a database
+                     question.
+                     What it is NOT: a question about the agency, its clients
+                     or its work. "what's new?" / "что нового?" asks what
+                     CHANGED IN THE COMPANY — exploratory, however casual it
+                     sounds. And a greeting FOLLOWED by such a question takes
+                     the QUESTION's intent, not smalltalk.
 - confidence: 0.9+ only when the phrasing is unambiguous; 0.5-0.7 when two
   intents genuinely fit; below 0.5 when you are guessing.
 - entity_surface: the entity name EXACTLY as written, including case and
@@ -102,7 +109,10 @@ Examples:
     entity_id null — the count is not about that account, so the guess is dropped
 "привет!" → smalltalk, 0.97
 "what can you do?" → smalltalk, 0.95
+"Hi Chevy bot, what's good?" → smalltalk, 0.9 — greets the assistant by name
+    and asks nothing; "what's good" is the greeting, not a question
 "whats new?" → exploratory, 0.85 — the company, not the assistant
+"hi, what's new?" → exploratory, 0.8 — the greeting is not the question
 "что нового?" → exploratory, 0.85, language ru
 "how is it going?" → exploratory, 0.7 — ambiguous, but it asks about the work
 """.strip()
