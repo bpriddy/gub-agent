@@ -447,7 +447,7 @@ def _shortcut(response: dict, decision: RouterDecision) -> Lookup | None:
 
 
 async def _campaign(decision: RouterDecision, shim: _ToolShim, question: str) -> Lookup | None:
-    # `entity_id` is the bot's "User selected campaign <uuid>" prefix (blend
+    # `entity_id` is the bot's "User selected …" / "Best guess: …" prefix (blend
     # 02) — a campaign id, so only the campaign intents may use it.
     campaign_id = decision.entity_id
     if not campaign_id:

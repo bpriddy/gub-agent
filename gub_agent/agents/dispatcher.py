@@ -17,7 +17,7 @@ test (`tests/unit/test_dispatcher.py`) rather than a claim about the code.
 Three details that are decisions, not accidents:
 
 - **The floor does not apply when the bot already resolved the entity.** A
-  `"User selected campaign <uuid>"` prefix means the user has JUST answered a
+  `"User selected <type> <uuid>"` prefix means the user has JUST answered a
   disambiguation card (blend 02); asking them another question would be the
   second card the epic forbids. The prompt also raises confidence to 0.95 by
   rule in that case, so this is the belt to that suspenders — and it costs the
