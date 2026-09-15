@@ -94,6 +94,25 @@ _SMALLTALK = {
     ),
 }
 
+# Starter questions for a greeting turn. The bot renders `follow_ups` as
+# tappable suggestion chips (gub-gchat-bot, chat/cards.ts), so a greeting
+# answers with somewhere to GO rather than a description of what could be
+# asked. Each one is deliberately aggregate — no entity name, so the
+# clarification layer has nothing to disambiguate and the tap cannot open
+# with a card.
+_SMALLTALK_FOLLOW_UPS = {
+    "ru": [
+        "Сколько сейчас активных кампаний?",
+        "Какие у нас клиентские аккаунты?",
+        "Что нового за эту неделю?",
+    ],
+    "en": [
+        "How many live campaigns do we have?",
+        "Which client accounts do we have?",
+        "What's new this week?",
+    ],
+}
+
 
 def smalltalk_payload(language: Language = "en") -> AnswerPayload:
     """A greeting answered by a template: no retrieval to do, so no model call
@@ -106,7 +125,7 @@ def smalltalk_payload(language: Language = "en") -> AnswerPayload:
         citations=[],
         facts=[],
         assumptions=[],
-        follow_ups=[],
+        follow_ups=_SMALLTALK_FOLLOW_UPS.get(language, _SMALLTALK_FOLLOW_UPS["en"]),
         candidates=[],
     )
 

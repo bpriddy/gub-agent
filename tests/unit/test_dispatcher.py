@@ -175,7 +175,13 @@ async def test_smalltalk_answers_from_the_template(branches):
     events = [e async for e in agent.run_async(ctx)]
 
     assert (fast.runs, deep.runs) == ([], [])
-    assert "Привет" in events[0].actions.state_delta[ANSWER_STATE_KEY]["headline"]
+    payload = events[0].actions.state_delta[ANSWER_STATE_KEY]
+    assert "Привет" in payload["headline"]
+    # A greeting answers with somewhere to GO: the bot renders follow_ups as
+    # tappable suggestion chips, so an empty list means a dead-end reply.
+    # Deliberately aggregate questions — no entity, nothing to disambiguate.
+    assert len(payload["follow_ups"]) == 3
+    assert all("?" in f for f in payload["follow_ups"])
 
 
 async def test_a_low_confidence_turn_asks_which_question_was_meant(branches):
