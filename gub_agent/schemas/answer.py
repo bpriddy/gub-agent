@@ -79,13 +79,19 @@ def _reject_over_budget(text: str, limit: int, where: str) -> str:
 
 
 class TableBlock(BaseModel):
-    """A real table (2-6 columns, 1-10 rows) — the bot renders it as a cardsV2
+    """A real table (2-6 columns, any number of rows) — the bot renders it as a cardsV2
     section because Chat renders no Markdown tables. The contract's convention
     puts the source evidence id in the last column."""
 
     kind: Literal["table"] = "table"
     columns: list[str] = Field(min_length=2, max_length=6)
-    rows: list[list[str]] = Field(min_length=1, max_length=10)
+    # No upper bound: a "top 20" answer capped at ten rows contradicted its
+    # own headline on screen (live 2026-09-16), and every cap we picked was
+    # someone's next complaint. The only real limit is Chat's — 100 widgets
+    # per card, one per table row — and that belongs in the RENDERER, which
+    # can truncate visibly and say so, not in the contract, which would
+    # silently make the answer unsendable.
+    rows: list[list[str]] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _rows_match_columns(self) -> TableBlock:
@@ -208,9 +214,12 @@ class AnswerPayload(BaseModel):
                 total += count_words(block.text)
             elif isinstance(block, BulletBlock):
                 total += sum(count_words(item) for item in block.items)
-            else:
-                total += sum(count_words(cell) for row in block.rows for cell in row)
-                total += sum(count_words(col) for col in block.columns)
+            # A table is DATA, not prose. Counting its cells made the word
+            # budget the real cap on table length — a "top 20" answer blew
+            # 250 words on rows alone and was rejected, so the table silently
+            # shrank instead (live 2026-09-16). The budget governs how much
+            # the answer SAYS; how many rows it can show is the renderer's
+            # limit (Chat: 100 widgets per card), enforced visibly there.
         total += sum(count_words(a) for a in self.assumptions)
         total += sum(count_words(f) for f in self.follow_ups)
         if total > TOTAL_MAX_WORDS:
