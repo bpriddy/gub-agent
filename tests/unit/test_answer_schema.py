@@ -111,13 +111,33 @@ async def test_table_rows_must_match_columns():
         )
 
 
-async def test_table_takes_twenty_rows():
-    """A "top 20" answer has to be able to carry twenty rows: capped at ten it
-    contradicted its own headline on screen (live 2026-09-16)."""
-    payload = AnswerPayload.model_validate(
-        _answer(blocks=[{"kind": "table", "columns": ["a", "b"], "rows": [["x", "y"]] * 20}])
+async def test_table_cells_do_not_spend_the_prose_budget():
+    """The 250-word budget governs how much the answer SAYS. Counting table
+    cells made it the real cap on table length: a twenty-row ranking blew the
+    budget on data alone and the table shrank instead (live 2026-09-16)."""
+    big = _answer(
+        blocks=[
+            {
+                "kind": "table",
+                "columns": ["Campaign", "Budget"],
+                "rows": [[f"Chevrolet campaign number {i}", "5,130,085.67"] for i in range(60)],
+            }
+        ]
     )
-    assert len(payload.blocks[0].rows) == 20
+    payload = AnswerPayload.model_validate(big)
+    assert len(payload.blocks[0].rows) == 60
+
+
+async def test_table_row_count_is_not_capped():
+    """A "top 20" answer capped at ten rows contradicted its own headline on
+    screen (live 2026-09-16). The contract no longer bounds row count at all:
+    the only real limit is Chat's widget budget, and that is the renderer's to
+    enforce visibly rather than the schema's to enforce silently."""
+    for n in (20, 50, 200):
+        payload = AnswerPayload.model_validate(
+            _answer(blocks=[{"kind": "table", "columns": ["a", "b"], "rows": [["x", "y"]] * n}])
+        )
+        assert len(payload.blocks[0].rows) == n
 
 
 async def test_table_column_and_row_bounds():
@@ -125,18 +145,7 @@ async def test_table_column_and_row_bounds():
         AnswerPayload.model_validate(
             _answer(blocks=[{"kind": "table", "columns": ["one"], "rows": [["x"]]}])
         )
-    with pytest.raises(ValidationError):
-        AnswerPayload.model_validate(
-            _answer(
-                blocks=[
-                    {
-                        "kind": "table",
-                        "columns": ["a", "b"],
-                        "rows": [["x", "y"]] * 21,
-                    }
-                ]
-            )
-        )
+    # No row ceiling any more — see test_table_row_count_is_not_capped.
 
 
 async def test_facts_must_echo_exactly_the_citations():
