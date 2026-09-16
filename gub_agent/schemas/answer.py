@@ -79,13 +79,17 @@ def _reject_over_budget(text: str, limit: int, where: str) -> str:
 
 
 class TableBlock(BaseModel):
-    """A real table (2-6 columns, 1-10 rows) — the bot renders it as a cardsV2
+    """A real table (2-6 columns, 1-20 rows) — the bot renders it as a cardsV2
     section because Chat renders no Markdown tables. The contract's convention
     puts the source evidence id in the last column."""
 
     kind: Literal["table"] = "table"
     columns: list[str] = Field(min_length=2, max_length=6)
-    rows: list[list[str]] = Field(min_length=1, max_length=10)
+    # 20, not 10: a "top 20" answer that can only carry 10 rows contradicts
+    # its own headline on screen (reported live 2026-09-16). One row is one
+    # Chat card widget and a card takes 100, so 20 is still far inside the
+    # rendering budget.
+    rows: list[list[str]] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")
     def _rows_match_columns(self) -> TableBlock:
