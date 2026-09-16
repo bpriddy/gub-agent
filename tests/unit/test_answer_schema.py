@@ -111,6 +111,15 @@ async def test_table_rows_must_match_columns():
         )
 
 
+async def test_table_takes_twenty_rows():
+    """A "top 20" answer has to be able to carry twenty rows: capped at ten it
+    contradicted its own headline on screen (live 2026-09-16)."""
+    payload = AnswerPayload.model_validate(
+        _answer(blocks=[{"kind": "table", "columns": ["a", "b"], "rows": [["x", "y"]] * 20}])
+    )
+    assert len(payload.blocks[0].rows) == 20
+
+
 async def test_table_column_and_row_bounds():
     with pytest.raises(ValidationError):
         AnswerPayload.model_validate(
@@ -123,7 +132,7 @@ async def test_table_column_and_row_bounds():
                     {
                         "kind": "table",
                         "columns": ["a", "b"],
-                        "rows": [["x", "y"]] * 11,
+                        "rows": [["x", "y"]] * 21,
                     }
                 ]
             )
