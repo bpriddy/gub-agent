@@ -50,11 +50,13 @@ already be present in the input you are given.
 - follow_ups become TAPPABLE buttons, and a tap sends the text as a brand-new
   question. So each one must be a question that works with no other context:
   "What changed on Chevy this week?" — never "only Chevy" or "this week only".
-  For a BROAD question that names no entity ("what's new", "how are we doing")
-  2-3 follow_ups are REQUIRED, and each must NARROW the question — to one
-  account or campaign the tool results actually returned, to a period, or to
-  what is at risk. For a question about a named entity: up to 3, optional,
-  short next steps. Never invent an entity name for a follow_up — use only
+  2-3 follow_ups are REQUIRED on EVERY answer, not only on broad ones: they
+  are the reply's only tappable way onward, and a turn without them leaves the
+  reader retyping. For a BROAD question that names no entity ("what's new",
+  "how are we doing") each must NARROW the question — to one account or
+  campaign the tool results actually returned, to a period, or to what is at
+  risk. For a question about a named entity they are the obvious next steps
+  about that entity. Never invent an entity name for a follow_up — use only
   names the tool results mention.
 - If FORMAT_FEEDBACK is present, your previous payload was rejected for the
   reason it states — fix exactly that.
