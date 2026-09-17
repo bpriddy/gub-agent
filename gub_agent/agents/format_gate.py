@@ -274,6 +274,46 @@ def repair_citations(
     return payload.model_copy(update={"citations": citations, "facts": facts}), repaired
 
 
+def prune_source_file_ids(
+    payload: AnswerPayload, index: dict[str, dict]
+) -> tuple[AnswerPayload, int]:
+    """Drop source ids a fact's own evidence row does not mention (blend 08 §5.2).
+
+    DROPPED, never rejected, and the asymmetry is deliberate: a citation that
+    fails is a missing LINK, a rejected payload is a missing ANSWER, and the
+    gate only has three attempts before the turn falls back to a template.
+    §11 D4 — what the reader sees for an unresolvable source is nothing.
+
+    The rule is the tightest one available without trusting the model: a fact
+    may carry only the file ids the evidence row it cites actually mentions.
+    That makes an invented Drive id unrenderable rather than merely wrong,
+    which matters because the renderer turns these straight into links and a
+    fabricated `drive.google.com/file/d/<hallucination>` is a 404 published
+    under the answer's authority.
+
+    Returns the payload and how many ids were removed (0 → payload unchanged,
+    same object, so the caller can skip the re-emit).
+    """
+    dropped = 0
+    facts = []
+    changed = False
+    for fact in payload.facts:
+        if not fact.source_file_ids:
+            facts.append(fact)
+            continue
+        allowed = set(index.get(fact.evidence_id, {}).get("source_file_ids") or [])
+        kept = [f for f in fact.source_file_ids if f in allowed]
+        if len(kept) != len(fact.source_file_ids):
+            dropped += len(fact.source_file_ids) - len(kept)
+            changed = True
+            facts.append(fact.model_copy(update={"source_file_ids": kept}))
+        else:
+            facts.append(fact)
+    if not changed:
+        return payload, 0
+    return payload.model_copy(update={"facts": facts}), dropped
+
+
 def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
     """The deterministic checks — empty list means the payload passes."""
     problems: list[str] = []
@@ -381,6 +421,21 @@ _GROUNDING_RULES = """RULES (checked in code — a payload breaking one is rejec
   starts with the claim. A heading you invented is an ungrounded phrase.
 - Cite only the ids above, and echo each cited id in `facts`."""
 
+# Appended ONLY when this turn's index actually carries source ids. The brief
+# is re-transmitted on every formatter attempt and most turns (`org_query`,
+# `search_staff`, …) cite no document at all — a rule about a field that will
+# stay empty is pure input cost on the hottest path.
+_SOURCE_RULE = """- When an id above carries `sources:`, copy those file ids verbatim into that
+  fact's `source_file_ids`. They are opaque handles the surface turns into
+  links — NEVER write one into a sentence, a heading or a table cell, and
+  never write a URL or a file name anywhere. Copy nothing that is not listed."""
+
+# How many source ids one evidence entry offers the formatter. The brief is
+# re-transmitted on EVERY formatter attempt (up to 3), so this is input cost on
+# the turn's hottest path; a campaign cites ~15 files and an answer attributes
+# a handful. Over-listing buys nothing a reader can use.
+MAX_BRIEF_SOURCE_IDS = 8
+
 
 def compose_brief(executor_text: str, index: dict[str, dict], feedback: str) -> str:
     lines = [
@@ -390,9 +445,17 @@ def compose_brief(executor_text: str, index: dict[str, dict], feedback: str) -> 
         "ALLOWED_EVIDENCE (the ONLY citable ids, with their values):",
     ]
     if index:
+        any_sources = False
         for evidence_id, entry in index.items():
             lines.append(f"- {evidence_id} = {entry.get('value', '')}")
-        lines += ["", _GROUNDING_RULES]
+            # Only where there is something to copy — an `org_query` row cites
+            # no document and a `sources: ` line saying so is pure input cost.
+            sources = (entry.get("source_file_ids") or [])[:MAX_BRIEF_SOURCE_IDS]
+            if sources:
+                any_sources = True
+                lines.append(f"    sources: {', '.join(sources)}")
+        rules = f"{_GROUNDING_RULES}\n{_SOURCE_RULE}" if any_sources else _GROUNDING_RULES
+        lines += ["", rules]
     else:
         # Nothing citable: `kind="answer"` is unsatisfiable by contract
         # (`schemas/answer.py` requires a citation), so say what IS available
@@ -660,19 +723,32 @@ class FormatGate(BaseAgent):
                         captured = None
                     if captured is not None:
                         payload, repaired = repair_citations(payload, index)
+                        # Source ids never cause a rejection, so pruning runs
+                        # before the checks and never contributes to them.
+                        payload, pruned_sources = prune_source_file_ids(payload, index)
                         problems = gate_problems(payload, index)
                         if not problems:
                             if repaired:
-                                # The formatter's own event carries the
-                                # UNREPAIRED json, so the corrected payload has
-                                # to be emitted again — the bot's answer channel
-                                # takes the last parseable one, and format_gate
-                                # is on it.
                                 logger.info(
                                     "format_gate: repaired citation(s) (inv=%s) — %s",
                                     ctx.invocation_id,
                                     "; ".join(repaired),
                                 )
+                            if pruned_sources:
+                                logger.info(
+                                    "format_gate: dropped %d unknown source_file_id(s) (inv=%s)",
+                                    pruned_sources,
+                                    ctx.invocation_id,
+                                )
+                            # The formatter's own event carries the ORIGINAL
+                            # json, so any payload this gate corrected has to
+                            # be emitted again — the bot's answer channel takes
+                            # the last parseable one, and format_gate is on it.
+                            # True of a repaired citation, and just as true of
+                            # a pruned source id: left unemitted, the bot would
+                            # read the formatter's event and publish a link to
+                            # the file the gate just removed.
+                            if repaired or pruned_sources:
                                 yield self._payload_event(ctx, payload)
                             return  # else the formatter's event already carried it
                         feedback = "; ".join(problems)

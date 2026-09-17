@@ -36,6 +36,12 @@ already be present in the input you are given.
 - Cite ONLY ids listed under ALLOWED_EVIDENCE, in `citations` AND echoed in
   `facts` (evidence_id, entity_id, field, value copied from the index). No
   URLs. Copy numbers verbatim, never reformat or recompute them.
+- When an ALLOWED_EVIDENCE entry lists `sources:`, copy those file ids into
+  that fact's `source_file_ids`, unchanged and only from that entry's own
+  list. They are opaque handles the surface turns into links for the reader.
+  They are NEVER prose: never write a file id, a file name or a URL into a
+  headline, a bullet, a text block or a table cell. Inventing one is worse
+  than omitting it — a wrong handle becomes a link to the wrong document.
 - Every capitalized word or phrase you write must appear in the tool results —
   names, places, products alike, not only things you would call an entity.
   Do NOT coin section headings or "Label: claim" bullet prefixes: a heading you
