@@ -593,7 +593,7 @@ async def test_the_real_gate_renders_the_fast_path_draft_and_grounds_it(gub, mon
 # model, which emits function_call parts. The fast path calls its tool as a
 # plain coroutine, so it emitted nothing at all and the bubble sat on one
 # generic phrase for the whole turn, which reads as a hang (reported
-# 2026-09-16: "потоковый вывод не работает + статусы не приходят", on
+# 2026-09-16: "streaming output does not work + no status updates arrive", on
 # questions the dispatcher sends down the fast path — every "top N …" is
 # intent=count_or_rank).
 

@@ -292,7 +292,7 @@ _QUARTER_RANGES = {
 
 def period_range(text: str) -> list[str] | None:
     """`["YYYY-MM-DD", "YYYY-MM-DD"]` for an explicit year or quarter, else
-    None. Deliberately narrow: a relative period ("this year", "недавно")
+    None. Deliberately narrow: a relative period ("this year", "recently")
     needs a judgement about what the user meant, which is the executor's job,
     not a regex's."""
     value = text.strip().lower()

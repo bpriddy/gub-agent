@@ -24,15 +24,15 @@ Two rules this schema encodes, both load-bearing:
 `slots` is a TYPED object, not the free `dict[str, str]` the spec sketched.
 Measured 2026-09-10 on `gemini-3.5-flash`: the free-map shape is accepted by
 Vertex structured output but the model leaves it EMPTY — over six runs, in the
-pipeline and in an isolated call, "сколько live кампаний" produced
-`slots: {}` every time (twice even listing `entity` in `missing_slots`
+pipeline and in an isolated call, the Russian probe "how many live campaigns"
+produced `slots: {}` every time (twice even listing `entity` in `missing_slots`
 instead), so every count question fell through to the deep path and the
 fast path's third-largest intent was dead on arrival. With the same prompt and
 the named fields below the model fills them correctly, which is the whole
 difference between a routed count and a 30-second one.
 
 `Slots.complete` is the guard the named fields need. A closed field set cannot
-express every constraint a sentence can state ("с бюджетом больше миллиона"),
+express every constraint a sentence can state ("with a budget over a million"),
 and a builder that silently dropped the part it could not express would answer
 a DIFFERENT question than the one asked — the one failure worse than being
 slow. So the router declares whether the fields cover the sentence, and the
