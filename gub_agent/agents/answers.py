@@ -88,8 +88,9 @@ def tool_activity_event(ctx: InvocationContext, tool: str, *, done: bool = False
     The fast path calls its tool as a plain Python coroutine — no LLM, so no
     `function_call` part is ever produced, so the bot sees no activity and its
     bubble sits on one generic phrase for the whole turn (reported 2026-09-16:
-    "потоковый вывод не работает + статусы не приходят"). The deep path gets
-    its progress for free precisely because its calls go through a model.
+    "streaming output does not work + no status updates arrive"). The deep
+    path gets its progress for free precisely because its calls go through a
+    model.
 
     So the fast path says so itself, in the shape the bot already parses
     (`agent/client.ts:extractToolActivity` reads `function_call.name` and

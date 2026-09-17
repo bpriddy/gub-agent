@@ -27,8 +27,8 @@ pattern from the Agentic RAG architecture, with the per-pass budget resets
 still attached to the executor, so a question that reaches it behaves exactly
 as it does today. What blend 04 adds is the option NOT to reach it: latency is
 model turns (thinking tokens ↔ elapsed, r=0.86), so the only way to answer
-"статус Silverado 2026 Q3" in seconds is to not take 1-3 executor rounds plus
-a critic pass for one HTTP call's worth of information.
+"what is the status of Silverado 2026 Q3" in seconds is to not take 1-3
+executor rounds plus a critic pass for one HTTP call's worth of information.
 
 root_agent is what ADK looks for at deploy time and what callers
 (gub-gchat-bot, Agentspace) invoke via stream_query. Same engine ID, same
