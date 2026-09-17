@@ -55,6 +55,7 @@ from pydantic import ValidationError
 
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
 from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
+from ..tenant import label_of
 from .critic import _last_executor_text
 from .evidence_index import (
     answer_draft,
@@ -757,9 +758,10 @@ class FormatGate(BaseAgent):
                 break
 
             logger.warning(
-                "format_gate: attempt %d rejected (inv=%s) — %s",
+                "format_gate: attempt %d rejected (inv=%s) tenant=%s — %s",
                 attempt + 1,
                 ctx.invocation_id,
+                label_of(ctx),
                 feedback,
             )
             # Feedback travels twice on purpose: the state_delta event makes
@@ -778,9 +780,10 @@ class FormatGate(BaseAgent):
         # gate. Later than every failed formatter event, so the bot's
         # last-payload-wins routing picks it up.
         logger.warning(
-            "format_gate: %d attempts spent (inv=%s) — emitting the template render",
+            "format_gate: %d attempts spent (inv=%s) tenant=%s — emitting the template render",
             MAX_FORMAT_ATTEMPTS,
             ctx.invocation_id,
+            label_of(ctx),
         )
         yield self._payload_event(ctx, template_payload(executor_text, index))
 

@@ -49,6 +49,7 @@ from google.adk.events import Event
 
 from ..config import ROUTER_CONFIDENCE_FLOOR
 from ..schemas.router import FAST_INTENTS, RouterDecision
+from ..tenant import label_of
 from .answers import (
     abstain_payload,
     clarify_intent_payload,
@@ -119,12 +120,18 @@ class Dispatcher(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         decision = decision_from(ctx)
         branch = choose(decision)
+        # `tenant` is APPENDED, never interleaved: this line is the denominator
+        # of every per-turn proportion measured from the logs, and existing
+        # queries match on the `intent=`/`confidence=`/`branch=` substrings.
+        # One engine serves more than one branded Chat app, so without the label
+        # those proportions silently mix two bots' traffic (gub_agent/tenant.py).
         logger.info(
-            "dispatcher: intent=%s confidence=%.2f branch=%s (inv=%s)",
+            "dispatcher: intent=%s confidence=%.2f branch=%s (inv=%s) tenant=%s",
             decision.intent,
             decision.confidence,
             branch,
             ctx.invocation_id,
+            label_of(ctx),
         )
 
         if branch == ABSTAIN:

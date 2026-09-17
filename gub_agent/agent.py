@@ -67,6 +67,7 @@ from .sandbox import (
     sandbox_echo,
     sandbox_instruction,
 )
+from .tenant import tenant_instruction
 from .tools import ALL_TOOLS
 
 
@@ -109,7 +110,14 @@ executor_agent = Agent(
     # Wrapped for the sandbox: a run carrying state["sandbox"].executor_instruction
     # (or .executor_variant) swaps the prompt for that call only, with no redeploy;
     # without one, the base provider's text is returned unchanged.
-    instruction=sandbox_instruction(with_current_date(EXECUTOR_INSTRUCTION), role="executor"),
+    #
+    # Then wrapped for tenancy, OUTSIDE the sandbox wrapper: one engine serves
+    # more than one branded Chat app, and which surface a turn arrived through is
+    # true of a sandbox run too. A turn with no state["tenant"] gets the inner
+    # text unchanged (gub_agent/tenant.py).
+    instruction=tenant_instruction(
+        sandbox_instruction(with_current_date(EXECUTOR_INSTRUCTION), role="executor")
+    ),
     # Native thinking capped at MEDIUM. Unbounded (dynamic) thinking was the top
     # latency driver (thinking_tokens ↔ elapsed r=0.86): hard questions ran away
     # to 9-13k thought tokens / one 40s pause per step (pitch 70s @ 2 calls,
