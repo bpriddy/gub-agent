@@ -59,7 +59,9 @@ from ..tenant import label_of
 from .critic import _last_executor_text
 from .evidence_index import (
     answer_draft,
+    entry_source_ids,
     evidence_index,
+    provenance,
     set_format_feedback,
     set_formatter_brief,
 )
@@ -276,7 +278,7 @@ def repair_citations(
 
 
 def prune_source_file_ids(
-    payload: AnswerPayload, index: dict[str, dict]
+    payload: AnswerPayload, index: dict[str, dict], prov: dict[str, list[str]] | None = None
 ) -> tuple[AnswerPayload, int]:
     """Drop source ids a fact's own evidence row does not mention (blend 08 §5.2).
 
@@ -286,7 +288,10 @@ def prune_source_file_ids(
     §11 D4 — what the reader sees for an unresolvable source is nothing.
 
     The rule is the tightest one available without trusting the model: a fact
-    may carry only the file ids the evidence row it cites actually mentions.
+    may carry only the file ids the evidence row it cites actually mentions —
+    or that its ENTITY does, via the uncapped provenance map (`prov`): a stub
+    row from an account overview inherits the ids of the campaign's detail
+    row, which is exactly the case the index cap made invisible.
     That makes an invented Drive id unrenderable rather than merely wrong,
     which matters because the renderer turns these straight into links and a
     fabricated `drive.google.com/file/d/<hallucination>` is a 404 published
@@ -302,7 +307,7 @@ def prune_source_file_ids(
         if not fact.source_file_ids:
             facts.append(fact)
             continue
-        allowed = set(index.get(fact.evidence_id, {}).get("source_file_ids") or [])
+        allowed = set(entry_source_ids(index.get(fact.evidence_id, {}), prov or {}))
         kept = [f for f in fact.source_file_ids if f in allowed]
         if len(kept) != len(fact.source_file_ids):
             dropped += len(fact.source_file_ids) - len(kept)
@@ -426,10 +431,13 @@ _GROUNDING_RULES = """RULES (checked in code — a payload breaking one is rejec
 # is re-transmitted on every formatter attempt and most turns (`org_query`,
 # `search_staff`, …) cite no document at all — a rule about a field that will
 # stay empty is pure input cost on the hottest path.
-_SOURCE_RULE = """- When an id above carries `sources:`, copy those file ids verbatim into that
-  fact's `source_file_ids`. They are opaque handles the surface turns into
-  links — NEVER write one into a sentence, a heading or a table cell, and
-  never write a URL or a file name anywhere. Copy nothing that is not listed."""
+_SOURCE_RULE = """- A `sources:` line sits under an ENTITY row (`<tool>:<id> = {...}`) and lists
+  the Drive file ids that entity's records were read out of. Those ids belong
+  to EVERY `<tool>:<id>:<field>` row of that same entity as well. For each fact
+  you cite, copy the ids of its entity verbatim into that fact's
+  `source_file_ids`. They are opaque handles the surface turns into links —
+  NEVER write one into a sentence, a heading or a table cell, and never write
+  a URL or a file name anywhere. Copy nothing that is not listed."""
 
 # How many source ids one evidence entry offers the formatter. The brief is
 # re-transmitted on EVERY formatter attempt (up to 3), so this is input cost on
@@ -438,7 +446,12 @@ _SOURCE_RULE = """- When an id above carries `sources:`, copy those file ids ver
 MAX_BRIEF_SOURCE_IDS = 8
 
 
-def compose_brief(executor_text: str, index: dict[str, dict], feedback: str) -> str:
+def compose_brief(
+    executor_text: str,
+    index: dict[str, dict],
+    feedback: str,
+    prov: dict[str, list[str]] | None = None,
+) -> str:
     lines = [
         "EXECUTOR ANSWER (render this — do not add facts):",
         executor_text.strip(),
@@ -447,11 +460,18 @@ def compose_brief(executor_text: str, index: dict[str, dict], feedback: str) -> 
     ]
     if index:
         any_sources = False
+        prov = prov or {}
         for evidence_id, entry in index.items():
             lines.append(f"- {evidence_id} = {entry.get('value', '')}")
-            # Only where there is something to copy — an `org_query` row cites
-            # no document and a `sources: ` line saying so is pure input cost.
-            sources = (entry.get("source_file_ids") or [])[:MAX_BRIEF_SOURCE_IDS]
+            # ONCE per entity, under its whole-entity row (field None), never
+            # under each field row: an account overview indexes ~290 rows for
+            # 47 campaigns, and a sources line on every one of them would
+            # triple a brief that is re-sent on every formatter attempt. The
+            # entity row is written first, so the line sits directly above
+            # that entity's field rows; _SOURCE_RULE says the fields inherit.
+            if entry.get("field") is not None:
+                continue
+            sources = entry_source_ids(entry, prov)[:MAX_BRIEF_SOURCE_IDS]
             if sources:
                 any_sources = True
                 lines.append(f"    sources: {', '.join(sources)}")
@@ -518,7 +538,9 @@ def _headline_from(line: str) -> str:
     return " ".join(head) + " …"
 
 
-def template_payload(executor_text: str, index: dict[str, dict]) -> AnswerPayload:
+def template_payload(
+    executor_text: str, index: dict[str, dict], prov: dict[str, list[str]] | None = None
+) -> AnswerPayload:
     """The deterministic render used after the formatter failed twice.
 
     The body is the EXECUTOR'S PROSE, not the evidence. The previous version
@@ -569,6 +591,12 @@ def template_payload(executor_text: str, index: dict[str, dict]) -> AnswerPayloa
             entity_id=e.get("entity_id"),
             field=e.get("field"),
             value=_shorten(str(e.get("value", ""))),
+            # The template is the turn the reader is MOST likely to distrust —
+            # the model burned three attempts and this is a mechanical render
+            # of raw rows. Attribution is exactly what makes it checkable, and
+            # it costs nothing here: no model is involved, so there is no id
+            # to invent. Dropping it was an oversight, not a policy.
+            source_file_ids=entry_source_ids(e, prov or {}),
         )
         for eid, e in entity_rows
     ]
@@ -673,7 +701,10 @@ class FormatGate(BaseAgent):
             return
 
         index = evidence_index(ctx.invocation_id)
-        set_formatter_brief(ctx.invocation_id, compose_brief(executor_text, index, feedback=""))
+        set_formatter_brief(
+            ctx.invocation_id,
+            compose_brief(executor_text, index, "", provenance(ctx.invocation_id)),
+        )
 
         # With nothing citable, `kind="answer"` CANNOT validate — the contract
         # requires a citation (`schemas/answer.py`) — so a rejected attempt is
@@ -726,7 +757,9 @@ class FormatGate(BaseAgent):
                         payload, repaired = repair_citations(payload, index)
                         # Source ids never cause a rejection, so pruning runs
                         # before the checks and never contributes to them.
-                        payload, pruned_sources = prune_source_file_ids(payload, index)
+                        payload, pruned_sources = prune_source_file_ids(
+                            payload, index, provenance(ctx.invocation_id)
+                        )
                         problems = gate_problems(payload, index)
                         if not problems:
                             if repaired:
@@ -769,7 +802,10 @@ class FormatGate(BaseAgent):
             # the in-process store is what the next formatter run's brief
             # actually reads — deterministic, no commit-timing dependency.
             set_format_feedback(ctx.invocation_id, feedback)
-            set_formatter_brief(ctx.invocation_id, compose_brief(executor_text, index, feedback))
+            set_formatter_brief(
+                ctx.invocation_id,
+                compose_brief(executor_text, index, feedback, provenance(ctx.invocation_id)),
+            )
             yield Event(
                 invocation_id=ctx.invocation_id,
                 author=self.name,
@@ -785,7 +821,9 @@ class FormatGate(BaseAgent):
             ctx.invocation_id,
             label_of(ctx),
         )
-        yield self._payload_event(ctx, template_payload(executor_text, index))
+        yield self._payload_event(
+            ctx, template_payload(executor_text, index, provenance(ctx.invocation_id))
+        )
 
 
 format_gate = FormatGate(name="format_gate", sub_agents=[formatter_agent])

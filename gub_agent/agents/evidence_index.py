@@ -61,6 +61,19 @@ MAX_ENTRIES = 400
 MAX_ENTITY_VALUE_CHARS = 2_000
 
 _INDEX: OrderedDict[str, dict[str, dict[str, Any]]] = OrderedDict()
+# entity_id → Drive file ids its status text cites — UNCAPPED, beside the
+# capped index (blend 08 §5.2, second attempt). Why a second store: MAX_ENTRIES
+# protects the formatter BRIEF, and on the first live account turn it evicted
+# exactly the rows that carry provenance. Replayed from the recorded session
+# (tests/fixtures/recorded_chevy_turn_2026-09-17.json): `find` → 113 entries,
+# `get_account_overview` (47 campaign stubs × 10 scalars) → cap hit at 400,
+# then six `get_campaign` responses carrying 21–185 markers each indexed ZERO
+# rows. 0/400 entries had a source id; the brief had no `sources:` line; the
+# model copied nothing, correctly. A set of ids per entity is a few hundred
+# bytes and needs no cap; keeping it here lets the stub row the formatter DID
+# cite (`get_account_overview:<cid>:budget`) inherit the provenance the
+# detail row it never saw would have carried.
+_PROVENANCE: OrderedDict[str, dict[str, list[str]]] = OrderedDict()
 _FEEDBACK: OrderedDict[str, str] = OrderedDict()
 _BRIEF: OrderedDict[str, str] = OrderedDict()
 _DRAFT: OrderedDict[str, str] = OrderedDict()
@@ -84,6 +97,7 @@ def reset_evidence_index(callback_context: Any) -> None:
     see module docstring."""
     invocation_id = getattr(callback_context, "invocation_id", "") or "?"
     _INDEX.pop(invocation_id, None)
+    _PROVENANCE.pop(invocation_id, None)
     _FEEDBACK.pop(invocation_id, None)
     _BRIEF.pop(invocation_id, None)
     _DRAFT.pop(invocation_id, None)
@@ -93,6 +107,26 @@ def reset_evidence_index(callback_context: Any) -> None:
 def evidence_index(invocation_id: str) -> dict[str, dict[str, Any]]:
     """This invocation's index (empty when no tool has returned yet)."""
     return _INDEX.get(invocation_id, {})
+
+
+def provenance(invocation_id: str) -> dict[str, list[str]]:
+    """entity_id → source file ids, over EVERY row any tool returned this
+    invocation — including rows the index cap dropped."""
+    return _PROVENANCE.get(invocation_id, {})
+
+
+def entry_source_ids(entry: dict[str, Any], prov: dict[str, list[str]]) -> list[str]:
+    """The file ids a fact citing this entry may carry: the entry's own, then
+    its entity's (any tool, any row, cap or no cap). Deduped, order kept."""
+    entity_id = entry.get("entity_id")
+    inherited = prov.get(entity_id, []) if isinstance(entity_id, str) else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for file_id in [*(entry.get("source_file_ids") or []), *inherited]:
+        if file_id not in seen:
+            seen.add(file_id)
+            out.append(file_id)
+    return out
 
 
 def set_format_feedback(invocation_id: str, feedback: str) -> None:
@@ -146,7 +180,11 @@ def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any
     if not isinstance(tool_response, dict):
         return None
     index = _bucket(_INDEX, invocation_id, {})
+    prov = _bucket(_PROVENANCE, invocation_id, {})
     tool_name = getattr(tool, "name", None) or str(tool)
+    # Provenance BEFORE the index, over every row: it must not depend on
+    # whether the row survives MAX_ENTRIES.
+    _record_provenance(tool_response, prov)
     _index_response(tool_name, tool_response, index)
     return None
 
@@ -182,6 +220,70 @@ def source_file_ids(text: Any) -> list[str]:
     return out
 
 
+# Where a row's status text lives on the wire. Campaign detail: top-level
+# `statusMarkdown`. Account detail: NESTED and snake_case —
+# `currentState.status_markdown` (345 markers on the recorded Chevy turn, all
+# invisible to a reader of `row["statusMarkdown"]`).
+_STATUS_KEYS = ("statusMarkdown", "status_markdown")
+
+
+def _row_source_ids(row: dict[str, Any]) -> list[str]:
+    """Every Drive file id this row's status text cites, wherever the wire put
+    it. Prefers the backend's `_cited` map when present: it is the marker set
+    already resolved against `drive_file_snapshots`, i.e. ONLY files the bot
+    can name — so nothing offered here can render as nothing. Falls back to
+    parsing markers (an older backend, or a row without `_cited`)."""
+    cited = row.get("_cited")
+    if isinstance(cited, dict) and cited:
+        return [k for k in cited if isinstance(k, str)]
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def take(text: Any) -> None:
+        for file_id in source_file_ids(text):
+            if file_id not in seen:
+                seen.add(file_id)
+                out.append(file_id)
+
+    for key in _STATUS_KEYS:
+        take(row.get(key))
+    for value in row.values():
+        if isinstance(value, dict):
+            for key in _STATUS_KEYS:
+                take(value.get(key))
+    return out
+
+
+def _record_provenance(response: dict[str, Any], prov: dict[str, list[str]]) -> None:
+    """entity_id → source ids for every id-bearing row in the response, top
+    level and every top-level list. Uncapped; unions across tools, so a
+    campaign seen as an overview stub and again as a detail row ends up with
+    the detail row's ids on both."""
+
+    def note(row: dict[str, Any]) -> None:
+        entity_id = row.get("id")
+        if not isinstance(entity_id, str):
+            return
+        ids = _row_source_ids(row)
+        if not ids:
+            return
+        have = prov.setdefault(entity_id, [])
+        for file_id in ids:
+            if file_id not in have:
+                have.append(file_id)
+
+    if response.get("error"):
+        return
+    if isinstance(response.get("id"), str):
+        note(response)
+    for key, value in response.items():
+        if key.startswith("_") or not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict):
+                note(item)
+
+
 def _index_row(tool_name: str, row: dict[str, Any], fallback_id: str, index: dict) -> None:
     if len(index) >= MAX_ENTRIES:
         return
@@ -193,7 +295,7 @@ def _index_row(tool_name: str, row: dict[str, Any], fallback_id: str, index: dic
     # multi-file status to any fact citing it. D1(b) — one evidence row per
     # bullet — is exact and costs an evidence-index rewrite; it is unratified,
     # and this shape is the one that ships without it.
-    row_sources = source_file_ids(row.get("statusMarkdown"))
+    row_sources = _row_source_ids(row)
     index[f"{tool_name}:{row_id}"] = {
         "tool": tool_name,
         "entity_id": entity_id,
