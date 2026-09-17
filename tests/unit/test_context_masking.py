@@ -61,3 +61,27 @@ async def test_noop_when_no_sources_shares_the_object():
 
     # Nothing to strip → no needless copy; the same object is kept.
     assert fr.response is resp
+
+
+async def test_strips_the_blend_08_plumbing_beside_sources():
+    """`_cited` / `_sourcesTotal` (blend 08 §5.1) exist for the BOT to bind
+    links; the formatter copies source ids off the evidence brief, never off
+    these. To the model they are ~90 opaque Drive ids per account overview,
+    re-sent every ReAct round — the same dead weight `_sources` was masked for.
+    Same copy-on-write contract: the original response is left whole."""
+    resp = {
+        "id": "a1",
+        "name": "Chevy",
+        "_sources": [{"fileId": "f1"}],
+        "_sourcesTotal": 3308,
+        "_cited": {"1rRAWMbDl": {"name": "Brief v2", "mimeType": "application/pdf"}},
+        "campaigns": [{"id": "c1", "_cited": {"x": {"name": "n"}}}],
+    }
+    req, fr = _request_with(resp)
+    strip_source_metadata(None, req)
+    for key in ("_sources", "_sourcesTotal", "_cited"):
+        assert key not in fr.response
+    assert "_cited" not in fr.response["campaigns"][0]
+    assert fr.response["name"] == "Chevy"  # real fields untouched
+    for key in ("_sources", "_sourcesTotal", "_cited"):
+        assert key in resp  # original untouched

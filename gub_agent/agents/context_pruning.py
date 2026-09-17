@@ -42,7 +42,13 @@ def _has_user_text(content: Any) -> bool:
 # the model these are for grounding infrastructure and MUST NOT appear in prose.
 # `_sources` (Drive file citations) measured at 512k chars / 128k tokens for ONE
 # account overview (3,257 file refs) — re-sent every ReAct round. Dead weight.
-_PLUMBING_KEYS = ("_sources",)
+#
+# `_cited` and `_sourcesTotal` (blend 08 §5.1) are the same kind of thing: a
+# fileId → name map and a count that exist so the BOT can bind links. The
+# formatter gets the source ids it copies from the evidence brief's `sources:`
+# lines, never from here — so to the model this is 87 opaque Drive ids per
+# account overview, re-sent every round, that it is forbidden to use.
+_PLUMBING_KEYS = ("_sources", "_sourcesTotal", "_cited")
 
 
 def _without_plumbing(obj: Any) -> Any:
