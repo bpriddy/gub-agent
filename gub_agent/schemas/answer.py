@@ -30,7 +30,10 @@ the index, which is per-invocation state, and live in the format gate
 
 The bot's zod mirror is `gub-gchat-bot/src/chat/render-answer.ts`; the eval
 reader is `gub-sandbox-ui/src/lib/batch/metrics.ts`. Field renames here are
-wire changes — change all three together.
+wire changes — change all three together. A payload that parses on one surface
+and renders as `null` on another is the failure mode, and a failed zod parse
+falls back to prose silently, so the bug reads as "links sometimes don't
+appear" rather than as a schema error.
 """
 
 from __future__ import annotations
@@ -135,6 +138,21 @@ class Fact(BaseModel):
     entity_id: str | None = None
     field: str | None = None
     value: str | None = None
+    # The Drive files this fact was read out of — the `[src: <fileId>]` markers
+    # the status document carries per bullet, copied off the evidence index
+    # entry this fact cites (blend 08 §5.2).
+    #
+    # IDS, never URLs, and the distinction is the whole design. The format gate
+    # grounds every number in the PROSE against the evidence index, and a Drive
+    # file id is 33 characters of digits and letters: a URL written into a
+    # sentence would read as an ungrounded number, burn all three formatter
+    # attempts and drop the turn into the template fallback. A structured field
+    # is not prose, so it is checked by nobody and rendered by the bot, which
+    # is the only component that knows what the reader can open.
+    #
+    # Additive and optional: an engine that never fills it validates exactly as
+    # before, and a bot that ignores it renders exactly as before.
+    source_file_ids: list[str] = Field(default_factory=list)
 
 
 class Candidate(BaseModel):

@@ -36,8 +36,20 @@ behind for the executor's pass to render instead of its own answer.
 from __future__ import annotations
 
 import json
+import re
 from collections import OrderedDict
 from typing import Any
+
+# The per-bullet Drive provenance the status-synthesis prompt writes after
+# every bullet of a `statusMarkdown` (blend 08 §5.2). 47/47 campaigns carry
+# these, 689 markers over 232 distinct files, and until now nothing read them.
+#
+# Parsed off the FIELD row, never the whole-entity row: `_compact_row` caps a
+# row at MAX_ENTITY_VALUE_CHARS, 30 of the 47 campaigns have a status longer
+# than that, and only 52.8 % of the markers fall inside the cap. The entity
+# row's marker set is the head of the document, which is worse than none —
+# it would attribute late claims to early files.
+SRC_MARKER_RE = re.compile(r"\[src:\s*([A-Za-z0-9_-]+)\]")
 
 # Rows are compact (scalar fields only), but the formatter instruction carries
 # the whole index — cap the entries so a runaway fan-out cannot balloon the
@@ -153,16 +165,41 @@ def _compact_row(row: dict[str, Any]) -> str:
     return text
 
 
+def source_file_ids(text: Any) -> list[str]:
+    """The `[src: <driveFileId>]` markers in a value, in order and deduped.
+
+    Total by design: a non-string, an empty string or a value with no markers
+    all give []. An entity with no Drive provenance is the common case (every
+    `org_query` row), not an error."""
+    if not isinstance(text, str) or "[src:" not in text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for file_id in SRC_MARKER_RE.findall(text):
+        if file_id not in seen:
+            seen.add(file_id)
+            out.append(file_id)
+    return out
+
+
 def _index_row(tool_name: str, row: dict[str, Any], fallback_id: str, index: dict) -> None:
     if len(index) >= MAX_ENTRIES:
         return
     row_id = row.get("id") if isinstance(row.get("id"), str) else fallback_id
     entity_id = row.get("id") if isinstance(row.get("id"), str) else None
+    # Every source id this ROW mentions, whichever field carried it — so a
+    # whole-entity citation can be attributed even though its own value was
+    # compacted. D1(a): per-field granularity, which OVER-attributes a
+    # multi-file status to any fact citing it. D1(b) — one evidence row per
+    # bullet — is exact and costs an evidence-index rewrite; it is unratified,
+    # and this shape is the one that ships without it.
+    row_sources = source_file_ids(row.get("statusMarkdown"))
     index[f"{tool_name}:{row_id}"] = {
         "tool": tool_name,
         "entity_id": entity_id,
         "field": None,
         "value": _compact_row(row),
+        "source_file_ids": row_sources,
     }
     for key, value in row.items():
         if len(index) >= MAX_ENTRIES:
@@ -174,6 +211,11 @@ def _index_row(tool_name: str, row: dict[str, Any], fallback_id: str, index: dic
             "entity_id": entity_id,
             "field": key,
             "value": str(value),
+            # A field row carries the markers of its OWN value when it has
+            # them (statusMarkdown), and otherwise the row's — a `budget`
+            # field cites no file of its own, but the campaign it belongs to
+            # does, and that is the honest attribution available at D1(a).
+            "source_file_ids": source_file_ids(value) or row_sources,
         }
 
 
@@ -214,4 +256,8 @@ def _index_response(tool_name: str, response: dict[str, Any], index: dict) -> No
                     "entity_id": None,
                     "field": key,
                     "value": str(value),
+                    # Uniform shape: every entry answers `source_file_ids`, so
+                    # no reader has to guess whether the key is missing or the
+                    # list is empty. A response-level scalar cites no document.
+                    "source_file_ids": [],
                 }

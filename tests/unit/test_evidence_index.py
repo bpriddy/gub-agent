@@ -56,6 +56,10 @@ async def test_org_query_rows_and_total_are_addressable():
         "entity_id": "c1",
         "field": "budget",
         "value": "1200000",
+        # blend 08 §5.2: every entry answers `source_file_ids`, uniformly, so
+        # a reader never has to tell "no key" from "no sources". An org_query
+        # row carries no status document, so the answer is "none".
+        "source_file_ids": [],
     }
     assert index["org_query:total"]["value"] == "7"
 
