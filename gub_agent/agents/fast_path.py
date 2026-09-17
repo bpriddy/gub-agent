@@ -59,7 +59,12 @@ from ..tools.accounts import get_account_overview, get_campaign
 from ..tools.discovery import find
 from ..tools.org_query import org_query
 from ..tools.staff import get_staff_profile, search_staff
-from .answers import no_access_payload, not_found_payload, payload_event
+from .answers import (
+    no_access_payload,
+    not_found_payload,
+    payload_event,
+    tool_activity_event,
+)
 from .evidence_index import (
     evidence_index,
     record_evidence,
@@ -522,6 +527,20 @@ _LOOKUPS = {
 }
 
 
+#: Which tool each intent's lookup will reach for, so the bot's progress line
+#: can name it BEFORE the call rather than after it — a step that arrives with
+#: the answer is not progress. Announcing ahead is accurate: the lookup runs
+#: this tool; what it may decline on is the RESULT. A lookup that touches more
+#: than one tool is named by the one that does the work.
+_FAST_TOOLS = {
+    "campaign_status": "get_campaign",
+    "campaign_facts": "get_campaign",
+    "account_facts": "get_account_overview",
+    "staff_lookup": "search_staff",
+    "count_or_rank": "org_query",
+}
+
+
 # ── the draft the format gate renders ─────────────────────────────────────────
 
 
@@ -580,6 +599,13 @@ class _ToolStub:
         self.name = name
 
 
+def lookup_tool(lookup: Lookup | None, fallback: str) -> str:
+    """The tool a finished lookup says it used, falling back to what was
+    announced. `Lookup.tool` is authoritative where it is set — a lookup that
+    shortcut to a 403/404 payload may not have reached the tool it planned."""
+    return lookup.tool if lookup is not None and lookup.tool else fallback
+
+
 class FastPath(BaseAgent):
     """One lookup, then the format gate. Emits nothing at all when it decides
     the question is not its business — the dispatcher reads `outcome()` and
@@ -603,14 +629,32 @@ class FastPath(BaseAgent):
         lookup_fn = _LOOKUPS.get(decision.intent)
         if lookup_fn is None:
             return
+
+        # Say what is about to happen. Without this the bot has no tool
+        # activity to show and its bubble holds one generic phrase for the
+        # whole turn, which reads as a hang — the deep path never had the
+        # problem because its calls go through a model and emit function_call
+        # parts of their own. These events are `partial`, so they reach the
+        # bot and never enter the session history (see `tool_activity_event`).
+        announced = _FAST_TOOLS.get(decision.intent)
+        if announced:
+            yield tool_activity_event(ctx, announced)
+        lookup: Lookup | None = None
+        raised = False
         try:
             lookup = await lookup_fn(decision, shim, question)
         except Exception:
             # Never fail the turn on the fast path — the deep path is always a
             # correct (if slower) answer to the same question.
             logger.exception("fast_path: lookup raised (inv=%s) — deep path", ctx.invocation_id)
-            return
-        if lookup is None:
+            raised = True
+        # Closed even when the lookup raised or declined. The pair is not
+        # decoration: the bot counts calls per tool to number repeats, and a
+        # call left open holds the bubble on "Querying org records…" while the
+        # deep path is already working underneath it.
+        if announced:
+            yield tool_activity_event(ctx, lookup_tool(lookup, announced), done=True)
+        if raised or lookup is None:
             return
 
         if lookup.payload is not None:
