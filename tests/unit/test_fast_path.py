@@ -355,6 +355,32 @@ def test_asked_shape_prefers_the_disqualifying_reading():
 # ── the agent ─────────────────────────────────────────────────────────────────
 
 
+def _answers(events: list) -> list:
+    """Everything the turn actually SAYS, i.e. the progress pings removed.
+
+    The fast path emits a function_call/function_response pair around its
+    lookup so the bot's bubble can advance its step line — its tool runs as a
+    plain coroutine, so nothing else would announce it. Those events are
+    `partial`, which is what keeps them out of the session history, and it is
+    also what makes them easy to drop here: an answer is never partial.
+    """
+    return [e for e in events if not e.partial]
+
+
+def _progress(events: list) -> list[tuple[str, bool]]:
+    """(tool name, is_result) for each progress ping, in order."""
+    out = []
+    for e in events:
+        if not e.partial or not e.content:
+            continue
+        for part in e.content.parts or []:
+            if part.function_call:
+                out.append((part.function_call.name, False))
+            if part.function_response:
+                out.append((part.function_response.name, True))
+    return out
+
+
 async def test_a_selected_campaign_id_skips_the_search_entirely(gub, gate):
     gub.on("GET", "/org/campaigns/", CAMPAIGN)
     ctx = await _ctx(_decision(entity_id="c1"))
@@ -365,7 +391,7 @@ async def test_a_selected_campaign_id_skips_the_search_entirely(gub, gate):
     assert gub.calls[0][1] == "/org/campaigns/c1"
     assert fp.outcome(INV) == "answered"
     assert gate.runs == [INV]
-    assert len(events) == 1
+    assert len(_answers(events)) == 1
 
 
 async def test_the_evidence_ids_are_indistinguishable_from_the_deep_paths(gub, gate):
@@ -409,7 +435,7 @@ async def test_an_ambiguous_surface_goes_deep_with_no_card_and_no_detail_call(gu
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
-    assert events == []
+    assert _answers(events) == []
     assert fp.outcome(INV) == "deep"
     assert gate.runs == []
     assert [path for _, path in gub.calls] == ["/org/search"]
@@ -421,7 +447,7 @@ async def test_an_empty_detail_result_falls_through_to_the_deep_path(gub, gate):
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
-    assert events == []
+    assert _answers(events) == []
     assert fp.outcome(INV) == "deep"
 
 
@@ -433,11 +459,11 @@ async def test_a_403_is_answered_immediately_without_the_gate(gub, gate):
 
     assert fp.outcome(INV) == "answered"
     assert gate.runs == []  # no formatter LLM to hear the same 403
-    assert len(events) == 1
-    payload = events[0].actions.state_delta[ANSWER_STATE_KEY]
+    assert len(_answers(events)) == 1
+    payload = _answers(events)[0].actions.state_delta[ANSWER_STATE_KEY]
     assert payload["kind"] == "answer"
     assert "Нет доступа" in payload["headline"]
-    assert events[0].author == "format_gate"  # the bot's answer channel
+    assert _answers(events)[0].author == "format_gate"  # the bot's answer channel
 
 
 async def test_a_404_names_what_was_looked_for_in_the_assumption_line(gub, gate):
@@ -446,7 +472,7 @@ async def test_a_404_names_what_was_looked_for_in_the_assumption_line(gub, gate)
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
-    payload = events[0].actions.state_delta[ANSWER_STATE_KEY]
+    payload = _answers(events)[0].actions.state_delta[ANSWER_STATE_KEY]
     assert payload["assumptions"] == ["Искал: Silverado 2026 Q3"]
     # The surface rides in `assumptions` precisely so the gate's grounding
     # checks pass against an EMPTY index — the headline names no entity.
@@ -459,7 +485,7 @@ async def test_a_500_falls_through_to_the_deep_path(gub, gate):
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
-    assert events == []
+    assert _answers(events) == []
     assert fp.outcome(INV) == "deep"
 
 
@@ -472,7 +498,7 @@ async def test_an_unexpected_exception_costs_the_deep_path_not_the_turn(monkeypa
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
-    assert events == []
+    assert _answers(events) == []
     assert fp.outcome(INV) == "deep"
 
 
@@ -556,5 +582,81 @@ async def test_the_real_gate_renders_the_fast_path_draft_and_grounds_it(gub, mon
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
     assert formatter.runs == [INV]  # one formatter pass, no retry: it grounded
-    assert [e.author for e in events] == ["formatter"]
+    assert [e.author for e in _answers(events)] == ["formatter"]
     assert fp.outcome(INV) == "answered"
+
+
+# ── the progress pings ────────────────────────────────────────────────────────
+#
+# The bot draws its "Querying org records…" line from tool activity in the
+# event stream. The deep path gets that for free — its calls go through a
+# model, which emits function_call parts. The fast path calls its tool as a
+# plain coroutine, so it emitted nothing at all and the bubble sat on one
+# generic phrase for the whole turn, which reads as a hang (reported
+# 2026-09-16: "потоковый вывод не работает + статусы не приходят", on
+# questions the dispatcher sends down the fast path — every "top N …" is
+# intent=count_or_rank).
+
+
+async def test_the_fast_path_announces_its_tool_before_calling_it(gub, gate):
+    gub.on("GET", "/org/campaigns/", CAMPAIGN)
+    ctx = await _ctx(_decision(entity_id="c1"))
+
+    events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    # named, and opened BEFORE the call — a step that arrives with the answer
+    # is not progress
+    assert _progress(events) == [("get_campaign", False), ("get_campaign", True)]
+    assert events[0].partial is True
+
+
+async def test_the_pings_are_partial_so_they_never_enter_the_history(gub, gate):
+    """Load-bearing, not cosmetic. ADK appends an event to the session only
+    when it is not partial (`runners.py:881`). A non-partial function_call
+    here would be written into the conversation history, and the deep path —
+    which runs whenever the fast path declines — would then read a tool call
+    that never happened, answered by a response carrying no data."""
+    gub.on("GET", "/org/search", {"hits": []})
+    ctx = await _ctx(_decision())
+
+    events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    pings = [e for e in events if e.partial]
+    assert pings
+    assert all(e.partial is True for e in pings)
+
+
+async def test_a_ping_carries_no_text_so_it_cannot_reach_the_answer(gub, gate):
+    """The bot builds the reply from `extractText(evt)`. A progress ping that
+    carried text would be appended to the answer the reader sees."""
+    gub.on("GET", "/org/campaigns/", CAMPAIGN)
+    ctx = await _ctx(_decision(entity_id="c1"))
+
+    events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    for e in (e for e in events if e.partial):
+        assert all(p.text is None for p in (e.content.parts or []))
+
+
+async def test_the_pair_is_closed_even_when_the_fast_path_declines(gub, gate):
+    """Declining is the common case — the deep path takes over. An unclosed
+    call would hold the bubble on "Reading campaign details…" while the deep
+    path is already working underneath it."""
+    gub.on("GET", "/org/search", {"hits": []})
+    ctx = await _ctx(_decision())
+
+    events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert _answers(events) == []  # nothing said; the deep path will answer
+    assert [done for _, done in _progress(events)] == [False, True]
+
+
+async def test_an_intent_with_no_lookup_announces_nothing(gub, gate):
+    """No tool will run, so there is nothing to report. A ping here would
+    promise work that never starts."""
+    ctx = await _ctx(_decision(intent="smalltalk"))
+
+    events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert _progress(events) == []
+    assert _answers(events) == []

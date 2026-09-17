@@ -73,6 +73,52 @@ def payload_event(ctx: InvocationContext, payload: AnswerPayload) -> Event:
     )
 
 
+#: Author of the fast path's progress events. Deliberately NOT one of the
+#: names the bot treats as internal (`agent/client.ts:216` — critic,
+#: loop_escalator, critic_gate, sandbox_echo, router, dispatcher, validator):
+#: those are filtered out before tool activity is read, and the progress line
+#: is exactly what these events exist to drive.
+FAST_PATH_AUTHOR = "fast_path"
+
+
+def tool_activity_event(ctx: InvocationContext, tool: str, *, done: bool = False) -> Event:
+    """A "I am calling this tool now" event, purely so the bot's bubble can
+    advance its progress line.
+
+    The fast path calls its tool as a plain Python coroutine — no LLM, so no
+    `function_call` part is ever produced, so the bot sees no activity and its
+    bubble sits on one generic phrase for the whole turn (reported 2026-09-16:
+    "потоковый вывод не работает + статусы не приходят"). The deep path gets
+    its progress for free precisely because its calls go through a model.
+
+    So the fast path says so itself, in the shape the bot already parses
+    (`agent/client.ts:extractToolActivity` reads `function_call.name` and
+    `function_response.name`, and maps the name to a phrase via `TOOL_STEPS`).
+
+    **`partial=True` is load-bearing, not a detail.** ADK appends an event to
+    the session only when it is not partial (`runners.py:881`). A non-partial
+    function_call here would be written into the conversation history, and the
+    deep path — which runs whenever the fast path declines — would then see a
+    tool call that never happened, paired with a response that carries no data.
+    That is a lie told to a model that is about to answer a question. Partial
+    keeps the event on the wire to the bot and out of the history.
+
+    It also carries no text part, so it cannot reach the answer channel: the
+    bot contributes only `extractText(evt)` to the reply.
+    """
+    part = (
+        genai_types.Part(function_response=genai_types.FunctionResponse(name=tool, response={}))
+        if done
+        else genai_types.Part(function_call=genai_types.FunctionCall(name=tool, args={}))
+    )
+    return Event(
+        invocation_id=ctx.invocation_id,
+        author=FAST_PATH_AUTHOR,
+        content=genai_types.Content(role="model", parts=[part]),
+        partial=True,
+    )
+
+
 # ── the payloads ─────────────────────────────────────────────────────────────
 
 
