@@ -70,5 +70,15 @@ def test_the_wrapper_key_is_the_one_that_endpoint_s_readers_use() -> None:
 def test_the_notice_forbids_both_wrong_answers() -> None:
     lowered = ACCOUNT_SCOPE_NOTICE.lower()
     assert "non-existent" in lowered  # not "there is no such account"
-    assert "lack access" in lowered  # not "you don't have permission"
-    assert "not available from this surface" in lowered
+    assert "lacks access" in lowered  # not "you don't have permission"
+    assert "do not invent them" in lowered
+
+
+def test_the_notice_tells_the_model_to_stay_quiet_about_the_scope() -> None:
+    """The surface states the limit once, in a line it prepends by code. A
+    model that states it too produced four renderings of one fact on a live
+    turn — the bot's line, the answer's headline, the answer's body and the
+    mailbox line — which reads as a stutter, not as a boundary."""
+    lowered = ACCOUNT_SCOPE_NOTICE.lower()
+    assert "do not write a sentence about the scope" in lowered
+    assert "abstain" in lowered
