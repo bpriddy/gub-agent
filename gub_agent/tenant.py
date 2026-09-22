@@ -22,13 +22,21 @@ and this module does two things with it, both cheap and both per-call:
    meaning.
 
 2. **Scopes the prompt.** `tenant_instruction` appends a block naming the
-   account this surface is branded for. That is a SOFT boundary and is meant to
-   be: nothing here restricts what the agent can retrieve, and the tools answer
-   with whatever the signed-in user's own grants allow. It is written down as an
-   accepted risk rather than implied — see the epic (gub-gchat-bot#83, #90).
-   Filter-level scoping was investigated and does not exist: the Workspace
-   connector data stores publish no schema, and a Vertex AI Search filter binds
-   to a schema key property.
+   account this surface is branded for, and tells the model what to say when a
+   tool result reports that records were withheld.
+
+   This block is NOT the boundary. Since tenant-10 the real one is enforced in
+   the backend — an account scope on the trusted-app registration, carried as a
+   token claim and intersected into every account / campaign / piece / idea
+   read — and it applies to admins too. The block stays because it is still the
+   honest description of the surface, and because a filtered read has to be
+   described rather than reported as an absence.
+
+   The 📊 half is scoped; the ✉️ Workspace half is NOT, and cannot be with the
+   machinery that exists: the connector data stores publish no schema, and a
+   Vertex AI Search filter binds to a schema key property. Staff, offices and
+   teams are unscoped by ruling — no staff→account link exists to scope them
+   by. See the epic (gub-gchat-bot#83, #90).
 
 Invariants, both pinned by tests:
 
@@ -107,13 +115,24 @@ def label_of(ctx_or_state: Any) -> str:
 def tenant_note(tenant: str) -> str:
     """The '## Tenant surface' block appended to the instruction for a tenant turn.
 
-    Deliberately not a refusal. The ruling (gub-gchat-bot#83, D4) is that this
-    surface is *branded* for an account, not *restricted* to it, so the model
-    treats the account as the default subject and SAYS SO when a question is
-    plainly about something else — the "answered with a caveat" behaviour. A
-    hard refusal here would read as a security boundary that does not exist:
-    nothing stops the same user asking the same question through the other bot,
-    or through the backend directly.
+    Still not a refusal rule, and still not the boundary — that now lives in
+    the backend (tenant-10). What changed is that the old text was written for
+    a surface which was *branded* and not *restricted*, and said so:
+    "you are not restricted", "never say or imply that other accounts are
+    unavailable". Both are now false for the 📊 half, and a model told them
+    will argue with its own tool results.
+
+    So the rule is evidence-bound rather than absolute: describe records as
+    withheld exactly when a tool result says they were, and never otherwise.
+    That keeps it correct in BOTH enforcement modes — in 'log' mode nothing is
+    withheld, no notice appears, and this block changes nothing.
+
+    Two failure modes it steers away from, deliberately:
+      - "there are no campaigns for that account" — a claim about the world
+        made from a fact about permissions, and the reason this exists;
+      - "you don't have access to that" — the user's own grants are not what
+        filtered it, and telling them otherwise sends them to ask for access
+        they already have.
 
     The label is interpolated, never hardcoded — this engine is multi-company
     and a client name in a prompt is a client name in every tenant's prompt.
@@ -121,19 +140,58 @@ def tenant_note(tenant: str) -> str:
     return (
         "## Tenant surface\n"
         f"This turn arrived through the **{tenant}** surface: a chat app branded "
-        f"for the {tenant} account.\n"
+        f"for the {tenant} account, and scoped to it in our database.\n"
         f"- Treat {tenant} as the default subject. When a question does not name "
         f"an account, it is about {tenant}.\n"
-        f"- You are not restricted to {tenant}. If the question is plainly about "
-        "something else, answer it normally — then add one short line noting that "
-        f"this surface is the {tenant} one.\n"
-        "- Never say or imply that other accounts are hidden, blocked or "
-        "unavailable to you. They are not."
+        "- A tool result may carry `account_scope_notice`. When it does, some "
+        "records were withheld because they are outside this surface's scope. "
+        "Say that plainly in one short line, and answer with what you did get.\n"
+        "- When records are withheld, never say the thing does not exist, and "
+        "never say the user lacks access — neither is true. The records are "
+        "simply not available from this surface.\n"
+        "- Without that notice, nothing was withheld: answer normally and do "
+        "not speculate about what might have been filtered.\n"
+        "- Your own mail, chat and files searches are NOT scoped. Do not "
+        "describe those results as limited to one account."
+    )
+
+
+def tenant_note_formatter(tenant: str) -> str:
+    """The formatter's version of the block.
+
+    The formatter needs its own because it is the ONLY model on some turns:
+    the fast path runs no executor at all, and smalltalk, abstain and clarify
+    turns never reach one either. A rule that lives only in the executor
+    instruction is therefore absent from exactly the short turns where a
+    one-line notice is the whole answer.
+
+    It is deliberately narrower than the executor's. The formatter sees no
+    tool results — its input is the executor's text plus the evidence index —
+    so its job is to not LOSE a notice that is already there, and to not
+    invent one that is not.
+
+    The last bullet is not decoration. `format_gate` rejects a capitalised run
+    that appears in no tool result as an ungrounded entity, and a tenant label
+    written into the answer is exactly such a word: it burns all three
+    formatter attempts and drops the turn into the template fallback.
+    """
+    return (
+        "## Tenant surface\n"
+        f"This turn arrived through the **{tenant}** surface, which is scoped to "
+        f"the {tenant} account in our database.\n"
+        "- If the text you were given says records were withheld as outside "
+        "this surface's scope, KEEP that line. It is not filler, and it must "
+        "survive compression — it is the difference between a limit and a lie.\n"
+        "- Never restate it as the records not existing, and never as the user "
+        "lacking access.\n"
+        "- Do not add the surface's name to the answer when it does not appear "
+        "in the evidence you were given."
     )
 
 
 def tenant_instruction(
     base_provider: Callable[[ReadonlyContext], str],
+    note: Callable[[str], str] = tenant_note,
 ) -> Callable[[ReadonlyContext], str]:
     """Wrap an InstructionProvider so a tenant turn carries the scope block.
 
@@ -148,6 +206,6 @@ def tenant_instruction(
         base = base_provider(ctx)
         if tenant is None:
             return base
-        return f"{base}\n\n{tenant_note(tenant)}"
+        return f"{base}\n\n{note(tenant)}"
 
     return provider

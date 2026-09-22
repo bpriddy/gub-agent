@@ -29,6 +29,7 @@ from gub_agent.tenant import (
     read_tenant,
     tenant_instruction,
     tenant_note,
+    tenant_note_formatter,
 )
 
 
@@ -72,17 +73,65 @@ def test_tenant_appends_the_scope_block() -> None:
     assert "chevy" in out
 
 
-def test_the_block_names_no_client_and_claims_no_boundary() -> None:
+def test_the_block_names_no_client() -> None:
     """The engine is multi-company: the label is interpolated, never baked in.
-    And the block must not promise a restriction that does not exist — the
-    ruling is 'branded for, not restricted to', recorded as an accepted risk."""
+    A client name in this prompt is a client name in every tenant's prompt."""
     note = tenant_note("someclient")
 
     assert note.count("someclient") >= 3
     assert "chevy" not in note.lower()
     assert "anomaly" not in note.lower()
-    # It tells the model it is NOT restricted, rather than staying silent.
-    assert "not restricted" in note.lower()
+
+
+def test_the_block_no_longer_denies_the_boundary() -> None:
+    """tenant-10 reversed the ruling: the 📊 half IS restricted now, enforced
+    in the backend. The old text said the opposite in two places, and a model
+    told 'you are not restricted' will argue with its own tool results."""
+    note = tenant_note("someclient").lower()
+
+    assert "not restricted" not in note
+    assert "never say or imply that other accounts are hidden" not in note
+
+
+def test_the_block_binds_the_claim_to_the_evidence() -> None:
+    """Withheld records are described only when a tool result says so — which
+    keeps the instruction correct in BOTH enforcement modes, since 'log' mode
+    withholds nothing and emits no notice."""
+    note = tenant_note("someclient")
+
+    assert "account_scope_notice" in note
+    assert "does not exist" in note.lower() or "not exist" in note.lower()
+    # And it forbids the other wrong answer: blaming the user's own access.
+    assert "lacks access" in note.lower()
+
+
+def test_the_workspace_half_is_called_out_as_unscoped() -> None:
+    """The ✉️ half is not scoped and cannot be with today's machinery. A model
+    that thinks everything is scoped will describe mailbox results as limited."""
+    note = tenant_note("someclient").lower()
+
+    assert "not scoped" in note
+
+
+def test_the_formatter_block_is_its_own_and_narrower() -> None:
+    """The formatter is the ONLY model on fast-path, smalltalk, abstain and
+    clarify turns, so it needs the rule directly — but it sees no tool
+    results, so its job is to not lose a notice rather than to raise one."""
+    note = tenant_note_formatter("someclient")
+
+    assert "## Tenant surface" in note
+    assert "someclient" in note
+    assert "keep that line" in note.lower()
+    # The format-gate trap: a capitalised label in no tool result is an
+    # ungrounded entity and burns all three formatter attempts.
+    assert "do not add the surface's name" in note.lower()
+
+
+def test_the_formatter_block_is_opt_in_like_the_executor_one() -> None:
+    provider = tenant_instruction(lambda _ctx: "BASE", note=tenant_note_formatter)
+
+    assert provider(_ctx({"gub_jwt": "jwt"})) == "BASE"
+    assert "## Tenant surface" in provider(_ctx({"tenant": "someclient"}))
 
 
 def test_state_read_works_through_both_context_shapes() -> None:

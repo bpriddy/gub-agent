@@ -39,6 +39,7 @@ from ..instruction_utils import current_date_note
 from ..prompts import FORMATTER_INSTRUCTION
 from ..sandbox import FORMATTER_THINKING_LEVEL, sandbox_before_model, sandbox_instruction
 from ..schemas import AnswerPayload
+from ..tenant import tenant_instruction, tenant_note_formatter
 from .evidence_index import formatter_brief
 
 FORMATTER_NAME = "formatter"
@@ -74,7 +75,16 @@ formatter_agent = LlmAgent(
     name=FORMATTER_NAME,
     # Wrapped for the sandbox: state["sandbox"].formatter_instruction (or
     # .formatter_variant) replaces the prompt for that run only.
-    instruction=sandbox_instruction(_formatter_base_instruction, role="formatter"),
+    # Wrapped for tenancy OUTSIDE the sandbox wrapper, same as the executor —
+    # and necessary separately from it: on a fast-path, smalltalk, abstain or
+    # clarify turn this agent is the only model that runs, so a rule that
+    # lives only in the executor's instruction is missing from exactly the
+    # turns where the notice IS the answer. A turn with no state["tenant"]
+    # gets the inner text unchanged.
+    instruction=tenant_instruction(
+        sandbox_instruction(_formatter_base_instruction, role="formatter"),
+        note=tenant_note_formatter,
+    ),
     # LOW: it renders given text into a given schema — no retrieval, no
     # analysis worth a deliberation budget. (FORMATTER_THINKING_LEVEL, so the
     # sandbox provenance can't drift from what actually runs.)
