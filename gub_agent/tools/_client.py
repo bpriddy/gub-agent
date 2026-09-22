@@ -177,6 +177,66 @@ async def _exchange_google_token(google_access_token: str) -> str:
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 
+# ── Account scope (tenant-10) ─────────────────────────────────────────────────
+#
+# A tenant bot's GUB session is scoped to one account's records. When the
+# scope removes rows, the backend says so on the response — a header, because
+# several org endpoints answer with a bare JSON array and an array has nowhere
+# to put a field.
+#
+# That signal has to reach the model, and this is the ONE place all 11 tools
+# funnel through. Without it a filtered read is indistinguishable from an
+# empty one, and a model being truthful about what it got says "Budweiser has
+# no campaigns" — a claim about the world built from a fact about permissions,
+# and worse than a refusal.
+
+SCOPE_HEADER = "x-account-scope-filtered"
+
+ACCOUNT_SCOPE_NOTICE = (
+    "Some records matching this request are outside this assistant's account "
+    "scope and were not returned. Do NOT report them as non-existent and do "
+    "NOT tell the user they lack access: say that those records are not "
+    "available from this surface."
+)
+
+# Where to hang a filtered bare-array payload so the shape stays meaningful.
+# Only the first two can actually be filtered — staff and resourcing are
+# unscoped by ruling — but the map is complete so a future scope does not
+# silently fall back to a key nothing reads.
+_ARRAY_KEYS = {
+    "/org/search": "hits",
+    "/org/accounts": "accounts",
+    "/org/staff": "staff",
+    "/org/resourcing": "people",
+}
+
+
+def _array_key(path: str) -> str:
+    return _ARRAY_KEYS.get(path.split("?")[0].rstrip("/"), "results")
+
+
+def _with_scope_notice(payload: Any, resp: httpx.Response, path: str) -> Any:
+    """Attach the out-of-scope notice when the backend flagged filtering.
+
+    The key must not start with "_": underscore-prefixed keys are stripped
+    from the model's view by context pruning and skipped by the evidence
+    index, so a notice hidden behind one would be attached and never seen.
+
+    A bare array is wrapped rather than left alone — the evidence index
+    drops non-dict payloads entirely, so an array cannot carry a notice at
+    all. The wrapper key is the one that endpoint's readers already use.
+    """
+    if resp.headers.get(SCOPE_HEADER) != "1":
+        return payload
+
+    if isinstance(payload, dict):
+        payload["account_scope_notice"] = ACCOUNT_SCOPE_NOTICE
+        return payload
+    if isinstance(payload, list):
+        return {_array_key(path): payload, "account_scope_notice": ACCOUNT_SCOPE_NOTICE}
+    return payload
+
+
 async def gub_get(
     path: str,
     tool_context: Any | None = None,
@@ -199,7 +259,7 @@ async def gub_get(
             params=clean_params,
         )
         resp.raise_for_status()
-        return resp.json()
+        return _with_scope_notice(resp.json(), resp, path)
     except httpx.HTTPStatusError as exc:
         logger.warning("GUB GET %s returned %s", path, exc.response.status_code)
         return {
@@ -231,7 +291,7 @@ async def gub_post(
             json=body,
         )
         resp.raise_for_status()
-        return resp.json()
+        return _with_scope_notice(resp.json(), resp, path)
     except httpx.HTTPStatusError as exc:
         logger.warning("GUB POST %s returned %s", path, exc.response.status_code)
         return {
