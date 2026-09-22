@@ -121,7 +121,9 @@ def test_the_formatter_block_is_its_own_and_narrower() -> None:
 
     assert "## Tenant surface" in note
     assert "someclient" in note
-    assert "keep that line" in note.lower()
+    # It must NOT keep a scope sentence: the surface prepends exactly one,
+    # and a second reads as a stutter (four renderings on one live turn).
+    assert "do not add a sentence saying records were withheld" in note.lower()
     # The format-gate trap: a capitalised label in no tool result is an
     # ungrounded entity and burns all three formatter attempts.
     assert "do not add the surface's name" in note.lower()

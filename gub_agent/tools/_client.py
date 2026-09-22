@@ -194,9 +194,12 @@ SCOPE_HEADER = "x-account-scope-filtered"
 
 ACCOUNT_SCOPE_NOTICE = (
     "Some records matching this request are outside this assistant's account "
-    "scope and were not returned. Do NOT report them as non-existent and do "
-    "NOT tell the user they lack access: say that those records are not "
-    "available from this surface."
+    "scope and were not returned. Treat them as UNKNOWN to you: do not report "
+    "them as non-existent, do not say the user lacks access, and do not "
+    "invent them. Do NOT write a sentence about the scope either — the "
+    "surface tells the user that itself, in one line, and a second telling "
+    "reads as a stutter. If everything you would have answered from is "
+    "affected, abstain instead of writing a placeholder answer."
 )
 
 # Where to hang a filtered bare-array payload so the shape stays meaningful.
