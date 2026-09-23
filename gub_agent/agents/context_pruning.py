@@ -144,13 +144,40 @@ def strip_prior_turn_tool_parts(callback_context: Any, llm_request: Any) -> None
 # ── Conversation window (memory-00 §3) ───────────────────────────────────────
 
 
+# The opening words of ADK's foreign-agent context preamble.
+#
+# A PREFIX, not the whole string, because ADK has already reworded it once and
+# the wording is not a contract:
+#
+#   2.6.1  flows/llm_flows/contents.py — the first part is exactly
+#          "For context:".
+#   2.9.2  flows/llm_flows/_fencing.py — OTHER_AGENT_CONTEXT_PREAMBLE, which
+#          opens "For context: below is a transcript of what another agent
+#          did, quoted between <<<BEGIN_QUOTED_AGENT_CONTENT>>> and ..." and
+#          runs on for several sentences.
+#
+# `google-adk` is UNPINNED (pyproject: >=1.0.0), so CI and the deploy install
+# whatever is newest at build time — this repo has already been burned by that
+# once, when a rebuild flipped stream_query to camelCase and the bot's readers
+# went blind. An exact-equality check against 2.6.1's wording matched NOTHING
+# on 2.9.2, which would have shipped a window counting 40 boundaries where
+# there are 8 real turns.
+#
+# Prefix-matching also fails in the SAFE direction if it ever over-matches. A
+# false positive (a reader genuinely opening a message with "For context:")
+# drops one boundary, so `starts[-window]` moves EARLIER and the request keeps
+# MORE history — and the current turn survives regardless, because it sits
+# after the cut. A false negative inflates the count and cuts too late, which
+# is the failure that loses the user's question.
+_FOREIGN_CONTEXT_PREFIX = "For context:"
+
+
 def _is_foreign_context(content: Any) -> bool:
     """True for an ADK foreign-agent context content.
 
     ADK rewrites another agent's events into a role="user" content whose FIRST
-    part is exactly "For context:" (adk/flows/llm_flows/contents.py:1006-1007),
-    followed by "[author] said: ..." parts. Those satisfy _has_user_text but
-    they are NOT turn boundaries.
+    part is a "For context: ..." preamble, followed by "[author] said: ..."
+    parts. Those satisfy _has_user_text but they are NOT turn boundaries.
 
     This matters more here than in a single-agent app: the pipeline runs
     router, executor, critic, formatter and format gate, so ONE completed turn
@@ -167,7 +194,7 @@ def _is_foreign_context(content: Any) -> bool:
     parts = content.parts or []
     if not parts:
         return False
-    return (getattr(parts[0], "text", None) or "").strip() == "For context:"
+    return (getattr(parts[0], "text", None) or "").lstrip().startswith(_FOREIGN_CONTEXT_PREFIX)
 
 
 def _turn_starts(contents: list[Any]) -> list[int]:
@@ -236,11 +263,20 @@ def trim_to_recent_turns(callback_context: Any, llm_request: Any) -> None:
 
     # INFO so the effective window is measurable from Cloud Logging at zero
     # cost. `turns` is the REAL turn count — the number this change exists to
-    # get right, and the rollout gate: a count 4-7x higher than the
-    # conversation's real length means _is_foreign_context is not working.
+    # get right.
+    #
+    # `naive` is what the count would be WITHOUT _is_foreign_context, and it is
+    # here so the rollout gate diagnoses itself rather than asking a reader to
+    # know what "inflated" looks like. On this five-agent pipeline a healthy
+    # multi-turn request has naive several times turns; `naive == turns` on a
+    # conversation that has had more than one turn means the filter matched
+    # nothing — which is exactly what an ADK version bump did once already
+    # (2.9.2 reworded the preamble the filter keys on).
+    naive = sum(1 for c in contents if _has_user_text(c))
     logger.info(
-        "context_window: turns=%d window=%d kept=%d dropped=%d",
+        "context_window: turns=%d naive=%d window=%d kept=%d dropped=%d",
         len(starts),
+        naive,
         window,
         len(kept),
         len(contents) - len(kept),
