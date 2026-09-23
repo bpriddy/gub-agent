@@ -13,13 +13,26 @@ user message that carries real text). Prior answers' prose survives, so
 follow-ups still resolve ("what about the other campaign?"); the current
 turn's raw tool data is untouched, so synthesis-over-raw-data and the
 critic's grounding checks are unaffected.
+
+`trim_to_recent_turns` (memory-00 §3) is the second, coarser bound in the
+same place: a sliding window of the last CONTEXT_TURN_WINDOW real turns.
+The pruner above keeps a long conversation from carrying its tool
+payloads; the window keeps it from carrying every turn. Together they are
+what let the bot's 5-minute idle session reset be relaxed to a day —
+until one of them is live, that timer is the only thing bounding how much
+transcript a model round re-reads.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from google.genai import types as genai_types
+
+from ..config import CONTEXT_TURN_WINDOW
+
+logger = logging.getLogger(__name__)
 
 
 def _is_function_part(part: Any) -> bool:
@@ -125,4 +138,148 @@ def strip_prior_turn_tool_parts(callback_context: Any, llm_request: Any) -> None
         # A content that was ONLY tool payload disappears entirely.
 
     llm_request.contents = pruned
+    return None
+
+
+# ── Conversation window (memory-00 §3) ───────────────────────────────────────
+
+
+# The opening words of ADK's foreign-agent context preamble.
+#
+# A PREFIX, not the whole string, because ADK has already reworded it once and
+# the wording is not a contract:
+#
+#   2.6.1  flows/llm_flows/contents.py — the first part is exactly
+#          "For context:".
+#   2.9.2  flows/llm_flows/_fencing.py — OTHER_AGENT_CONTEXT_PREAMBLE, which
+#          opens "For context: below is a transcript of what another agent
+#          did, quoted between <<<BEGIN_QUOTED_AGENT_CONTENT>>> and ..." and
+#          runs on for several sentences.
+#
+# `google-adk` is UNPINNED (pyproject: >=1.0.0), so CI and the deploy install
+# whatever is newest at build time — this repo has already been burned by that
+# once, when a rebuild flipped stream_query to camelCase and the bot's readers
+# went blind. An exact-equality check against 2.6.1's wording matched NOTHING
+# on 2.9.2, which would have shipped a window counting 40 boundaries where
+# there are 8 real turns.
+#
+# Prefix-matching also fails in the SAFE direction if it ever over-matches. A
+# false positive (a reader genuinely opening a message with "For context:")
+# drops one boundary, so `starts[-window]` moves EARLIER and the request keeps
+# MORE history — and the current turn survives regardless, because it sits
+# after the cut. A false negative inflates the count and cuts too late, which
+# is the failure that loses the user's question.
+_FOREIGN_CONTEXT_PREFIX = "For context:"
+
+
+def _is_foreign_context(content: Any) -> bool:
+    """True for an ADK foreign-agent context content.
+
+    ADK rewrites another agent's events into a role="user" content whose FIRST
+    part is a "For context: ..." preamble, followed by "[author] said: ..."
+    parts. Those satisfy _has_user_text but they are NOT turn boundaries.
+
+    This matters more here than in a single-agent app: the pipeline runs
+    router, executor, critic, formatter and format gate, so ONE completed turn
+    emits several of these. Counting them inflates the turn count 4-7x and
+    silently shrinks the window to a fraction of CONTEXT_TURN_WINDOW — no
+    exception, no malformed request, just a model that can no longer resolve
+    "the other one".
+
+    A SUBTRACTIVE filter layered on _has_user_text rather than a second copy of
+    the "is this a real user message" rule: tool responses also arrive
+    role="user" (as function_response parts), and a second home for that rule
+    is the first thing to drift.
+    """
+    parts = content.parts or []
+    if not parts:
+        return False
+    return (getattr(parts[0], "text", None) or "").lstrip().startswith(_FOREIGN_CONTEXT_PREFIX)
+
+
+def _turn_starts(contents: list[Any]) -> list[int]:
+    """Indices of REAL user turns — the only indices it is safe to cut at."""
+    return [
+        i
+        for i, content in enumerate(contents)
+        if _has_user_text(content) and not _is_foreign_context(content)
+    ]
+
+
+def trim_to_recent_turns(callback_context: Any, llm_request: Any) -> None:
+    """Sliding window: show the model the last CONTEXT_TURN_WINDOW complete turns.
+
+    This is the bound that replaces the bot's 5-minute idle session reset. Once
+    a session lives as long as the conversation does, every model round of every
+    later turn re-reads the whole transcript; strip_prior_turn_tool_parts already
+    keeps that growth to prose rather than tool payloads, so it is a slow leak
+    and not a runaway — but it is unbounded, and input volume is the primary
+    cost driver on this workload.
+
+    A window, not a TTL, because time was never the thing that mattered: a
+    follow-up needs the last few exchanges ("the other campaign", "and Q3?"),
+    and that is equally true of a 30-second pause and an overnight one.
+
+    Per-request only. ADK rebuilds `contents` from the session's events on every
+    round, so nothing is destroyed: raising CONTEXT_TURN_WINDOW restores the
+    older turns on the very next call, and a badly chosen N is a config change
+    rather than a lost conversation. That is the decisive advantage over a
+    bot-owned truncated transcript.
+
+    Orphan safety — why there is no repair pass here. A message-counted window
+    can split a function_call from its function_response, which is not a smaller
+    request but an INVALID one (Gemini answers 400 INVALID_ARGUMENT, which
+    inside Agent Engine reaches the caller as an empty 200 stream). This design
+    cannot produce that, for two independent reasons: the cut is always AT a
+    turn boundary, and a call/response pair always lives between two consecutive
+    boundaries; and strip_prior_turn_tool_parts runs immediately after and
+    removes every pre-current-turn function part anyway. An earlier draft
+    specified a _drop_orphan_responses helper — it would be dead code in all
+    three chains as wired, and a later reader would trust it.
+    """
+    window = CONTEXT_TURN_WINDOW
+    if window <= 0:
+        return None  # explicitly disabled — the rollback, with no redeploy
+
+    contents = llm_request.contents or []
+    if not contents:
+        return None
+
+    starts = _turn_starts(contents)
+    if len(starts) <= window:
+        return None  # shorter than the window — no-op, and no copies made
+
+    # starts[-1] IS the current turn and cut <= starts[-1] for any window >= 1,
+    # so the current turn survives whole however much tool traffic it has
+    # accumulated: the window bounds HISTORY, never the work in progress.
+    cut = starts[-window]
+
+    # Anything before the FIRST real boundary is preamble, not a turn. With
+    # `instruction=` the system text rides in config.system_instruction and this
+    # slice is empty; an agent configured with `static_instruction` has ADK put
+    # instruction contents in `contents`, and those must keep leading the request.
+    preamble = contents[: starts[0]]
+    kept = preamble + contents[cut:]
+
+    # INFO so the effective window is measurable from Cloud Logging at zero
+    # cost. `turns` is the REAL turn count — the number this change exists to
+    # get right.
+    #
+    # `naive` is what the count would be WITHOUT _is_foreign_context, and it is
+    # here so the rollout gate diagnoses itself rather than asking a reader to
+    # know what "inflated" looks like. On this five-agent pipeline a healthy
+    # multi-turn request has naive several times turns; `naive == turns` on a
+    # conversation that has had more than one turn means the filter matched
+    # nothing — which is exactly what an ADK version bump did once already
+    # (2.9.2 reworded the preamble the filter keys on).
+    naive = sum(1 for c in contents if _has_user_text(c))
+    logger.info(
+        "context_window: turns=%d naive=%d window=%d kept=%d dropped=%d",
+        len(starts),
+        naive,
+        window,
+        len(kept),
+        len(contents) - len(kept),
+    )
+    llm_request.contents = kept
     return None

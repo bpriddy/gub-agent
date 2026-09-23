@@ -143,6 +143,24 @@ FAST_TIE_BAND: float = float(os.environ.get("FAST_TIE_BAND", "0.10"))
 # See the Anomaly workspace's task-specs/clarify-01-always-ask-when-unsure.md.
 ROUTER_CONFIDENCE_FLOOR: float = float(os.environ.get("ROUTER_CONFIDENCE_FLOOR", "0.70"))
 
+# ── Conversation window ──────────────────────────────────────────────────────
+# How many COMPLETE turns of transcript the model is shown, counted back from
+# and INCLUDING the current one (agents/context_pruning.py:trim_to_recent_turns).
+#
+# Counted in TURNS, never in messages: one Chat turn is 4-10 genai Content
+# objects (question -> function_call -> function_response -> ... -> answer), so
+# a message-counted window cuts a turn in half.
+#
+# This is what replaces the bot's 5-minute idle reset as the bound on context
+# growth (gub-gchat-bot threads.ts:IDLE_RESET_MS). 0 or negative disables it,
+# which is also the rollback: no code redeploy, just the variable.
+#
+# NOT per-run A/B-able. It is read from os.environ at import, so a sandbox run
+# cannot vary it; doing that means adding context_turn_window to
+# SandboxOverrides and reading it through _state_of(callback_context), the way
+# sandbox_before_model does. Separate change.
+CONTEXT_TURN_WINDOW: int = int(os.environ.get("CONTEXT_TURN_WINDOW", "5"))
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 

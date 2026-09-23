@@ -51,7 +51,17 @@ ROUTER_STATE_KEY = "router_decision"
 def _router_before_model(callback_context, llm_request):
     """Sandbox overrides first (model / router_thinking_level / temperature — a
     no-op without state["sandbox"]), then the same prior-turn pruning the
-    critic has always had."""
+    critic has always had.
+
+    The conversation window is DEFERRED here, not excluded (memory-00 §3.5).
+    The router does benefit from history — resolving "and Q3?" needs the
+    previous turn — but it is the agent most affected by boundary inflation,
+    so it is only windowed once the executor's `context_window:` log line has
+    confirmed the real turn count in production. When it is enabled it uses
+    the same function and the same config value. If the router's transcript
+    cost has to be cut sooner, the right instrument is a content filter rather
+    than a turn window: foreign-context contents older than the current turn
+    are pure text and carry no tool pairs, so dropping them is always safe."""
     sandbox_before_model(callback_context, llm_request, role="router")
     return strip_prior_turn_tool_parts(callback_context, llm_request)
 
