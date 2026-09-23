@@ -8,7 +8,29 @@ version = "0.1.0"
 description = "GUB AI Agent — ADK agent for agency operations on Vertex AI Agent Engine"
 requires-python = ">=3.11"
 dependencies = [
-    "google-adk>=1.0.0",
+    # PINNED EXACTLY, and it has to stay that way until an upgrade is tested.
+    #
+    # This agent reads ADK's internal wire and prompt shapes, and ADK changes
+    # them in patch-ish releases without a deprecation. Two silent production
+    # breakages have come from a floating version — both invisible, because
+    # neither raises anything:
+    #
+    #   * `stream_query` event keys flipped to camelCase on a rebuild, and the
+    #     bot's readers went blind (0 `_sources`) with no error anywhere.
+    #   * 2.9.2 moved foreign-agent context from `flows/llm_flows/contents.py`
+    #     to `flows/llm_flows/_fencing.py` and REWORDED the marker the
+    #     conversation window keys on, from exactly "For context:" to a long
+    #     preamble. `agents/context_pruning.py` counted 8 real turns as 40 and
+    #     would have windowed away the user's question. Caught by CI in
+    #     2026-09-23 only because CI installs a different version than the
+    #     local venv did.
+    #
+    # Upgrading is a deliberate change, not a side effect of a rebuild: bump
+    # this line, run the suite (tests/unit/test_context_window.py is the
+    # tripwire — it asserts ADK actually injected foreign context), and read
+    # `context_window: turns=… naive=…` after the deploy. `naive == turns` on a
+    # multi-turn request means a marker moved again.
+    "google-adk==2.9.2",
     "anthropic[vertex]>=0.43.0",
     "httpx[http2]>=0.27.0",
     "python-dotenv>=1.0.0",
