@@ -50,7 +50,11 @@ With no such key every override point is a no-op.
 from google.adk.agents import Agent, LoopAgent, SequentialAgent
 
 from .agents.circuit_breaker import circuit_breaker, reset_tool_budget
-from .agents.context_pruning import strip_prior_turn_tool_parts, strip_source_metadata
+from .agents.context_pruning import (
+    strip_prior_turn_tool_parts,
+    strip_source_metadata,
+    trim_to_recent_turns,
+)
 from .agents.critic import critic_gate, escalator_agent
 from .agents.dispatcher import Dispatcher
 from .agents.evidence_index import record_evidence, reset_evidence_index
@@ -87,15 +91,28 @@ def _before_agent(callback_context):
 
 def _before_model(callback_context, llm_request):
     """Chain the model-level guards: apply any sandbox overrides (model,
-    thinking, temperature), prune prior-turn tool payloads, mask `_sources`
-    citation plumbing from current-turn results, then cap ReAct rounds (strip
-    tools past the budget).
+    thinking, temperature), window the transcript to the last few turns, prune
+    prior-turn tool payloads, mask `_sources` citation plumbing from
+    current-turn results, then cap ReAct rounds (strip tools past the budget).
 
     Sandbox first, deliberately: it only writes `llm_request.model` and fields
     of `config`, while the round limiter may clear `config.tools` — neither can
     undo the other. With no `sandbox` key in state it is a no-op.
+
+    Two orderings after it are load-bearing (memory-00 §3.1):
+
+    * `trim_to_recent_turns` BEFORE `round_limit`, for CORRECTNESS. The round
+      limiter appends a role="user" text content ("Tool-call limit reached…")
+      that satisfies _has_user_text. A window running after it would read that
+      injection as the newest turn boundary and could cut away the user's
+      actual question on a synthesis round.
+    * `trim_to_recent_turns` BEFORE `strip_prior_turn_tool_parts`, for COST —
+      the pruner then rebuilds fewer Content objects. NOT for orphan safety:
+      the reverse order orphans nothing (§3.4), and justifying it that way
+      would send the next reader looking for a hazard that is not there.
     """
     sandbox_before_model(callback_context, llm_request, role="executor")
+    trim_to_recent_turns(callback_context, llm_request)
     strip_prior_turn_tool_parts(callback_context, llm_request)
     strip_source_metadata(callback_context, llm_request)
     return round_limit(callback_context, llm_request)

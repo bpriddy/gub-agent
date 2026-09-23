@@ -131,7 +131,15 @@ def _critic_instruction(ctx: ReadonlyContext) -> str:
 def _critic_before_model(callback_context, llm_request):
     """Chain the critic's model-level hooks: sandbox overrides first (model,
     critic thinking level, temperature — a no-op without state["sandbox"]),
-    then the prior-turn tool-payload pruning the critic has always had."""
+    then the prior-turn tool-payload pruning the critic has always had.
+
+    NO conversation window here, on purpose (memory-00 §3.5). The critic's
+    request is anchored on the CURRENT turn's draft, not on conversation
+    history: ADK feeds it the executor's work as foreign-context contents, so
+    with only two prior turns it already carries ~18 _has_user_text
+    boundaries. Even with _is_foreign_context filtering them out, a turn-count
+    window is the wrong instrument here — at N=5 it can cut INSIDE the current
+    turn and remove the user's question."""
     sandbox_before_model(callback_context, llm_request, role="critic")
     return strip_prior_turn_tool_parts(callback_context, llm_request)
 
