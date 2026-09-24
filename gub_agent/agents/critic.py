@@ -43,7 +43,11 @@ from ..sandbox import (
     sandbox_before_model,
     sandbox_instruction,
 )
-from .context_pruning import strip_prior_turn_tool_parts
+from .context_pruning import (
+    strip_prior_turn_tool_parts,
+    strip_prior_turn_tool_text,
+    trim_to_recent_turns,
+)
 
 
 class CriticVerdict(BaseModel):
@@ -94,8 +98,18 @@ def _executor_made_tool_call(ctx: ReadonlyContext) -> bool:
     The executor's tool calls are real events in the session — whether one was
     made is a FACT, not a judgement. We compute it here and hand it to the
     critic, instead of asking the LLM to read it off the transcript.
+
+    "This run" is THIS invocation, and the filter is what makes it so. Session
+    events are never trimmed, and a scan of all of them answered "yes" as soon
+    as ANY earlier turn had called a tool — which switched off the critic's
+    "you answered from memory" guard for the rest of the session. In a thread
+    that lives for 200 turns that is close to certain. Both executor passes of
+    one turn share an invocation id, so a retry still counts the first pass's
+    calls, as it always has.
     """
     for event in ctx.session.events:
+        if event.invocation_id != ctx.invocation_id:
+            continue
         if event.author != AGENT_NAME:
             continue
         parts = event.content.parts if event.content and event.content.parts else []
@@ -131,17 +145,27 @@ def _critic_instruction(ctx: ReadonlyContext) -> str:
 def _critic_before_model(callback_context, llm_request):
     """Chain the critic's model-level hooks: sandbox overrides first (model,
     critic thinking level, temperature — a no-op without state["sandbox"]),
-    then the prior-turn tool-payload pruning the critic has always had.
+    then the conversation window, then the prior-turn pruning.
 
-    NO conversation window here, on purpose (memory-00 §3.5). The critic's
-    request is anchored on the CURRENT turn's draft, not on conversation
-    history: ADK feeds it the executor's work as foreign-context contents, so
-    with only two prior turns it already carries ~18 _has_user_text
-    boundaries. Even with _is_foreign_context filtering them out, a turn-count
-    window is the wrong instrument here — at N=5 it can cut INSIDE the current
-    turn and remove the user's question."""
+    memory-00 §3.5 left the critic unwindowed on purpose, and its reason was
+    right for the counter it had in mind: ADK feeds the critic the executor's
+    work as foreign-context contents, so with two prior turns its request
+    already carries ~18 _has_user_text boundaries, and a window counting THOSE
+    at N=5 would cut inside the current turn and remove the user's question.
+    The window never counted them — `_turn_starts` excludes foreign context —
+    so the cut lands at or before the current question, and every tool result
+    of THIS turn survives: the evidence the critic exists to judge. Pinned by
+    tests/unit/test_router_critic_context.py against ADK's own content builder.
+
+    It has to be windowed now. A thread keeps up to 200 turns, and the critic
+    re-read every one of them — including, until `strip_prior_turn_tool_text`,
+    every earlier turn's full tool results, which ADK hands it as text that
+    `strip_prior_turn_tool_parts` cannot see. The critic judges this turn; the
+    earlier turns' payloads were only ever cost."""
     sandbox_before_model(callback_context, llm_request, role="critic")
-    return strip_prior_turn_tool_parts(callback_context, llm_request)
+    trim_to_recent_turns(callback_context, llm_request, role="critic")
+    strip_prior_turn_tool_parts(callback_context, llm_request)
+    return strip_prior_turn_tool_text(callback_context, llm_request)
 
 
 critic_agent = LlmAgent(
@@ -166,15 +190,29 @@ critic_agent = LlmAgent(
     planner=build_thinking_planner(thinking_level=CRITIC_THINKING_LEVEL),
     output_schema=CriticVerdict,
     output_key="critic_verdict",
-    # Same pruning as the executor: the critic verifies THIS turn's grounding
-    # against THIS turn's tool results — prior turns' payloads are noise.
+    # Same bounds as the executor — the per-session window, then prior-turn
+    # pruning: the critic verifies THIS turn's grounding against THIS turn's
+    # tool results — prior turns' payloads are noise.
     before_model_callback=_critic_before_model,
 )
 
 
 def _last_executor_text(ctx: InvocationContext) -> str:
-    """The executor's most recent visible response text (thoughts excluded)."""
+    """The executor's most recent visible response text (thoughts excluded),
+    from THIS invocation.
+
+    Unfiltered, a turn whose executor produced no text — the run died inside
+    the engine — read the PREVIOUS turn's answer instead. Two callers act on
+    that: the format gate would format and ship the earlier answer as this
+    turn's (its own comment says an empty draft must emit nothing, "so the
+    trace shows the failure instead of a fabricated answer"), and CriticGate
+    would skip the critic whenever that earlier answer happened to be a
+    NO_COMPANY_RECORDS abstention. Both got likelier with every turn a session
+    lives, and a thread lives long.
+    """
     for event in reversed(ctx.session.events):
+        if event.invocation_id != ctx.invocation_id:
+            continue
         if event.author != AGENT_NAME:
             continue
         parts = event.content.parts if event.content and event.content.parts else []

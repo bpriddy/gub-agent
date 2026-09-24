@@ -92,7 +92,8 @@ def _before_agent(callback_context):
 
 def _before_model(callback_context, llm_request):
     """Chain the model-level guards: apply any sandbox overrides (model,
-    thinking, temperature), window the transcript to the last few turns, prune
+    thinking, temperature), window the transcript to the session's last N
+    turns (N from state["context_turn_window"], else CONTEXT_TURN_WINDOW), prune
     prior-turn tool payloads, mask `_sources` citation plumbing from
     current-turn results, withhold the file-search tool on non-file turns, then
     cap ReAct rounds (strip tools past the budget).
@@ -127,7 +128,7 @@ def _before_model(callback_context, llm_request):
       direction only.
     """
     sandbox_before_model(callback_context, llm_request, role="executor")
-    trim_to_recent_turns(callback_context, llm_request)
+    trim_to_recent_turns(callback_context, llm_request, role="executor")
     strip_prior_turn_tool_parts(callback_context, llm_request)
     strip_source_metadata(callback_context, llm_request)
     tool_gate(callback_context, llm_request)

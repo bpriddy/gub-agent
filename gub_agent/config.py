@@ -153,13 +153,25 @@ ROUTER_CONFIDENCE_FLOOR: float = float(os.environ.get("ROUTER_CONFIDENCE_FLOOR",
 #
 # This is what replaces the bot's 5-minute idle reset as the bound on context
 # growth (gub-gchat-bot threads.ts:IDLE_RESET_MS). 0 or negative disables it,
-# which is also the rollback: no code redeploy, just the variable.
+# which is also the rollback: no code redeploy, just the variable — and it
+# wins over any per-session value, or it would roll back nothing.
 #
-# NOT per-run A/B-able. It is read from os.environ at import, so a sandbox run
-# cannot vary it; doing that means adding context_turn_window to
-# SandboxOverrides and reading it through _state_of(callback_context), the way
-# sandbox_before_model does. Separate change.
-CONTEXT_TURN_WINDOW: int = int(os.environ.get("CONTEXT_TURN_WINDOW", "5"))
+# PER SESSION since thread-topics. The bot writes `context_turn_window` into
+# session state — 10 for the main DM stream, 200 for a thread — and the
+# executor, router and critic all read it per request
+# (context_pruning.resolve_turn_window). This value is the DEFAULT, for every
+# session that carries no key: the Chevy tenant bot (a pre-memory-00 image on
+# this same engine), gub-sandbox-ui, the /blend harness, and any bot session
+# created before the key existed until its next turn pushes it. So the default
+# is a finite window and must never become "unlimited": those callers would
+# inherit it with no way to opt out. 10, matching the main stream, so an
+# unlabelled caller behaves like a top-level conversation.
+#
+# Per-run A/B follows from the same thing: a sandbox run varies the window by
+# creating its session with `state={"context_turn_window": N}` — no
+# SandboxOverrides field, and it works on the production engine too, where
+# `state["sandbox"]` is ignored.
+CONTEXT_TURN_WINDOW: int = int(os.environ.get("CONTEXT_TURN_WINDOW", "10"))
 
 # ── File search (search-01) ──────────────────────────────────────────────────
 # Master switch for the Drive file-NAME search tool. OFF is exactly today's

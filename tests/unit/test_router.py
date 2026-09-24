@@ -152,6 +152,27 @@ async def test_no_decision_at_all_becomes_the_deep_path():
     assert decision_from(ctx) == FALLBACK_DECISION
 
 
+async def test_an_earlier_turns_router_event_is_never_this_turns_decision():
+    """Session events are never trimmed, and a thread keeps up to 200 turns.
+    When this turn's router left nothing readable, the newest-first fallback
+    used to walk back into an earlier turn and return ITS decision — a fast
+    path against the previous question's entity. Absent means the deep path."""
+    earlier = Event(
+        invocation_id="inv-earlier",
+        author="router",
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part(text=json.dumps(_decision_dict()))]
+        ),
+    )
+    ctx = await invocation_ctx(events=[earlier], invocation_id=INV)
+    assert decision_from(ctx) == FALLBACK_DECISION
+
+    # This turn's own event still wins over an earlier one.
+    now = _router_event(json.dumps(_decision_dict(intent="campaign_facts")))
+    ctx_now = await invocation_ctx(events=[earlier, now], invocation_id=INV)
+    assert decision_from(ctx_now).intent == "campaign_facts"
+
+
 # ── the question ──────────────────────────────────────────────────────────────
 
 

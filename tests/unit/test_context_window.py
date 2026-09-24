@@ -19,6 +19,7 @@ encode that bug instead of catching it.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,13 +27,17 @@ from google.adk.events import Event
 from google.adk.flows.llm_flows.contents import _get_contents
 from google.genai import types as genai_types
 
+from gub_agent import config
 from gub_agent.agents import context_pruning
 from gub_agent.agents.context_pruning import (
+    WINDOW_STATE_KEY,
     _is_foreign_context,
     _turn_starts,
+    resolve_turn_window,
     strip_prior_turn_tool_parts,
     trim_to_recent_turns,
 )
+from tests.helpers import invocation_ctx
 
 INV = "inv-1"
 AGENT = "gub_agent"
@@ -384,3 +389,201 @@ def test_no_function_response_outlives_its_call_through_the_chain():
         if getattr(p, "function_response", None) is not None
     ]
     assert sorted(calls) == sorted(responses)
+
+
+# ── the per-session window (thread-topics) ───────────────────────────────────
+#
+# The bot writes `context_turn_window` into session state — 10 for the main DM
+# stream, 200 for a thread — and CONTEXT_TURN_WINDOW is only the default for a
+# session without one. Every test above passes `callback_context=None`, which
+# must keep meaning "the default", read from the module at call time.
+
+
+def _cb(state: dict | None = None, invocation_id: str = INV) -> SimpleNamespace:
+    """A CallbackContext stand-in: `.state` is what ADK's CallbackContext and
+    ReadonlyContext expose (tenant._state_of reads it first)."""
+    return SimpleNamespace(state=state if state is not None else {}, invocation_id=invocation_id)
+
+
+def test_the_shipped_default_is_ten_and_finite():
+    """The default reaches every caller that sends no window — the Chevy
+    tenant bot's pre-memory-00 image on the SAME production engine,
+    gub-sandbox-ui, the /blend harness. It must never be "unlimited" (<= 0),
+    and it is 10 so an unlabelled caller behaves like a top-level
+    conversation. Read from the source, not the imported value, so a local
+    CONTEXT_TURN_WINDOW in the environment cannot make this pass or fail."""
+    text = Path(config.__file__).read_text()
+    assert 'os.environ.get("CONTEXT_TURN_WINDOW", "10")' in text
+
+
+def test_the_state_key_is_the_one_the_bot_writes():
+    # Pinned cross-repo: gub-gchat-bot writes exactly this name.
+    assert WINDOW_STATE_KEY == "context_turn_window"
+
+
+def test_a_state_window_replaces_the_default():
+    req = _request(_plain_turns(8))
+    trim_to_recent_turns(_cb({WINDOW_STATE_KEY: 2}), req)
+    assert _texts(req.contents) == ["q6", "a6", "q7", "a7"]
+
+
+def test_a_state_window_wider_than_the_default_keeps_everything():
+    # A thread: 200 in state, 5 in the env. Eight turns fit — and a no-op is
+    # still an identity, not a rebuilt list.
+    contents = _plain_turns(8)
+    req = _request(contents)
+    trim_to_recent_turns(_cb({WINDOW_STATE_KEY: 200}), req)
+    assert req.contents is contents
+
+
+def test_an_absent_key_falls_back_to_the_default():
+    assert resolve_turn_window(_cb({})) == (5, "env")
+    assert resolve_turn_window(_cb({"tenant": "chevy"})) == (5, "env")
+    assert resolve_turn_window(None) == (5, "env")
+
+
+def test_the_default_is_read_at_call_time(monkeypatch):
+    # The module constant, not a value captured at definition: tests (and any
+    # future hot-reload) monkeypatch it.
+    monkeypatch.setattr(context_pruning, "CONTEXT_TURN_WINDOW", 3)
+    assert resolve_turn_window(None) == (3, "env")
+    req = _request(_plain_turns(8))
+    trim_to_recent_turns(None, req)
+    assert len(_turn_starts(req.contents)) == 3
+
+
+def test_invocation_context_state_is_read_too():
+    # InvocationContext and the test fakes carry state on `.session`.
+    ctx = SimpleNamespace(session=SimpleNamespace(state={WINDOW_STATE_KEY: 4}))
+    assert resolve_turn_window(ctx) == (4, "state")
+
+
+async def test_a_real_adk_callback_context_is_read():
+    """ADK's CallbackContext exposes a `State` object, not a dict — a fake
+    cannot catch a `.get` that behaves differently on it."""
+    from google.adk.agents.callback_context import CallbackContext
+
+    ctx = await invocation_ctx(state={WINDOW_STATE_KEY: 2})
+    assert resolve_turn_window(CallbackContext(ctx)) == (2, "state")
+
+
+def test_zero_in_state_disables_the_window_for_that_session():
+    """0 keeps its old meaning, "disabled" — the rollback, never a sentinel
+    for "unlimited"."""
+    contents = _plain_turns(20)
+    req = _request(contents)
+    trim_to_recent_turns(_cb({WINDOW_STATE_KEY: 0}), req)
+    assert req.contents is contents
+
+
+def test_the_env_rollback_beats_a_state_window(monkeypatch):
+    """CONTEXT_TURN_WINDOW=0 is the operator's rollback. Every bot session
+    carries a window in state, so a rollback that state could outvote would
+    roll back nothing for exactly the traffic it was pulled for."""
+    for value in (0, -1):
+        monkeypatch.setattr(context_pruning, "CONTEXT_TURN_WINDOW", value)
+        assert resolve_turn_window(_cb({WINDOW_STATE_KEY: 2})) == (value, "env")
+        contents = _plain_turns(20)
+        req = _request(contents)
+        trim_to_recent_turns(_cb({WINDOW_STATE_KEY: 2}), req)
+        assert req.contents is contents
+
+
+def test_an_integral_float_is_the_int_the_bot_sent():
+    # State crosses a protobuf Struct in the Vertex session store, and a
+    # Struct's only number type is double: the bot's 200 may come back 200.0.
+    assert resolve_turn_window(_cb({WINDOW_STATE_KEY: 200.0})) == (200, "state")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [-1, -200, "10", "200", True, False, 10.5, float("nan"), [10], {"n": 10}],
+    ids=repr,
+)
+def test_an_unusable_state_value_falls_back_and_is_logged(bad, caplog):
+    """Not trusted blindly: a negative, a string, a bool (True would be a
+    one-turn window), a fraction. Each means the bot and the engine disagree
+    about the contract, and the known-safe default beats a guess."""
+    with caplog.at_level("WARNING", logger="gub_agent.agents.context_pruning"):
+        assert resolve_turn_window(_cb({WINDOW_STATE_KEY: bad, "tenant": "chevy"})) == (5, "env")
+    assert "turn_window: ignored state[context_turn_window]" in caplog.text
+    assert "tenant=chevy" in caplog.text
+
+    req = _request(_plain_turns(8))
+    trim_to_recent_turns(_cb({WINDOW_STATE_KEY: bad}), req)
+    assert len(_turn_starts(req.contents)) == 5
+
+
+def test_a_state_that_is_not_a_mapping_is_the_default():
+    # `_state_of` hands back whatever `.state` is; one without `.get` must not
+    # throw on a model round.
+    assert resolve_turn_window(SimpleNamespace(state=42)) == (5, "env")
+
+
+# ── the per-call log line ────────────────────────────────────────────────────
+
+
+def _turn_window_line(text: str) -> str:
+    lines = [ln for ln in text.splitlines() if "turn_window: agent=" in ln]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def test_every_call_logs_the_window_even_when_nothing_is_cut(caplog):
+    """The executor-only `context_window:` line fires only on a cut, so a
+    thread (200, rarely reached) would never appear in it. This one fires on
+    every windowed call, with where the window came from and whose traffic it
+    is."""
+    with caplog.at_level("INFO", logger="gub_agent.agents.context_pruning"):
+        trim_to_recent_turns(_cb({WINDOW_STATE_KEY: 200}), _request(_plain_turns(3)))
+    line = _turn_window_line(caplog.text)
+    for field in (
+        "agent=executor",
+        "window=200",
+        "source=state",
+        "turns=3",
+        "kept=6",
+        "dropped=0",
+        "(inv=inv-1)",
+    ):
+        assert field in line, field
+    # tenant= LAST, the way the dispatcher line carries it — and the original
+    # bot's traffic is labelled, not blank.
+    assert line.endswith("tenant=anomaly")
+    assert "context_window: turns=" not in caplog.text
+
+
+def test_the_log_line_carries_the_tenant_and_the_env_source(caplog):
+    with caplog.at_level("INFO", logger="gub_agent.agents.context_pruning"):
+        trim_to_recent_turns(_cb({"tenant": "chevy"}), _request(_plain_turns(8)))
+    line = _turn_window_line(caplog.text)
+    assert "window=5 source=env turns=8" in line
+    assert "dropped=6" in line
+    assert line.endswith("tenant=chevy")
+
+
+def test_a_disabled_window_is_still_logged(caplog, monkeypatch):
+    monkeypatch.setattr(context_pruning, "CONTEXT_TURN_WINDOW", 0)
+    with caplog.at_level("INFO", logger="gub_agent.agents.context_pruning"):
+        trim_to_recent_turns(None, _request(_plain_turns(4)))
+    line = _turn_window_line(caplog.text)
+    assert "window=0 source=env turns=4" in line and "(inv=-)" in line
+
+
+def test_the_rollout_line_stays_executor_only(caplog):
+    """`context_window: turns=…` is read and counted by existing log queries,
+    and until thread-topics only the executor could emit it. The router and
+    the critic are windowed now; they must not start emitting it, or an
+    existing count changes meaning without a character of it changing."""
+    with caplog.at_level("INFO", logger="gub_agent.agents.context_pruning"):
+        for role in ("router", "critic"):
+            trim_to_recent_turns(_cb(), _request(_plain_turns(8)), role=role)
+    assert "context_window:" not in caplog.text
+    assert "turn_window: agent=router" in caplog.text
+    assert "turn_window: agent=critic" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="gub_agent.agents.context_pruning"):
+        trim_to_recent_turns(_cb(), _request(_plain_turns(8)))
+    # Byte for byte what memory-00 shipped.
+    assert "context_window: turns=8 naive=8 window=5 kept=10 dropped=6" in caplog.text
