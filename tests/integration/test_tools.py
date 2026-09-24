@@ -127,3 +127,58 @@ async def test_find_files_omits_an_unset_account_scope(gub):
     targets = [t for m, t in gub.targets if m == "GET"]
     assert "accountId" not in targets[0]
     assert "accountId=a1" in targets[1]
+
+
+# ── find_files grounding hint ─────────────────────────────────────────────────
+# `query` is what the model distilled the question into; `ground` is what the
+# person actually said. The backend scores candidate names against BOTH, which
+# is the only thing that catches a distilled query matching an unrelated file
+# (measured on the sandbox engine 2026-09-24).
+
+
+class _Part:
+    def __init__(self, text):
+        self.text = text
+
+
+class _Content:
+    def __init__(self, *texts):
+        self.parts = [_Part(t) for t in texts]
+
+
+def _query_string(gub) -> str:
+    return gub.targets[-1][1]
+
+
+async def test_find_files_sends_the_users_own_words_as_ground(gub):
+    gub.routes[("GET", "/org/files/search")] = (200, [])
+    ctx = FakeToolContext()
+    ctx.user_content = _Content("the final OnStar pitch pre-read doc")
+
+    await find_files("OnStar pitch pre-read", tool_context=ctx)
+
+    target = _query_string(gub)
+    assert "ground=" in target
+    # The RAW phrase, not the distilled one: "final" survives only in `ground`.
+    assert "final" in target
+
+
+async def test_find_files_omits_ground_when_the_turn_has_no_text(gub):
+    """Losing the hint costs the CHECK, never the search — gub_get drops None
+    params and the backend then scores the query against itself."""
+    gub.routes[("GET", "/org/files/search")] = (200, [])
+    ctx = FakeToolContext()
+    ctx.user_content = None
+
+    await find_files("BHAC teaser", tool_context=ctx)
+
+    assert "ground=" not in _query_string(gub)
+
+
+async def test_find_files_survives_an_odd_user_content_shape(gub):
+    """A content object with no parts must not take the search down with it."""
+    gub.routes[("GET", "/org/files/search")] = (200, [])
+    ctx = FakeToolContext()
+    ctx.user_content = object()
+
+    assert await find_files("BHAC teaser", tool_context=ctx) == {"files": []}

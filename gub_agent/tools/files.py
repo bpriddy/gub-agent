@@ -26,6 +26,30 @@ from typing import Any
 from ._client import gub_get
 
 
+def _asked(tool_context: Any) -> str | None:
+    """The user's own words for this turn, for the backend's grounding check.
+
+    `query` is whatever the model distilled the question into, and distilling is
+    what defeats the similarity floor: measured 2026-09-24, "final OnStar pitch
+    pre-read doc" matches nothing, while the model's "OnStar pitch pre-read"
+    matched an unrelated file that was then reported as found. The backend
+    scores each candidate name against THIS text as well, so a file the question
+    does not account for is dropped before the model ever sees it.
+
+    Best-effort by design: ADK exposes `user_content` on the tool context
+    (ReadonlyContext), but a missing or oddly-shaped content object must cost
+    the CHECK, never the search — the backend treats an absent value as "score
+    against the query itself", which passes everything.
+    """
+    try:
+        content = getattr(tool_context, "user_content", None)
+        parts = getattr(content, "parts", None) or []
+        text = " ".join(p.text for p in parts if getattr(p, "text", None)).strip()
+        return text or None
+    except Exception:  # noqa: BLE001 - never fail a search over the grounding hint
+        return None
+
+
 # The docstring below deliberately does NOT tell the model to SAY "we could not
 # find it by name". That sentence was in all three prompts (here, the executor
 # and the critic) and it is undeliverable: an empty result leaves the turn with
@@ -77,10 +101,12 @@ async def find_files(
 
     Returns:
         dict with a `files` list, each { fileId, name, mimeType, accountId,
-        campaignId, modifiedTime, similarity, coverage }. `coverage` is the
+        campaignId, modifiedTime, path, similarity, coverage, grounding }. `coverage` is the
         share of the query's distinctive words the name carries, `similarity`
-        the raw trigram score; the list is already ranked and already filtered,
-        so the top entries are the answer — do not re-rank it yourself.
+        the raw trigram score, and `path` is the folder the file sits in — say
+        it when two hits look alike, it is usually what tells them apart. The
+        list is already ranked and already filtered, so the top entries are the
+        answer — do not re-rank it yourself.
         AN EMPTY LIST MEANS THE FILE WAS NOT FOUND BY NAME, WHICH IS NOT THE
         SAME AS THE FILE NOT EXISTING. Name no file and offer no near-match as
         a substitute. An empty list is also no evidence, so the turn has
@@ -88,7 +114,13 @@ async def find_files(
         only index names, and a separate system searches the user's own
         Workspace by CONTENT and may well find this one.
     """
-    hits = await gub_get("/org/files/search", tool_context, q=query, accountId=account_id)
+    hits = await gub_get(
+        "/org/files/search",
+        tool_context,
+        q=query,
+        accountId=account_id,
+        ground=_asked(tool_context),
+    )
 
     # An error keeps the shape every other tool's failures have — the model is
     # already taught to read `{"error": true, message}`, and dressing it up as
