@@ -153,6 +153,23 @@ async def test_production_deploy_declares_emit_thinking_explicitly():
     )
 
 
+async def test_both_deploy_envs_declare_the_file_search_flag():
+    """search-01's kill switch, stated rather than defaulted — in BOTH files.
+
+    Its value is a rollout decision (the rollout enables it only after the GUB
+    it calls has FILE_SEARCH on, because a disabled backend answers `200 []`
+    and the tool reads that as "no such file"), so this pins the DECLARATION,
+    not the setting: an operator turning it on should be editing a line that is
+    already in front of them, and a reader should not have to open config.py to
+    learn which way an engine is running.
+    """
+    for path in (_prod_env_file(), _sandbox_env_file()):
+        assert "FILE_SEARCH_ENABLED" in _env(path), (
+            f"{path.name}: keep FILE_SEARCH_ENABLED explicit — it is the kill "
+            "switch for the file-search tool, and its default is off"
+        )
+
+
 async def test_production_deploy_verifies_the_env_landed():
     """A deploy that cannot fail on a skipped env file will hide the next one."""
     text = DEPLOY_WORKFLOW.read_text()

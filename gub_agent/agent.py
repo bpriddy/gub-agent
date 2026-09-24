@@ -62,6 +62,7 @@ from .agents.fast_path import fast_path
 from .agents.format_gate import format_gate
 from .agents.round_limiter import reset_rounds, round_limit
 from .agents.router import router_agent
+from .agents.tool_gate import tool_gate
 from .config import AGENT_NAME, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
 from .prompts import EXECUTOR_INSTRUCTION
@@ -93,7 +94,8 @@ def _before_model(callback_context, llm_request):
     """Chain the model-level guards: apply any sandbox overrides (model,
     thinking, temperature), window the transcript to the last few turns, prune
     prior-turn tool payloads, mask `_sources` citation plumbing from
-    current-turn results, then cap ReAct rounds (strip tools past the budget).
+    current-turn results, withhold the file-search tool on non-file turns, then
+    cap ReAct rounds (strip tools past the budget).
 
     Sandbox first, deliberately: it only writes `llm_request.model` and fields
     of `config`, while the round limiter may clear `config.tools` — neither can
@@ -110,11 +112,25 @@ def _before_model(callback_context, llm_request):
       the pruner then rebuilds fewer Content objects. NOT for orphan safety:
       the reverse order orphans nothing (§3.4), and justifying it that way
       would send the next reader looking for a hazard that is not there.
+
+    And one more since search-01:
+
+    * `tool_gate` BEFORE `round_limit`, which stays LAST. The limiter's whole
+      job past the budget is to empty `config.tools` so the model cannot call
+      anything; a gate running after it would be rewriting a list the limiter
+      had deliberately cleared. Today that is merely pointless — filtering an
+      empty list removes nothing — but the invariant worth keeping is that
+      NOTHING writes `config.tools` after the limiter has cleared it, because
+      the next gate written here may well rebuild the list rather than filter
+      it, and would hand back a declaration the limiter had just taken away.
+      Withholding one tool and withdrawing all of them compose in one
+      direction only.
     """
     sandbox_before_model(callback_context, llm_request, role="executor")
     trim_to_recent_turns(callback_context, llm_request)
     strip_prior_turn_tool_parts(callback_context, llm_request)
     strip_source_metadata(callback_context, llm_request)
+    tool_gate(callback_context, llm_request)
     return round_limit(callback_context, llm_request)
 
 
@@ -146,7 +162,8 @@ executor_agent = Agent(
     # Reset the per-pass round + tool budgets at the start of each executor pass
     # (so critic-requested retries aren't born over budget). See _before_agent.
     before_agent_callback=_before_agent,
-    # Prune prior-turn tool payloads + cap ReAct rounds (context_pruning.py,
+    # Prune prior-turn tool payloads, withhold `find_files` off file-shaped
+    # turns, cap ReAct rounds (context_pruning.py, tool_gate.py,
     # round_limiter.py) — the round cap forces synthesis instead of endless fan-out.
     before_model_callback=_before_model,
     # Dedupe repeated calls + per-turn tool budget (circuit_breaker.py) —

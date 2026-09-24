@@ -35,6 +35,15 @@ You never answer the question and you never retrieve anything.
                      staff or pieces
   assessment       — a verdict or judgement is being asked for
   exploratory      — open-ended, several entities, or "what should we do"
+  file_lookup      — WHICH FILE: the user is after a specific file and
+                     describes it — its name, what it is called, where to
+                     find it ("the BHAC 30 second teaser", "the Silverado HD
+                     brief", "do we have the ACI jpg"). The give-away is that
+                     the file itself is the answer. A question about what a
+                     document SAYS or CONTAINS is NOT this — we index file
+                     names, not their text, so "what does the OnStar pre-read
+                     say" is exploratory. Files the user owns personally
+                     ("the deck I made yesterday") stay workspace_personal.
   market_enrichment— outside-world information about a brand or market
   workspace_personal — the user's OWN mail, chats or files ("мои письма",
                      "my inbox", "письмо от вчера"). A cross-cutting question
@@ -114,5 +123,9 @@ Examples:
 "whats new?" → exploratory, 0.85 — the company, not the assistant
 "hi, what's new?" → exploratory, 0.8 — the greeting is not the question
 "что нового?" → exploratory, 0.85, language ru
+"do we have the BHAC 30 second teaser?" → file_lookup, 0.9,
+    "BHAC 30 second teaser" — the file IS the answer
+"what does the OnStar pre-read say?" → exploratory, 0.8 — asks for the
+    CONTENTS of a document, not which file it is
 "how is it going?" → exploratory, 0.7 — ambiguous, but it asks about the work
 """.strip()

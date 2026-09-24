@@ -67,6 +67,12 @@ logger = logging.getLogger(__name__)
 # clarification there would ask the user to choose between "explore this" and
 # "explore this". Blend 04's edge table requires exactly this: a schema-invalid
 # router output must reach the deep path, not a question.
+#
+# `file_lookup` (search-01) is absent for a different reason: it does not steer
+# a branch at all, it only decides whether the executor is offered `find_files`
+# (`agents/tool_gate.py`). Offering the user "did you mean: which file?" would
+# put a card in front of a question that is already going to be answered the
+# same way either way.
 CLARIFIABLE_INTENTS = FAST_INTENTS | {"assessment", "market_enrichment"}
 
 # The five branches, as returned by `choose`.

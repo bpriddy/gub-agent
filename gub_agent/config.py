@@ -161,6 +161,29 @@ ROUTER_CONFIDENCE_FLOOR: float = float(os.environ.get("ROUTER_CONFIDENCE_FLOOR",
 # sandbox_before_model does. Separate change.
 CONTEXT_TURN_WINDOW: int = int(os.environ.get("CONTEXT_TURN_WINDOW", "5"))
 
+# ── File search (search-01) ──────────────────────────────────────────────────
+# Master switch for the Drive file-NAME search tool. OFF is exactly today's
+# behaviour: `agents/tool_gate.py` withholds `find_files` from every turn, so
+# the model is never offered it and can never call it.
+#
+# It exists because the three services deploy independently and GUB's own
+# `FILE_SEARCH` flag defaults to off — and while it is off `/org/files/search`
+# answers `200 []`, which is indistinguishable from a genuine miss. An engine
+# deployed ahead of its backend would therefore report a file GUB DOES hold as
+# "not found by name": a confident false statement produced by an env var, with
+# nothing in the response to warn the model. A switch on this side makes the
+# deploy order safe in either direction — turn this on only once the backend
+# this engine calls has FILE_SEARCH on.
+#
+# Set explicitly in both deploy env files (the same reasoning as
+# SANDBOX_ENABLED): it is the rollback, and an operator under pressure should
+# be editing a line that is already in front of them.
+FILE_SEARCH_ENABLED: bool = os.environ.get("FILE_SEARCH_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 

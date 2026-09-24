@@ -22,16 +22,26 @@ from google.genai import types as genai_types
 
 
 class MockGub:
-    """Keep-alive HTTP server; (method, path) -> (status, json payload).
+    """Keep-alive HTTP server; (method, path) -> (status, json payload) with an
+    optional third slot of extra response headers.
+
+    The payload is whatever GUB answers with, NOT necessarily a dict: several
+    org endpoints answer with a bare JSON array. The header slot exists for the
+    signals the client reads off the response rather than the body — today the
+    tenant-10 `x-account-scope-filtered` flag, which is the only way to
+    exercise the bare-array wrapping end to end.
 
     `connections` counts TCP connections (for pooling assertions);
-    `requests` records every (method, path) hit (for call-count assertions).
+    `requests` records every (method, path) hit (for call-count assertions);
+    `targets` records the same hits with the query string still attached, for
+    the assertions that are about what was SENT rather than how often.
     """
 
     def __init__(self) -> None:
-        self.routes: dict[tuple[str, str], tuple[int, dict]] = {}
+        self.routes: dict[tuple[str, str], tuple] = {}
         self.connections = 0
         self.requests: list[tuple[str, str]] = []
+        self.targets: list[tuple[str, str]] = []
         self._server: asyncio.Server | None = None
         self.port: int | None = None
 
@@ -60,14 +70,19 @@ class MockGub:
                     await reader.readexactly(content_length)
 
                 self.requests.append((method, path))
-                status, payload = self.routes.get((method, path), (404, {"detail": "not found"}))
+                self.targets.append((method, target))
+                status, payload, *rest = self.routes.get(
+                    (method, path), (404, {"detail": "not found"})
+                )
+                extra = rest[0] if rest else {}
                 body = json.dumps(payload).encode()
                 writer.write(
                     (
                         f"HTTP/1.1 {status} X\r\n"
                         "Content-Type: application/json\r\n"
                         f"Content-Length: {len(body)}\r\n"
-                        "Connection: keep-alive\r\n\r\n"
+                        + "".join(f"{name}: {value}\r\n" for name, value in extra.items())
+                        + "Connection: keep-alive\r\n\r\n"
                     ).encode()
                     + body
                 )
