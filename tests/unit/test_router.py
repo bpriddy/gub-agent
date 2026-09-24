@@ -16,6 +16,7 @@ from google.adk.events import Event
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
+from gub_agent import config
 from gub_agent.agents.router import ROUTER_STATE_KEY, decision_from, router_agent, user_text
 from gub_agent.config import AGENT_NAME
 from gub_agent.schemas.router import FALLBACK_DECISION, FAST_INTENTS, RouterDecision
@@ -211,10 +212,13 @@ def test_the_root_is_echo_then_router_then_dispatcher():
     from gub_agent.agent import deep_agent, root_agent
 
     assert [a.name for a in root_agent.sub_agents] == ["sandbox_echo", "router", "dispatcher"]
-    # The deep path is the pipeline as it was, minus the echo that moved up.
+    # The deep path is the pipeline as it was, minus the echo that moved up —
+    # with the format gate and the critic side by side unless CRITIC_PARALLEL=0
+    # (tests/unit/test_critic_parallel.py pins both shapes).
+    middle = ["format_and_critic"] if config.CRITIC_PARALLEL else ["format_gate"]
     assert [a.name for a in deep_agent.sub_agents] == [
         AGENT_NAME,
-        "format_gate",
+        *middle,
         "critic_gate",
         "loop_escalator",
     ]

@@ -62,12 +62,21 @@ fast_path (gub_agent/agents/fast_path.py)
 
 deep_agent = LoopAgent("gub_pipeline", max_iterations=2)
   ├─ executor    — the tool-using LLM (gub_agent/agent.py)
-  ├─ format_gate — renders the typed AnswerPayload and enforces the answer
-  │                contract in code (gub_agent/agents/format_gate.py)
-  ├─ critic      — evaluates information sufficiency
-  │                (gub_agent/agents/critic.py)
+  ├─ format_and_critic — ParallelAgent: the two below run at once
+  │   ├─ format_gate — renders the typed AnswerPayload and enforces the
+  │   │                answer contract in code (gub_agent/agents/format_gate.py)
+  │   └─ critic      — evaluates information sufficiency; its verdict is held
+  │                    (gub_agent/agents/critic.py)
+  ├─ critic_gate — decides after the join: deterministic passes and the
+  │                from-memory re-query on THIS pass's payload, else the
+  │                critic's verdict
   └─ escalator   — exits the loop early when the critic is satisfied
 ```
+
+`CRITIC_PARALLEL=0` restores the serial order — format_gate, then critic_gate
+running the critic — with no code change (`build_deep_agent` in
+`gub_agent/agent.py`). The critic never reads the formatter's payload, so
+waiting for it only cost time: p50 2.8 s / p90 8.9 s per deep turn.
 
 The deep path is the Agentic-RAG "critic-before-commit" pattern: on a clean
 answer the loop exits after one pass; on a flagged answer the executor runs

@@ -22,12 +22,25 @@ This is the load-bearing critic-before-commit pattern from the Agentic
 RAG architecture; we keep just this one specialist instead of the full
 planner/rewriter/fanout fleet because at our scale it's the one piece
 that genuinely improves dependability.
+
+Two wirings, chosen by CRITIC_PARALLEL (agent.py:build_deep_agent):
+
+- serial (0):   executor → format_gate → CriticGate → escalator. The gate
+                reads the formatter's payload from state, then runs the LLM.
+- parallel (1): executor → ParallelAgent(format_gate, SpeculativeCritic)
+                → CriticResolver → escalator. The critic LLM runs while the
+                formatter does, and the resolver — named `critic_gate`, so
+                its events are authored as before — makes CriticGate's
+                decisions after the join, on the payload of THIS pass.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
 
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
@@ -45,11 +58,14 @@ from ..sandbox import (
     sandbox_before_model,
     sandbox_instruction,
 )
+from ..tenant import label_of
 from .context_pruning import (
     strip_prior_turn_tool_parts,
     strip_prior_turn_tool_text,
     trim_to_recent_turns,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CriticVerdict(BaseModel):
@@ -228,6 +244,28 @@ def _last_executor_text(ctx: InvocationContext) -> str:
     return ""
 
 
+def _pass_reason_before_format(ctx: InvocationContext) -> str | None:
+    """Why the critic LLM need not run, when the executor's pass alone says so.
+
+    Neither check reads anything the format gate produces, so each holds
+    before the gate has run exactly as it does after. That is what lets the
+    parallel wiring skip the speculative critic call for these turns instead
+    of spending it and dropping the verdict. The abstain PAYLOAD is the one
+    check that has to wait for the gate (`CriticGate._abstain_verdict`).
+    """
+    # Sandbox: an experiment measuring the executor alone turns the critic
+    # off. Same skip mechanism as the abstention pass — a verdict is still
+    # written, so the loop still exits after one iteration instead of
+    # running the executor twice for nothing.
+    if not read_overrides(ctx.session.state).critic_enabled:
+        return "sandbox: critic disabled"
+
+    text = _last_executor_text(ctx)
+    if text.strip().upper().startswith("NO_COMPANY_RECORDS"):
+        return "Deterministic pass: exact NO_COMPANY_RECORDS abstention (no critic LLM run)."
+    return None
+
+
 class CriticGate(BaseAgent):
     """Deterministic pre-check in front of the critic LLM.
 
@@ -249,6 +287,11 @@ class CriticGate(BaseAgent):
     (sandbox.py): the critic is construction-time wiring, so turning it off for
     one run means skipping it here rather than rebuilding the pipeline.
     """
+
+    def _critic_name(self) -> str:
+        """The critic LLM's name: the author of its verdicts, and of ours when
+        a verdict has to read as the critic's (`_requery_event`)."""
+        return self.sub_agents[0].name
 
     def _pass_event(self, ctx: InvocationContext, reason: str) -> Event:
         """The sufficient verdict written WITHOUT running the critic LLM.
@@ -302,7 +345,7 @@ class CriticGate(BaseAgent):
         }
         return Event(
             invocation_id=ctx.invocation_id,
-            author=self.sub_agents[0].name,
+            author=self._critic_name(),
             content=genai_types.Content(
                 role="model", parts=[genai_types.Part(text=json.dumps(verdict))]
             ),
@@ -311,7 +354,7 @@ class CriticGate(BaseAgent):
 
     def _already_sent_back(self, ctx: InvocationContext) -> bool:
         """This turn's executor already had its from-memory retry."""
-        critic = self.sub_agents[0].name
+        critic = self._critic_name()
         for event in ctx.session.events:
             if event.invocation_id != ctx.invocation_id or event.author != critic:
                 continue
@@ -321,39 +364,23 @@ class CriticGate(BaseAgent):
                 return True
         return False
 
-    async def _run_async_impl(
-        self,
-        ctx: InvocationContext,
-    ) -> AsyncGenerator[Event, None]:
-        # Sandbox: an experiment measuring the executor alone turns the critic
-        # off. Same skip mechanism as the abstention pass — a verdict is still
-        # written, so the loop still exits after one iteration instead of
-        # running the executor twice for nothing.
-        if not read_overrides(ctx.session.state).critic_enabled:
-            yield self._pass_event(ctx, "sandbox: critic disabled")
-            return
-
-        text = _last_executor_text(ctx)
-        if text.strip().upper().startswith("NO_COMPANY_RECORDS"):
-            yield self._pass_event(
-                ctx,
-                "Deterministic pass: exact NO_COMPANY_RECORDS abstention (no critic LLM run).",
-            )
-            return
-
+    def _abstain_verdict(self, ctx: InvocationContext, payload: object) -> Event | None:
+        """The verdict an abstain payload settles in code, or None when the
+        payload leaves it to the critic LLM."""
         # The abstention can also arrive as the answer contract's typed form:
-        # the format gate (which runs before this gate) wrote an
-        # AnswerPayload with kind="abstain" into state. Same deterministic
-        # pass — an abstention needs no information-sufficiency judge —
-        # PROVIDED the executor looked this turn.
+        # the format gate (which runs before this gate — or beside the critic,
+        # in the parallel wiring, with the payload read after the join) wrote
+        # an AnswerPayload with kind="abstain". Same deterministic pass — an
+        # abstention needs no information-sufficiency judge — PROVIDED the
+        # executor looked this turn.
         #
         # Without a tool call, an abstain payload is not the executor's
         # abstention but the format gate refusing a draft written from memory:
         # it finds no evidence this pass and abstains. Seen live 2026-09-24
         # when a reader asked "whats new" a sixth time: the executor copied its
         # previous answer and the reader got NO_COMPANY_RECORDS. The bare
-        # marker above still passes without a tool call — that one IS the
-        # executor's own "nothing to look up".
+        # marker (`_pass_reason_before_format`) still passes without a tool
+        # call — that one IS the executor's own "nothing to look up".
         #
         # Such a draft is sent back for a re-query HERE, in code, not by the
         # critic LLM. The first fix (e48bec5) ran the critic on it and relied on
@@ -367,15 +394,26 @@ class CriticGate(BaseAgent):
         # about the conversation itself, "what did I just ask?"), the abstain
         # passes as it always did rather than spending a verdict on a loop that
         # has no iteration left.
-        payload = ctx.session.state.get("answer_payload")
         if isinstance(payload, dict) and payload.get("kind") == "abstain":
             if not _executor_made_tool_call(ctx) and not self._already_sent_back(ctx):
-                yield self._requery_event(ctx)
-                return
-            yield self._pass_event(
+                return self._requery_event(ctx)
+            return self._pass_event(
                 ctx,
                 "Deterministic pass: abstain AnswerPayload (no critic LLM run).",
             )
+        return None
+
+    async def _run_async_impl(
+        self,
+        ctx: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        reason = _pass_reason_before_format(ctx)
+        if reason is not None:
+            yield self._pass_event(ctx, reason)
+            return
+        verdict = self._abstain_verdict(ctx, ctx.session.state.get("answer_payload"))
+        if verdict is not None:
+            yield verdict
             return
         async for event in self.sub_agents[0].run_async(ctx):
             yield event
@@ -412,6 +450,184 @@ class EscalateIfSufficient(BaseAgent):
 
 escalator_agent = EscalateIfSufficient(name="loop_escalator")
 
-# The loop wires the GATE (not the raw critic): deterministic abstention pass,
-# critic LLM for everything else.
-critic_gate = CriticGate(name="critic_gate", sub_agents=[critic_agent])
+# The loop wires a GATE around the critic, never the raw LLM: deterministic
+# passes in code, the critic LLM for everything else. Which gate — CriticGate,
+# or SpeculativeCritic + CriticResolver — is decided where the loop is built
+# (agent.py:build_deep_agent, by CRITIC_PARALLEL), because ADK gives an agent
+# one parent and `critic_agent` can only be adopted by the one that runs it.
+
+
+# ── the parallel wiring (CRITIC_PARALLEL) ────────────────────────────────────
+
+
+@dataclass
+class _Speculation:
+    """What the critic LLM produced beside the format gate, held for the
+    resolver: its events in order, or the exception that ended it."""
+
+    events: list[Event] = field(default_factory=list)
+    error: Exception | None = None
+
+
+# Keyed on invocation id, like the evidence index's stores: the branch and the
+# resolver are two agents of one invocation in one process, and session state
+# is the very channel whose timing this hand-off exists to control.
+_SPECULATIONS: OrderedDict[str, _Speculation] = OrderedDict()
+_MAX_TRACKED = 256
+
+
+def _hold(invocation_id: str, run: _Speculation) -> None:
+    _SPECULATIONS[invocation_id] = run
+    _SPECULATIONS.move_to_end(invocation_id)
+    while len(_SPECULATIONS) > _MAX_TRACKED:
+        _SPECULATIONS.popitem(last=False)
+
+
+def _is_bookkeeping(event: Event) -> bool:
+    """ADK's own agent-state events (resumable runs only) — nobody's output."""
+    actions = event.actions
+    return bool(actions and (actions.agent_state is not None or actions.end_of_agent))
+
+
+def _this_pass_payload(ctx: InvocationContext, authors: tuple[str, ...]) -> dict | None:
+    """The AnswerPayload the format gate produced in THIS pass, or None.
+
+    Read off this pass's events, not `state["answer_payload"]`. State holds
+    whatever payload was written LAST, and a gate that emits nothing — an
+    executor that produced no text, which the gate answers with silence on
+    purpose — leaves it holding an earlier one: the previous turn's, because
+    session state outlives the turn. That payload's abstention would then
+    settle this turn's verdict.
+
+    The pass's gate events are the ones after the executor's last event: the
+    resolver runs straight after the join, and the critic's events are still
+    held, so the first event of this invocation by any other author is the
+    edge of the pass.
+    """
+    for event in reversed(ctx.session.events):
+        if event.invocation_id != ctx.invocation_id or _is_bookkeeping(event):
+            continue
+        if event.author not in authors:
+            return None
+        delta = event.actions.state_delta if event.actions else None
+        payload = (delta or {}).get("answer_payload")
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+class SpeculativeCritic(BaseAgent):
+    """The critic LLM, run beside the format gate instead of after it.
+
+    It is the format gate's sibling in a ParallelAgent (agent.py). ADK gives
+    each branch its own conversation branch and shares session state
+    (parallel_agent.py:_create_branch_ctx_for_sub_agent): this one sees every
+    event that led to the fork — the executor's calls, results and text — and
+    none of the formatter's. The critic judges only the executor's work
+    (prompts/critic.py calls the formatter's JSON "pipeline plumbing"), so
+    nothing it needs is missing.
+
+    Its events are HELD, not yielded, for three reasons:
+
+    - its verdict must not reach state before the resolver has decided. On an
+      abstain payload CriticGate passes WITHOUT the LLM, and a speculative
+      `sufficient: false` committed through output_key would be read by the
+      escalator as a retry;
+    - the bot restarts its streamed pass on a complete `sufficient: false`
+      authored `critic`, and counts one critic iteration per such event
+      (gub-gchat-bot src/agent/client.ts), so a verdict the resolver drops must
+      never be streamed;
+    - the stream keeps its order: payload, then verdict, then escalator.
+
+    An exception is held as well, and re-raised by the resolver only if it
+    needs the verdict. A turn the gate settles in code never ran the critic
+    in the serial order, so a critic failure could not fail it; running the
+    critic speculatively must not change that.
+
+    The payload-independent passes (sandbox off, the bare NO_COMPANY_RECORDS
+    marker) are known before the fork, so for them no call is made at all.
+    Only an abstain payload costs a call whose verdict is then dropped.
+    """
+
+    async def _run_async_impl(
+        self,
+        ctx: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        _SPECULATIONS.pop(ctx.invocation_id, None)  # never an earlier pass's
+        if _pass_reason_before_format(ctx) is not None:
+            return
+        run = _Speculation()
+        try:
+            async for event in self.sub_agents[0].run_async(ctx):
+                run.events.append(event)
+        except Exception as exc:
+            run.error = exc  # the resolver's to raise, if it needs the verdict
+        _hold(ctx.invocation_id, run)
+        return
+        yield  # an async generator that holds everything it produces
+
+
+class CriticResolver(CriticGate):
+    """CriticGate's decisions, made after the join (the parallel wiring).
+
+    Named `critic_gate` in the tree, so a deterministic pass is authored as it
+    always was, and the verdicts it relays keep the critic's own author. The
+    checks run in CriticGate's order — the payload-independent passes, then
+    the abstain payload of THIS pass (`_this_pass_payload`), and only then the
+    critic's verdict. A held verdict the checks overrule is dropped without
+    reaching the stream or state, exactly as if the critic had never run.
+    """
+
+    #: The critic LLM's name — the author of its verdicts and of a re-query.
+    critic_name: str = "critic"
+    #: The authors of this pass's payload: the format gate and its formatter.
+    payload_authors: tuple[str, ...] = ()
+
+    def _critic_name(self) -> str:
+        return self.critic_name
+
+    async def _run_async_impl(
+        self,
+        ctx: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        held = _SPECULATIONS.pop(ctx.invocation_id, None)
+        reason = _pass_reason_before_format(ctx)
+        verdict = (
+            self._pass_event(ctx, reason)
+            if reason is not None
+            else self._abstain_verdict(ctx, _this_pass_payload(ctx, self.payload_authors))
+        )
+        if verdict is not None:
+            if held is not None:
+                # The measurable price of running the critic beside the gate:
+                # count these against critic calls for the wasted share.
+                logger.info(
+                    "critic_speculation: verdict discarded (inv=%s) tenant=%s — %s",
+                    ctx.invocation_id,
+                    label_of(ctx),
+                    verdict.actions.state_delta["critic_verdict"]["reason"],
+                )
+            yield verdict
+            return
+
+        if held is None:
+            # The branch holds a result whenever it had a call to make, so this
+            # is a pass it never ran (a resumed invocation, or an entry evicted
+            # from the store). Fall back to the serial order rather than write
+            # a verdict nobody reached: run the critic now, after the payload.
+            logger.warning(
+                "critic_speculation: nothing held (inv=%s) tenant=%s — running the critic serially",
+                ctx.invocation_id,
+                label_of(ctx),
+            )
+            critic = self.root_agent.find_agent(self.critic_name)
+            if critic is None:
+                raise RuntimeError(f"critic_gate: no agent named {self.critic_name!r} in the tree")
+            async for event in critic.run_async(ctx):
+                yield event
+            return
+
+        if held.error is not None:
+            raise held.error
+        for event in held.events:
+            yield event

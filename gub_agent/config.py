@@ -196,6 +196,23 @@ FILE_SEARCH_ENABLED: bool = os.environ.get("FILE_SEARCH_ENABLED", "false").lower
     "yes",
 )
 
+# ── The critic's place in the deep path ──────────────────────────────────────
+# Run the critic LLM CONCURRENTLY with the format gate instead of after it
+# (agent.py:build_deep_agent, agents/critic.py:SpeculativeCritic). The critic
+# judges the executor's tool coverage and never reads the formatter's output,
+# so waiting for the formatter bought nothing but time: over 155 router-era
+# deep turns, overlapping the two saves p50 2.8 s / p90 8.9 s / mean 4.5 s per
+# turn. The price is a critic call on the turns the gate would have settled in
+# code after the formatter — an abstain payload (21 of 155) — whose verdict is
+# then discarded unseen.
+#
+# Off is the rollback, and it is exact: the tree is then the serial one this
+# replaced, [executor, format_gate, critic_gate, loop_escalator], built from the
+# same objects. Read at import — a change needs a redeploy. Set explicitly in
+# both deploy env files for the reason CONTEXT_TURN_WINDOW is: an operator
+# under pressure should be editing a line that is already in front of them.
+CRITIC_PARALLEL: bool = os.environ.get("CRITIC_PARALLEL", "1").lower() in ("1", "true", "yes")
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 
