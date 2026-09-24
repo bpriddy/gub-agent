@@ -153,3 +153,55 @@ async def test_this_turns_abstention_still_skips_the_critic():
 
     assert critic.ran == []
     assert events[0].actions.state_delta["critic_verdict"]["sufficient"] is True
+
+
+# ── an abstain payload with no tool call is a draft from memory ─────────────
+
+
+async def _gate_on_abstain_payload(events: list[Event]) -> tuple[_RecordingCritic, list[Event]]:
+    critic = _RecordingCritic(name="critic", ran=[])
+    gate = CriticGate(name="critic_gate", sub_agents=[critic])
+    ctx = await invocation_ctx(invocation_id=NOW, events=events)
+    ctx.session.state["answer_payload"] = {"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}
+    return critic, [e async for e in gate.run_async(ctx)]
+
+
+async def test_an_abstain_payload_with_no_tool_call_runs_the_critic():
+    """The live 2026-09-24 case: the executor copied its previous answer
+    without querying, the format gate found no evidence and abstained. The
+    critic must see it — its "TOOL CALL THIS TURN: no" guard is what sends the
+    executor back to re-query — instead of the gate passing the refusal."""
+    critic, events = await _gate_on_abstain_payload(
+        [
+            *_earlier_turn_with_a_tool_call(),
+            _text(AGENT_NAME, "Here is what's new: 3 new hires, 12 live campaigns.", EARLIER),
+            _text("user", "whats new", NOW),
+            _text(AGENT_NAME, "Here is what's new: 3 new hires, 12 live campaigns.", NOW),
+        ]
+    )
+
+    assert critic.ran == [NOW]  # an EARLIER turn's call does not count as looking
+    assert not any((e.actions.state_delta or {}).get("critic_verdict") for e in events if e.actions)
+
+
+async def test_an_abstain_payload_after_a_tool_call_still_skips_the_critic():
+    critic, events = await _gate_on_abstain_payload(
+        [
+            _text("user", "how is the acme account?", NOW),
+            _call(NOW),
+            _text(AGENT_NAME, "GUB has no account by that name.", NOW),
+        ]
+    )
+
+    assert critic.ran == []
+    assert events[0].actions.state_delta["critic_verdict"]["sufficient"] is True
+
+
+async def test_the_bare_marker_skips_the_critic_without_a_tool_call():
+    """The executor's own "nothing to look up" — no tool call needed."""
+    critic, events = await _gate_on_abstain_payload(
+        [_text("user", "what's the weather?", NOW), _text(AGENT_NAME, "NO_COMPANY_RECORDS", NOW)]
+    )
+
+    assert critic.ran == []
+    assert events[0].actions.state_delta["critic_verdict"]["sufficient"] is True

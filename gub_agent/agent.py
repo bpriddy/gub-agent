@@ -183,7 +183,9 @@ executor_agent = Agent(
 # INSIDE the gate, never through this loop. The critic gate then judges
 # information sufficiency only (its old shape axis moved into the format
 # gate); it skips its LLM deterministically for abstentions — the bare
-# NO_COMPANY_RECORDS marker or an abstain payload. On clean answers the
+# NO_COMPANY_RECORDS marker, or an abstain payload after a tool call (one
+# with no tool call is a draft from memory, and the critic sends it back
+# for a re-query). On clean answers the
 # critic emits sufficient=true, escalator triggers loop exit after one
 # iteration. On flagged failures, the executor runs again seeing the critic's
 # feedback in session state. Capped at 2 iterations.

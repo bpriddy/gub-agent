@@ -239,7 +239,8 @@ class CriticGate(BaseAgent):
     zero change to answer quality by construction.
 
     The marker check mirrors the bot's own gubAbstained detection
-    (trim → upper → startswith).
+    (trim → upper → startswith). The abstain PAYLOAD passes only when the
+    executor made a tool call this turn — see the comment at the check.
 
     The gate is also where `state["sandbox"].critic_enabled=false` takes effect
     (sandbox.py): the critic is construction-time wiring, so turning it off for
@@ -292,9 +293,24 @@ class CriticGate(BaseAgent):
         # The abstention can also arrive as the answer contract's typed form:
         # the format gate (which runs before this gate) wrote an
         # AnswerPayload with kind="abstain" into state. Same deterministic
-        # pass — an abstention needs no information-sufficiency judge.
+        # pass — an abstention needs no information-sufficiency judge —
+        # PROVIDED the executor looked this turn.
+        #
+        # Without a tool call, an abstain payload is not the executor's
+        # abstention but the format gate refusing a draft written from memory:
+        # it finds no evidence this pass and abstains. That is exactly the case
+        # the critic's "TOOL CALL THIS TURN: no" guard exists to send back for
+        # a re-query, and skipping here shipped the refusal instead. Seen live
+        # 2026-09-24 when a reader asked "whats new" a sixth time: the executor
+        # copied its previous answer and the reader got NO_COMPANY_RECORDS.
+        # The bare marker above still passes without a tool call — that one IS
+        # the executor's own "nothing to look up".
         payload = ctx.session.state.get("answer_payload")
-        if isinstance(payload, dict) and payload.get("kind") == "abstain":
+        if (
+            isinstance(payload, dict)
+            and payload.get("kind") == "abstain"
+            and _executor_made_tool_call(ctx)
+        ):
             yield self._pass_event(
                 ctx,
                 "Deterministic pass: abstain AnswerPayload (no critic LLM run).",

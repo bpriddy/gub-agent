@@ -630,7 +630,23 @@ async def test_critic_gate_recognises_the_abstain_payload():
         user_id="u",
         state={"answer_payload": {"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}},
     )
-    # Executor text that is NOT the bare marker — only the payload says abstain.
+    # The executor looked (a tool call this turn) and found nothing: its text
+    # is NOT the bare marker — only the payload says abstain.
+    await service.append_event(
+        session,
+        Event(
+            invocation_id=INV,
+            author=AGENT_NAME,
+            content=genai_types.Content(
+                role="model",
+                parts=[
+                    genai_types.Part(
+                        function_call=genai_types.FunctionCall(name="org_query", args={})
+                    )
+                ],
+            ),
+        ),
+    )
     await service.append_event(
         session,
         Event(
