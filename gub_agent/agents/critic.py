@@ -26,12 +26,14 @@ that genuinely improves dependability.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator
 
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import Event, EventActions
+from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 
 from ..config import AGENT_NAME, build_model, build_thinking_planner
@@ -239,8 +241,9 @@ class CriticGate(BaseAgent):
     zero change to answer quality by construction.
 
     The marker check mirrors the bot's own gubAbstained detection
-    (trim → upper → startswith). The abstain PAYLOAD passes only when the
-    executor made a tool call this turn — see the comment at the check.
+    (trim → upper → startswith). An abstain PAYLOAD with no tool call this
+    turn is a draft from memory: the gate sends it back for one re-query
+    itself — see the comment at the check.
 
     The gate is also where `state["sandbox"].critic_enabled=false` takes effect
     (sandbox.py): the critic is construction-time wiring, so turning it off for
@@ -270,6 +273,54 @@ class CriticGate(BaseAgent):
             ),
         )
 
+    def _requery_event(self, ctx: InvocationContext) -> Event:
+        """The insufficient verdict for a draft written from memory, WITHOUT
+        running the critic LLM.
+
+        Authored as the critic and carrying the verdict as text, like the
+        critic LLM's own event, because both readers key on that: the
+        executor's retry sees it as "[critic] said: {...}" and reads the
+        feedback from there (nothing injects state into its prompt), and the
+        bot counts a critic iteration and restarts the streamed pass on a
+        `sufficient: false` from author "critic" — pass one's prose is the
+        from-memory draft and must not stay in the bubble.
+        """
+        verdict = {
+            "info_sufficient": False,
+            "answer_satisfies": False,
+            "sufficient": False,
+            "reason": (
+                "Deterministic: no tool call this turn and the format gate "
+                "abstained, so the draft was written from memory (no critic LLM run)."
+            ),
+            "feedback": (
+                "You made NO tool call this turn, so your draft repeated earlier "
+                "answers from memory and nothing in it could be grounded. Query GUB "
+                "now for THIS question - do not reuse prior turns - and answer only "
+                "from what the tools return."
+            ),
+        }
+        return Event(
+            invocation_id=ctx.invocation_id,
+            author=self.sub_agents[0].name,
+            content=genai_types.Content(
+                role="model", parts=[genai_types.Part(text=json.dumps(verdict))]
+            ),
+            actions=EventActions(state_delta={"critic_verdict": verdict}),
+        )
+
+    def _already_sent_back(self, ctx: InvocationContext) -> bool:
+        """This turn's executor already had its from-memory retry."""
+        critic = self.sub_agents[0].name
+        for event in ctx.session.events:
+            if event.invocation_id != ctx.invocation_id or event.author != critic:
+                continue
+            delta = event.actions.state_delta if event.actions else None
+            verdict = (delta or {}).get("critic_verdict")
+            if isinstance(verdict, dict) and verdict.get("sufficient") is False:
+                return True
+        return False
+
     async def _run_async_impl(
         self,
         ctx: InvocationContext,
@@ -298,19 +349,29 @@ class CriticGate(BaseAgent):
         #
         # Without a tool call, an abstain payload is not the executor's
         # abstention but the format gate refusing a draft written from memory:
-        # it finds no evidence this pass and abstains. That is exactly the case
-        # the critic's "TOOL CALL THIS TURN: no" guard exists to send back for
-        # a re-query, and skipping here shipped the refusal instead. Seen live
-        # 2026-09-24 when a reader asked "whats new" a sixth time: the executor
-        # copied its previous answer and the reader got NO_COMPANY_RECORDS.
-        # The bare marker above still passes without a tool call — that one IS
-        # the executor's own "nothing to look up".
+        # it finds no evidence this pass and abstains. Seen live 2026-09-24
+        # when a reader asked "whats new" a sixth time: the executor copied its
+        # previous answer and the reader got NO_COMPANY_RECORDS. The bare
+        # marker above still passes without a tool call — that one IS the
+        # executor's own "nothing to look up".
+        #
+        # Such a draft is sent back for a re-query HERE, in code, not by the
+        # critic LLM. The first fix (e48bec5) ran the critic on it and relied on
+        # its "TOOL CALL THIS TURN: no" guard; live, the critic read the earlier
+        # turns' identical answers in its window and passed the copy twice out
+        # of two ("the executor gathered sufficient recent company data").
+        # "No tool call and nothing citable" is a fact, not a judgement — the
+        # same reasoning that computes the tool-call fact for the critic.
+        #
+        # Once per turn: if the retry ALSO answers from memory (a question
+        # about the conversation itself, "what did I just ask?"), the abstain
+        # passes as it always did rather than spending a verdict on a loop that
+        # has no iteration left.
         payload = ctx.session.state.get("answer_payload")
-        if (
-            isinstance(payload, dict)
-            and payload.get("kind") == "abstain"
-            and _executor_made_tool_call(ctx)
-        ):
+        if isinstance(payload, dict) and payload.get("kind") == "abstain":
+            if not _executor_made_tool_call(ctx) and not self._already_sent_back(ctx):
+                yield self._requery_event(ctx)
+                return
             yield self._pass_event(
                 ctx,
                 "Deterministic pass: abstain AnswerPayload (no critic LLM run).",

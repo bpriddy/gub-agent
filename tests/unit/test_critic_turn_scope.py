@@ -19,9 +19,11 @@ under test and a fake would supply whatever the test assumed.
 
 from __future__ import annotations
 
+import json
+
 from google.adk.agents import BaseAgent
 from google.adk.agents.readonly_context import ReadonlyContext
-from google.adk.events import Event
+from google.adk.events import Event, EventActions
 from google.genai import types as genai_types
 
 from gub_agent.agents.critic import (
@@ -166,11 +168,13 @@ async def _gate_on_abstain_payload(events: list[Event]) -> tuple[_RecordingCriti
     return critic, [e async for e in gate.run_async(ctx)]
 
 
-async def test_an_abstain_payload_with_no_tool_call_runs_the_critic():
+async def test_an_abstain_payload_with_no_tool_call_is_sent_back_in_code():
     """The live 2026-09-24 case: the executor copied its previous answer
-    without querying, the format gate found no evidence and abstained. The
-    critic must see it — its "TOOL CALL THIS TURN: no" guard is what sends the
-    executor back to re-query — instead of the gate passing the refusal."""
+    without querying and the format gate found no evidence and abstained.
+
+    The gate sends it back for a re-query itself. Not via the critic LLM:
+    live, the critic read the earlier turns' identical answers and passed the
+    copy both times it was asked."""
     critic, events = await _gate_on_abstain_payload(
         [
             *_earlier_turn_with_a_tool_call(),
@@ -180,8 +184,50 @@ async def test_an_abstain_payload_with_no_tool_call_runs_the_critic():
         ]
     )
 
-    assert critic.ran == [NOW]  # an EARLIER turn's call does not count as looking
-    assert not any((e.actions.state_delta or {}).get("critic_verdict") for e in events if e.actions)
+    assert critic.ran == []  # an EARLIER turn's call does not count as looking
+    [event] = events
+    verdict = event.actions.state_delta["critic_verdict"]
+    assert verdict["sufficient"] is False  # the escalator does not exit: retry
+    assert "NO tool call" in verdict["feedback"]
+    # Authored as the critic, verdict as text: the executor's retry reads its
+    # feedback from "[critic] said: …", and the bot restarts the streamed pass
+    # on a sufficient=false from author "critic".
+    assert event.author == "critic"
+    assert json.loads(event.content.parts[0].text) == verdict
+
+
+async def test_a_second_from_memory_abstain_in_the_same_turn_passes():
+    """The retry answered from memory too (a question about the conversation
+    itself): the abstain ships, once, instead of a second send-back."""
+    sent_back = Event(
+        invocation_id=NOW,
+        author="critic",
+        actions=EventActions(state_delta={"critic_verdict": {"sufficient": False}}),
+    )
+    critic, events = await _gate_on_abstain_payload(
+        [
+            _text("user", "what did I just ask?", NOW),
+            _text(AGENT_NAME, "You asked what's new.", NOW),
+            sent_back,
+            _text(AGENT_NAME, "You asked what's new.", NOW),
+        ]
+    )
+
+    assert critic.ran == []
+    assert events[0].actions.state_delta["critic_verdict"]["sufficient"] is True
+
+
+async def test_an_earlier_turns_send_back_does_not_count():
+    earlier = Event(
+        invocation_id=EARLIER,
+        author="critic",
+        actions=EventActions(state_delta={"critic_verdict": {"sufficient": False}}),
+    )
+    critic, events = await _gate_on_abstain_payload(
+        [earlier, _text("user", "whats new", NOW), _text(AGENT_NAME, "Copied.", NOW)]
+    )
+
+    assert events[0].actions.state_delta["critic_verdict"]["sufficient"] is False
 
 
 async def test_an_abstain_payload_after_a_tool_call_still_skips_the_critic():
@@ -205,3 +251,23 @@ async def test_the_bare_marker_skips_the_critic_without_a_tool_call():
 
     assert critic.ran == []
     assert events[0].actions.state_delta["critic_verdict"]["sufficient"] is True
+
+
+async def test_the_executor_retry_sees_the_send_back_feedback():
+    """Nothing injects state into the executor's prompt, so the feedback only
+    reaches the retry if ADK renders the send-back event into its request.
+    Built through ADK's own content builder, as the executor's retry sees it."""
+    from google.adk.flows.llm_flows.contents import _get_contents
+
+    critic, [send_back] = await _gate_on_abstain_payload(
+        [_text("user", "whats new", NOW), _text(AGENT_NAME, "Copied from memory.", NOW)]
+    )
+    events = [
+        _text("user", "whats new", NOW),
+        _text(AGENT_NAME, "Copied from memory.", NOW),
+        send_back,
+    ]
+
+    contents = _get_contents(None, events, AGENT_NAME)
+    rendered = " ".join(p.text or "" for c in contents for p in (c.parts or []))
+    assert "You made NO tool call this turn" in rendered
