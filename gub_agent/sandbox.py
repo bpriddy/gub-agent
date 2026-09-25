@@ -59,6 +59,7 @@ from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import Event, EventActions
+from google.adk.planners import BuiltInPlanner
 from google.genai import types as genai_types
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -76,7 +77,12 @@ RESOLVED_STATE_KEY = "sandbox_resolved"
 MAX_PROMPT_BYTES = 64 * 1024
 
 Role = Literal["executor", "critic", "formatter", "router"]
-ThinkingLevel = Literal["MINIMAL", "LOW", "MEDIUM", "HIGH", "DYNAMIC"]
+ThinkingLevel = Literal["MINIMAL", "LOW", "MEDIUM", "HIGH", "DYNAMIC", "OFF"]
+
+# Like DYNAMIC, not a genai thinking_level: thinking_budget=0, thinking switched
+# off. A level in this vocabulary so the provenance can name what the router and
+# the formatter run on, and so a run can ask for exactly that.
+THINKING_OFF = "OFF"
 
 # Baseline thinking levels, reported in the provenance when nothing overrides
 # them. Imported by the construction sites (agent.py, agents/critic.py,
@@ -84,10 +90,11 @@ ThinkingLevel = Literal["MINIMAL", "LOW", "MEDIUM", "HIGH", "DYNAMIC"]
 # from what actually runs.
 EXECUTOR_THINKING_LEVEL = "MEDIUM"
 CRITIC_THINKING_LEVEL = "LOW"
-FORMATTER_THINKING_LEVEL = "LOW"
-# The router classifies and stops (blend 04); a deliberation budget here would
-# spend the latency the fast path exists to save.
-ROUTER_THINKING_LEVEL = "LOW"
+# The formatter renders given text into a given schema, and the router
+# classifies and stops (blend 04): off by default, LOW with the flag at 0
+# (config.FORMATTER_THINKING_OFF / ROUTER_THINKING_OFF has the measurement).
+FORMATTER_THINKING_LEVEL = THINKING_OFF if config.FORMATTER_THINKING_OFF else "LOW"
+ROUTER_THINKING_LEVEL = THINKING_OFF if config.ROUTER_THINKING_OFF else "LOW"
 
 
 class SandboxOverrides(BaseModel):
@@ -196,6 +203,8 @@ def _validate(overrides: SandboxOverrides) -> None:
         # A named thinking_level is a 3-series knob; other models return 400 for
         # it — and the baseline planners carry a named level, so "model only" is
         # not a valid override for such a model. Verified live (gemini-2.5-pro).
+        # OFF counts too: gemini-2.5-pro cannot switch thinking off either, and
+        # one rule — DYNAMIC on every role — is the one gub-sandbox-ui mirrors.
         executor_level = overrides.thinking_level or EXECUTOR_THINKING_LEVEL
         critic_level = overrides.critic_thinking_level or CRITIC_THINKING_LEVEL
         formatter_level = overrides.formatter_thinking_level or FORMATTER_THINKING_LEVEL
@@ -349,10 +358,28 @@ def _thinking_config(level: str) -> genai_types.ThinkingConfig:
             thinking_budget=-1,
             include_thoughts=config.EMIT_THINKING,
         )
+    if level == THINKING_OFF:
+        # Matches build_thinking_planner(thinking_budget=0) — no thinking.
+        return genai_types.ThinkingConfig(
+            thinking_budget=0,
+            include_thoughts=config.EMIT_THINKING,
+        )
     return genai_types.ThinkingConfig(
         thinking_level=level,
         include_thoughts=config.EMIT_THINKING,
     )
+
+
+def baseline_planner(level: str) -> BuiltInPlanner:
+    """The construction-time planner for a baseline level, in the vocabulary an
+    override uses — so the level `resolved_config` reports for a role is the
+    config its planner sends. A fresh planner, and a fresh ThinkingConfig in it,
+    per call (config.build_thinking_planner)."""
+    if level == THINKING_OFF:
+        return config.build_thinking_planner(thinking_budget=0)
+    if level == "DYNAMIC":
+        return config.build_thinking_planner()
+    return config.build_thinking_planner(thinking_level=level)
 
 
 def sandbox_before_model(callback_context: Any, llm_request: Any, *, role: Role) -> None:

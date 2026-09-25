@@ -82,9 +82,9 @@ SANDBOX_MODEL_ALLOWLIST: tuple[str, ...] = tuple(
 # 3-series knob). Any other allowlisted model rejects it with 400 INVALID_ARGUMENT
 # — verified live 2026-09-07 with gemini-2.5-pro — and inside the engine that 400
 # reaches the caller as an empty 200 stream. The baseline planners pin MEDIUM
-# (executor) and LOW (critic), so a sandbox run that swaps to a model outside this
-# set must ALSO set both roles to DYNAMIC (`thinking_budget=-1`); sandbox.py
-# refuses the run up front otherwise.
+# (executor) and LOW (critic), and thinking off (router, formatter), so a sandbox
+# run that swaps to a model outside this set must ALSO set every role to DYNAMIC
+# (`thinking_budget=-1`); sandbox.py refuses the run up front otherwise.
 SANDBOX_THINKING_LEVEL_MODELS: tuple[str, ...] = tuple(
     name.strip()
     for name in os.environ.get("SANDBOX_THINKING_LEVEL_MODELS", "gemini-3.5-flash").split(",")
@@ -92,15 +92,26 @@ SANDBOX_THINKING_LEVEL_MODELS: tuple[str, ...] = tuple(
 )
 
 
-def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
-    """Native thinking planner shared by the executor and critic.
+def build_thinking_planner(
+    thinking_level: str | None = None, *, thinking_budget: int | None = None
+) -> BuiltInPlanner:
+    """Native thinking planner for one agent — a FRESH ThinkingConfig per call.
 
-    Default (thinking_level=None): dynamic budget — the model thinks as much
-    as it wants. Pass a level ('MINIMAL'/'LOW'/'MEDIUM'/'HIGH', the 3-series
-    knob) to cap it — the critic runs at LOW because it's a checklist judge
-    whose unbounded thinking measured 13-16s/turn (~29% of a whole turn).
+    Default (neither given): dynamic budget — the model thinks as much as it
+    wants. Pass a level ('MINIMAL'/'LOW'/'MEDIUM'/'HIGH', the 3-series knob)
+    to cap it — the critic runs at LOW because it's a checklist judge whose
+    unbounded thinking measured 13-16s/turn (~29% of a whole turn). Or pass a
+    budget in tokens: 0 switches thinking off (the router and the formatter,
+    ROUTER_THINKING_OFF / FORMATTER_THINKING_OFF below), -1 is the dynamic
+    default. Not both — they are two answers to one question.
+
+    Fresh, never shared: the planner assigns its own object into every request
+    (ADK planners/built_in_planner.py; see sandbox.py:_thinking_config), so two
+    agents on one config would be one mutation away from sharing a knob.
     Thought summaries are emitted only when EMIT_THINKING is set.
     """
+    if thinking_level is not None and thinking_budget is not None:
+        raise ValueError("build_thinking_planner: pass thinking_level or thinking_budget, not both")
     if thinking_level is not None:
         return BuiltInPlanner(
             thinking_config=genai_types.ThinkingConfig(
@@ -110,10 +121,38 @@ def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
         )
     return BuiltInPlanner(
         thinking_config=genai_types.ThinkingConfig(
-            thinking_budget=-1,
+            thinking_budget=-1 if thinking_budget is None else thinking_budget,
             include_thoughts=EMIT_THINKING,
         ),
     )
+
+
+# ── Thinking off for the router and the formatter ────────────────────────────
+# Both run with thinking_budget=0 instead of thinking_level=LOW. Neither needs
+# to deliberate: the router makes one classification and the formatter renders
+# given text into a given schema. Measured 2026-09-25 by replaying 20 real
+# production router requests under four arms: at LOW every router call spent
+# ~99 thought tokens, and TTFT p90 was 3.2 s against 1.1 s at budget 0, with
+# the same intent on 19 of 20. Under LOW the formatter thinks on ~43% of its
+# calls, p90 3.1k thought tokens, worth ~3.2-3.8 s of the mean formatter call.
+# The formatter's output at budget 0 was NOT replayed. Watch `format_gate:
+# attempt … rejected … tenant=…` against formatter calls after a deploy.
+#
+# Off (0) is the rollback of each: thinking_level=LOW, as before. Read at import
+# (sandbox.py derives the baseline levels its provenance reports from these), so
+# a change needs a redeploy. A sandbox run still overrides either per call
+# (router_thinking_level / formatter_thinking_level). Set explicitly in both
+# deploy env files, like the other rollbacks.
+ROUTER_THINKING_OFF: bool = os.environ.get("ROUTER_THINKING_OFF", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+FORMATTER_THINKING_OFF: bool = os.environ.get("FORMATTER_THINKING_OFF", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`

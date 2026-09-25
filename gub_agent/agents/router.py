@@ -1,7 +1,7 @@
 """
 router.py — the intent router (blend 04, gub-agent#23).
 
-One LlmAgent, no tools, `output_schema=RouterDecision`, thinking at LOW: it
+One LlmAgent, no tools, `output_schema=RouterDecision`, thinking off: it
 classifies the question and stops. The dispatcher (`agents/dispatcher.py`)
 then picks a branch in plain code, so the routing decision is inspectable and
 testable rather than implied by whatever the executor felt like doing.
@@ -38,11 +38,16 @@ from google.adk.agents import LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
 from pydantic import ValidationError
 
-from ..config import build_model, build_thinking_planner
+from ..config import build_model
 from ..instruction_utils import with_current_date
 from ..models import bind_model_call
 from ..prompts import ROUTER_INSTRUCTION
-from ..sandbox import ROUTER_THINKING_LEVEL, sandbox_before_model, sandbox_instruction
+from ..sandbox import (
+    ROUTER_THINKING_LEVEL,
+    baseline_planner,
+    sandbox_before_model,
+    sandbox_instruction,
+)
 from ..schemas.router import FALLBACK_DECISION, RouterDecision
 from .context_pruning import (
     strip_prior_turn_tool_parts,
@@ -96,10 +101,11 @@ router_agent = LlmAgent(
     # practical way to drive the misroute rate down without a redeploy.
     # InstructionProvider — appends today's date deterministically per request.
     instruction=sandbox_instruction(with_current_date(ROUTER_INSTRUCTION), role="router"),
-    # LOW, from sandbox.py so the provenance can't drift from what runs. The
-    # router exists to save model turns; giving it a deliberation budget would
-    # spend them again.
-    planner=build_thinking_planner(thinking_level=ROUTER_THINKING_LEVEL),
+    # Thinking off (thinking_budget=0; LOW with ROUTER_THINKING_OFF=0), from
+    # sandbox.py so the provenance can't drift from what runs. The router exists
+    # to save model turns; at LOW its ~99 thought tokens a call put TTFT p90 at
+    # 3.2 s against 1.1 s off, for the same intent on 19 of 20 replayed requests.
+    planner=baseline_planner(ROUTER_THINKING_LEVEL),
     # THE routing contract — a violation is a pydantic error the dispatcher
     # treats as "exploratory at confidence 0", i.e. the deep path.
     output_schema=RouterDecision,

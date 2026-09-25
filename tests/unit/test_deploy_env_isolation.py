@@ -174,7 +174,12 @@ async def test_both_deploy_envs_state_the_latency_switches():
     """Each latency change has its own rollback, and each rollback is a line in
     BOTH files — the same value, so a sandbox run measures what production
     runs. Pins the declaration and the parity, not the setting."""
-    switches = ("CRITIC_PARALLEL", "CRITIC_SKIP_FINAL_PASS")
+    switches = (
+        "CRITIC_PARALLEL",
+        "CRITIC_SKIP_FINAL_PASS",
+        "ROUTER_THINKING_OFF",
+        "FORMATTER_THINKING_OFF",
+    )
     prod, sandbox = _env(_prod_env_file()), _env(_sandbox_env_file())
     for key in switches:
         assert key in prod and key in sandbox, (

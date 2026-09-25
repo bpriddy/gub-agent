@@ -34,11 +34,16 @@ from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.genai import types as genai_types
 
-from ..config import build_model, build_thinking_planner
+from ..config import build_model
 from ..instruction_utils import current_date_note
 from ..models import bind_model_call
 from ..prompts import FORMATTER_INSTRUCTION
-from ..sandbox import FORMATTER_THINKING_LEVEL, sandbox_before_model, sandbox_instruction
+from ..sandbox import (
+    FORMATTER_THINKING_LEVEL,
+    baseline_planner,
+    sandbox_before_model,
+    sandbox_instruction,
+)
 from ..schemas import AnswerPayload
 from ..tenant import tenant_instruction, tenant_note_formatter
 from .evidence_index import formatter_brief
@@ -88,10 +93,12 @@ formatter_agent = LlmAgent(
         sandbox_instruction(_formatter_base_instruction, role="formatter"),
         note=tenant_note_formatter,
     ),
-    # LOW: it renders given text into a given schema — no retrieval, no
-    # analysis worth a deliberation budget. (FORMATTER_THINKING_LEVEL, so the
-    # sandbox provenance can't drift from what actually runs.)
-    planner=build_thinking_planner(thinking_level=FORMATTER_THINKING_LEVEL),
+    # Thinking off (thinking_budget=0; LOW with FORMATTER_THINKING_OFF=0): it
+    # renders given text into a given schema — no retrieval, no analysis worth a
+    # deliberation budget, and under LOW it thought on ~43% of calls, p90 3.1k
+    # tokens. (FORMATTER_THINKING_LEVEL, so the sandbox provenance can't drift
+    # from what actually runs.)
+    planner=baseline_planner(FORMATTER_THINKING_LEVEL),
     # THE contract: every AnswerPayload validator (filler, budgets, table
     # shape, facts↔citations) runs on parse — a violation is a pydantic error
     # the format gate turns into retry feedback, not a judge's opinion.

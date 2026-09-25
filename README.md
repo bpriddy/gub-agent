@@ -105,6 +105,12 @@ tokens ↔ elapsed, r=0.86), so a fact question with a known entity — one HTTP
 call's worth of information — is answered with two model calls (router,
 formatter) instead of 1-3 executor rounds plus a critic pass.
 
+Those two run with thinking OFF (`thinking_budget=0`): one classifies, the
+other renders given text into a given schema. At `thinking_level=LOW` the
+router's TTFT p90 was 3.2 s against 1.1 s off, for the same intent on 19 of 20
+replayed production requests. `ROUTER_THINKING_OFF=0` / `FORMATTER_THINKING_OFF=0`
+put either back on LOW (`gub_agent/config.py`).
+
 The engine id, the `stream_query` shape and the author-routed answer channel
 are unchanged: callers see no difference at the boundary.
 
@@ -185,9 +191,10 @@ on every call:
 ```python
 create_session(state={"sandbox": {
     "model": "gemini-2.5-pro",          # allowlist: SANDBOX_MODEL_ALLOWLIST
-    "thinking_level": "DYNAMIC",        # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC — named
+    "thinking_level": "DYNAMIC",        # MINIMAL|LOW|MEDIUM|HIGH|DYNAMIC|OFF — named
     "critic_thinking_level": "DYNAMIC", #   levels are 3-series only; a 2.5 model
-                                        #   needs DYNAMIC on both roles (enforced)
+                                        #   needs DYNAMIC on every role (enforced);
+                                        #   OFF = thinking_budget=0
     "temperature": 0.2,
     "executor_instruction": "<full prompt text>",   # or executor_variant
     "critic_instruction": "<full prompt text>",     # or critic_variant
@@ -420,10 +427,14 @@ untouched: with `SANDBOX_ENABLED=0` the sandbox never writes the model field.
 
 One more live-verified trap, now caught up front: a **named `thinking_level`
 is a 3-series knob**. `gemini-2.5-pro` rejects it with 400, and the baseline
-planners pin MEDIUM / LOW — so `{"model": "gemini-2.5-pro"}` alone would die
-silently. `read_overrides` refuses such a run unless `thinking_level` (and
-`critic_thinking_level`, while the critic is on) is `DYNAMIC`; the set of
-models that do accept named levels is `SANDBOX_THINKING_LEVEL_MODELS`.
+planners pin MEDIUM / LOW, and thinking off (`OFF`, `thinking_budget=0`) for
+the router and the formatter, which 2.5-pro cannot do either — so
+`{"model": "gemini-2.5-pro"}` alone would die silently. `read_overrides`
+refuses such a run unless `thinking_level`, `formatter_thinking_level`,
+`router_thinking_level` (and `critic_thinking_level`, while the critic is on)
+are `DYNAMIC`; the set of models that do accept named levels is
+`SANDBOX_THINKING_LEVEL_MODELS`. The provenance reports `OFF` for an
+untouched router or formatter on an engine with the flags on.
 
 ### Billing
 
