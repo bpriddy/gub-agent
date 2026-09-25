@@ -48,9 +48,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-# The ten intents. Ordered as the prompt lists them: the five FACT-shaped ones
-# the fast path can serve, then the ones that need the executor, then the two
-# that need no data at all.
+# The eleven intents. Ordered as the prompt lists them: the five FACT-shaped
+# ones the fast path can serve, then the ones that need the executor, then the
+# two that need no data at all.
 Intent = Literal[
     "campaign_status",
     "campaign_facts",
@@ -59,6 +59,13 @@ Intent = Literal[
     "count_or_rank",
     "assessment",
     "exploratory",
+    # "which file is it?" (search-01). It exists to GATE A TOOL, not to route:
+    # it is absent from FAST_INTENTS below and from CLARIFIABLE_INTENTS
+    # (`agents/dispatcher.py`), so it behaves exactly like `exploratory` — the
+    # deep path, one pass — and the only thing it changes is that
+    # `agents/tool_gate.py` offers the executor `find_files` on this label and
+    # withholds it on every other one.
+    "file_lookup",
     "market_enrichment",
     "workspace_personal",
     "smalltalk",

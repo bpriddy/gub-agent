@@ -82,9 +82,9 @@ SANDBOX_MODEL_ALLOWLIST: tuple[str, ...] = tuple(
 # 3-series knob). Any other allowlisted model rejects it with 400 INVALID_ARGUMENT
 # — verified live 2026-09-07 with gemini-2.5-pro — and inside the engine that 400
 # reaches the caller as an empty 200 stream. The baseline planners pin MEDIUM
-# (executor) and LOW (critic), so a sandbox run that swaps to a model outside this
-# set must ALSO set both roles to DYNAMIC (`thinking_budget=-1`); sandbox.py
-# refuses the run up front otherwise.
+# (executor) and LOW (critic), and thinking off (router, formatter), so a sandbox
+# run that swaps to a model outside this set must ALSO set every role to DYNAMIC
+# (`thinking_budget=-1`); sandbox.py refuses the run up front otherwise.
 SANDBOX_THINKING_LEVEL_MODELS: tuple[str, ...] = tuple(
     name.strip()
     for name in os.environ.get("SANDBOX_THINKING_LEVEL_MODELS", "gemini-3.5-flash").split(",")
@@ -92,15 +92,26 @@ SANDBOX_THINKING_LEVEL_MODELS: tuple[str, ...] = tuple(
 )
 
 
-def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
-    """Native thinking planner shared by the executor and critic.
+def build_thinking_planner(
+    thinking_level: str | None = None, *, thinking_budget: int | None = None
+) -> BuiltInPlanner:
+    """Native thinking planner for one agent — a FRESH ThinkingConfig per call.
 
-    Default (thinking_level=None): dynamic budget — the model thinks as much
-    as it wants. Pass a level ('MINIMAL'/'LOW'/'MEDIUM'/'HIGH', the 3-series
-    knob) to cap it — the critic runs at LOW because it's a checklist judge
-    whose unbounded thinking measured 13-16s/turn (~29% of a whole turn).
+    Default (neither given): dynamic budget — the model thinks as much as it
+    wants. Pass a level ('MINIMAL'/'LOW'/'MEDIUM'/'HIGH', the 3-series knob)
+    to cap it — the critic runs at LOW because it's a checklist judge whose
+    unbounded thinking measured 13-16s/turn (~29% of a whole turn). Or pass a
+    budget in tokens: 0 switches thinking off (the router and the formatter,
+    ROUTER_THINKING_OFF / FORMATTER_THINKING_OFF below), -1 is the dynamic
+    default. Not both — they are two answers to one question.
+
+    Fresh, never shared: the planner assigns its own object into every request
+    (ADK planners/built_in_planner.py; see sandbox.py:_thinking_config), so two
+    agents on one config would be one mutation away from sharing a knob.
     Thought summaries are emitted only when EMIT_THINKING is set.
     """
+    if thinking_level is not None and thinking_budget is not None:
+        raise ValueError("build_thinking_planner: pass thinking_level or thinking_budget, not both")
     if thinking_level is not None:
         return BuiltInPlanner(
             thinking_config=genai_types.ThinkingConfig(
@@ -108,12 +119,45 @@ def build_thinking_planner(thinking_level: str | None = None) -> BuiltInPlanner:
                 include_thoughts=EMIT_THINKING,
             ),
         )
+    budget = -1 if thinking_budget is None else thinking_budget
     return BuiltInPlanner(
         thinking_config=genai_types.ThinkingConfig(
-            thinking_budget=-1,
-            include_thoughts=EMIT_THINKING,
+            thinking_budget=budget,
+            # Nothing to summarise at budget 0, and include_thoughts=true with
+            # thinking off is a pairing production has never sent — the sandbox
+            # engine runs EMIT_THINKING=1, where a rejection would reach the
+            # caller as an empty 200 stream.
+            include_thoughts=EMIT_THINKING and budget != 0,
         ),
     )
+
+
+# ── Thinking off for the router and the formatter ────────────────────────────
+# Both run with thinking_budget=0 instead of thinking_level=LOW. Neither needs
+# to deliberate: the router makes one classification and the formatter renders
+# given text into a given schema. Measured 2026-09-25 by replaying 20 real
+# production router requests under four arms: at LOW every router call spent
+# ~99 thought tokens, and TTFT p90 was 3.2 s against 1.1 s at budget 0, with
+# the same intent on 19 of 20. Under LOW the formatter thinks on ~43% of its
+# calls, p90 3.1k thought tokens, worth ~3.2-3.8 s of the mean formatter call.
+# The formatter's output at budget 0 was NOT replayed. Watch `format_gate:
+# attempt … rejected … tenant=…` against formatter calls after a deploy.
+#
+# Off (0) is the rollback of each: thinking_level=LOW, as before. Read at import
+# (sandbox.py derives the baseline levels its provenance reports from these), so
+# a change needs a redeploy. A sandbox run still overrides either per call
+# (router_thinking_level / formatter_thinking_level). Set explicitly in both
+# deploy env files, like the other rollbacks.
+ROUTER_THINKING_OFF: bool = os.environ.get("ROUTER_THINKING_OFF", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+FORMATTER_THINKING_OFF: bool = os.environ.get("FORMATTER_THINKING_OFF", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
@@ -153,13 +197,83 @@ ROUTER_CONFIDENCE_FLOOR: float = float(os.environ.get("ROUTER_CONFIDENCE_FLOOR",
 #
 # This is what replaces the bot's 5-minute idle reset as the bound on context
 # growth (gub-gchat-bot threads.ts:IDLE_RESET_MS). 0 or negative disables it,
-# which is also the rollback: no code redeploy, just the variable.
+# which is also the rollback: no code redeploy, just the variable — and it
+# wins over any per-session value, or it would roll back nothing.
 #
-# NOT per-run A/B-able. It is read from os.environ at import, so a sandbox run
-# cannot vary it; doing that means adding context_turn_window to
-# SandboxOverrides and reading it through _state_of(callback_context), the way
-# sandbox_before_model does. Separate change.
-CONTEXT_TURN_WINDOW: int = int(os.environ.get("CONTEXT_TURN_WINDOW", "5"))
+# PER SESSION since thread-topics. The bot writes `context_turn_window` into
+# session state — 10 for the main DM stream, 200 for a thread — and the
+# executor, router and critic all read it per request
+# (context_pruning.resolve_turn_window). This value is the DEFAULT, for every
+# session that carries no key: the Chevy tenant bot (a pre-memory-00 image on
+# this same engine), gub-sandbox-ui, the /blend harness, and any bot session
+# created before the key existed until its next turn pushes it. So the default
+# is a finite window and must never become "unlimited": those callers would
+# inherit it with no way to opt out. 10, matching the main stream, so an
+# unlabelled caller behaves like a top-level conversation.
+#
+# Per-run A/B follows from the same thing: a sandbox run varies the window by
+# creating its session with `state={"context_turn_window": N}` — no
+# SandboxOverrides field, and it works on the production engine too, where
+# `state["sandbox"]` is ignored.
+CONTEXT_TURN_WINDOW: int = int(os.environ.get("CONTEXT_TURN_WINDOW", "10"))
+
+# ── File search (search-01) ──────────────────────────────────────────────────
+# Master switch for the Drive file-NAME search tool. OFF is exactly today's
+# behaviour: `agents/tool_gate.py` withholds `find_files` from every turn, so
+# the model is never offered it and can never call it.
+#
+# It exists because the three services deploy independently and GUB's own
+# `FILE_SEARCH` flag defaults to off — and while it is off `/org/files/search`
+# answers `200 []`, which is indistinguishable from a genuine miss. An engine
+# deployed ahead of its backend would therefore report a file GUB DOES hold as
+# "not found by name": a confident false statement produced by an env var, with
+# nothing in the response to warn the model. A switch on this side makes the
+# deploy order safe in either direction — turn this on only once the backend
+# this engine calls has FILE_SEARCH on.
+#
+# Set explicitly in both deploy env files (the same reasoning as
+# SANDBOX_ENABLED): it is the rollback, and an operator under pressure should
+# be editing a line that is already in front of them.
+FILE_SEARCH_ENABLED: bool = os.environ.get("FILE_SEARCH_ENABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# ── The critic's place in the deep path ──────────────────────────────────────
+# Run the critic LLM CONCURRENTLY with the format gate instead of after it
+# (agent.py:build_deep_agent, agents/critic.py:SpeculativeCritic). The critic
+# judges the executor's tool coverage and never reads the formatter's output,
+# so waiting for the formatter bought nothing but time: over 155 router-era
+# deep turns, overlapping the two saves p50 2.8 s / p90 8.9 s / mean 4.5 s per
+# turn. The price is a critic call on the turns the gate would have settled in
+# code after the formatter — an abstain payload (21 of 155) — whose verdict is
+# then discarded unseen.
+#
+# Off is the rollback of the TREE: the serial one this replaced, [executor,
+# format_gate, critic_gate, loop_escalator], built from the same objects. It is
+# not a rollback to b11e400's behaviour. The last-pass skip below has its own
+# switch, and the serial gate reads this pass's payload off its events like the
+# resolver does — a fix both wirings keep (agents/critic.py:_this_pass_payload).
+# Read at import — a change needs a redeploy. Set explicitly in both deploy env
+# files for the reason CONTEXT_TURN_WINDOW is: an operator under pressure should
+# be editing a line that is already in front of them.
+CRITIC_PARALLEL: bool = os.environ.get("CRITIC_PARALLEL", "1").lower() in ("1", "true", "yes")
+
+# No critic LLM on the deep loop's LAST iteration (agents/critic.py:
+# _is_final_pass): its verdict there cannot buy another pass, so the gate writes
+# a sufficient one in code — 2.8-20.7 s off every retried production turn. The
+# price is the critic's opinion of the retry: gubCriticSufficient on a retried
+# turn is always true. Independent of CRITIC_PARALLEL, in both wirings.
+#
+# Off is its rollback: the critic LLM judges the last pass again, as it did
+# before. Read at import, set explicitly in both deploy env files, like the flag
+# above.
+CRITIC_SKIP_FINAL_PASS: bool = os.environ.get("CRITIC_SKIP_FINAL_PASS", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
@@ -189,8 +303,8 @@ def build_model() -> BaseLlm:
     blip still clears (most do on the first retry), but a genuinely overloaded
     turn fails fast instead of dragging toward the timeout. Retriable codes are
     the genai defaults (408/429/5xx) — genuine client errors (400/403/404) are
-    NOT retried. Retries are logged by genai at INFO (before_sleep); a dedicated
-    retry counter is a worthwhile follow-up for prod visibility.
+    NOT retried. Retries are logged by genai at INFO (before_sleep), and each
+    call's `model_call:` line counts its own (`retries=`, models.py).
     """
     from .models import VendorRouter  # noqa: PLC0415 — models.py imports config
 

@@ -16,6 +16,7 @@ from google.adk.events import Event
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
+from gub_agent import config
 from gub_agent.agents.router import ROUTER_STATE_KEY, decision_from, router_agent, user_text
 from gub_agent.config import AGENT_NAME
 from gub_agent.schemas.router import FALLBACK_DECISION, FAST_INTENTS, RouterDecision
@@ -152,6 +153,27 @@ async def test_no_decision_at_all_becomes_the_deep_path():
     assert decision_from(ctx) == FALLBACK_DECISION
 
 
+async def test_an_earlier_turns_router_event_is_never_this_turns_decision():
+    """Session events are never trimmed, and a thread keeps up to 200 turns.
+    When this turn's router left nothing readable, the newest-first fallback
+    used to walk back into an earlier turn and return ITS decision — a fast
+    path against the previous question's entity. Absent means the deep path."""
+    earlier = Event(
+        invocation_id="inv-earlier",
+        author="router",
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part(text=json.dumps(_decision_dict()))]
+        ),
+    )
+    ctx = await invocation_ctx(events=[earlier], invocation_id=INV)
+    assert decision_from(ctx) == FALLBACK_DECISION
+
+    # This turn's own event still wins over an earlier one.
+    now = _router_event(json.dumps(_decision_dict(intent="campaign_facts")))
+    ctx_now = await invocation_ctx(events=[earlier, now], invocation_id=INV)
+    assert decision_from(ctx_now).intent == "campaign_facts"
+
+
 # ── the question ──────────────────────────────────────────────────────────────
 
 
@@ -186,14 +208,24 @@ def test_the_router_is_a_no_tool_typed_classifier():
 
 def test_the_root_is_echo_then_router_then_dispatcher():
     """The boundary contract: same engine, same stream_query, and sandbox_echo
-    still first so the provenance event precedes any work."""
+    still first so the provenance event precedes any work. With
+    SPECULATIVE_DEEP (the default) the router and the dispatcher sit inside
+    `speculative_dispatch` (tests/unit/test_speculation.py pins both shapes)."""
     from gub_agent.agent import deep_agent, root_agent
+    from gub_agent.agents.speculation import SPECULATIVE_DEEP
 
-    assert [a.name for a in root_agent.sub_agents] == ["sandbox_echo", "router", "dispatcher"]
-    # The deep path is the pipeline as it was, minus the echo that moved up.
+    names = [a.name for a in root_agent.sub_agents]
+    if SPECULATIVE_DEEP:
+        assert names == ["sandbox_echo", "speculative_dispatch"]
+        names = [names[0], *(a.name for a in root_agent.sub_agents[1].sub_agents)]
+    assert names == ["sandbox_echo", "router", "dispatcher"]
+    # The deep path is the pipeline as it was, minus the echo that moved up —
+    # with the format gate and the critic side by side unless CRITIC_PARALLEL=0
+    # (tests/unit/test_critic_parallel.py pins both shapes).
+    middle = ["format_and_critic"] if config.CRITIC_PARALLEL else ["format_gate"]
     assert [a.name for a in deep_agent.sub_agents] == [
         AGENT_NAME,
-        "format_gate",
+        *middle,
         "critic_gate",
         "loop_escalator",
     ]

@@ -61,6 +61,15 @@ def _decision(**over) -> RouterDecision:
         (_decision(intent="assessment", confidence=0.95, entity_surface="Chevy"), dp.DEEP),
         (_decision(intent="exploratory", confidence=0.95), dp.DEEP),
         (_decision(intent="market_enrichment", confidence=0.95), dp.DEEP),
+        # `file_lookup` gates a TOOL, not a branch (search-01): it must route
+        # exactly like `exploratory` — deep path at every confidence, with or
+        # without an entity — so the only thing the new label changes is which
+        # tools `agents/tool_gate.py` leaves in the request.
+        (
+            _decision(intent="file_lookup", confidence=0.95, entity_surface="BHAC teaser"),
+            dp.DEEP,
+        ),
+        (_decision(intent="file_lookup", confidence=0.40), dp.DEEP),
         # Below the floor: ask, rather than look up the wrong thing…
         (
             _decision(intent="campaign_facts", confidence=0.62, entity_surface="Silverado"),

@@ -184,7 +184,7 @@ async def _exchange_google_token(google_access_token: str) -> str:
 # several org endpoints answer with a bare JSON array and an array has nowhere
 # to put a field.
 #
-# That signal has to reach the model, and this is the ONE place all 11 tools
+# That signal has to reach the model, and this is the ONE place all 12 tools
 # funnel through. Without it a filtered read is indistinguishable from an
 # empty one, and a model being truthful about what it got says "Budweiser has
 # no campaigns" — a claim about the world built from a fact about permissions,
@@ -203,11 +203,14 @@ ACCOUNT_SCOPE_NOTICE = (
 )
 
 # Where to hang a filtered bare-array payload so the shape stays meaningful.
-# Only the first two can actually be filtered — staff and resourcing are
+# Only the first three can actually be filtered — staff and resourcing are
 # unscoped by ruling — but the map is complete so a future scope does not
 # silently fall back to a key nothing reads.
 _ARRAY_KEYS = {
     "/org/search": "hits",
+    # `tools/files.py` normalises the UNfiltered bare array to the same key, so
+    # a scoped file turn and an unscoped one hand the model the same shape.
+    "/org/files/search": "files",
     "/org/accounts": "accounts",
     "/org/staff": "staff",
     "/org/resourcing": "people",

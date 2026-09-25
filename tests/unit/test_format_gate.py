@@ -611,7 +611,7 @@ async def test_no_executor_text_means_no_events_and_no_formatter_run():
 async def test_critic_gate_recognises_the_abstain_payload():
     """The pipeline invariant: NO_COMPANY_RECORDS keeps skipping the critic
     LLM whether it arrives as the bare marker or as the typed abstain payload
-    already written to state by the format gate."""
+    the format gate emitted this pass."""
     from gub_agent.agents.critic import CriticGate
 
     class _RecordingCritic(BaseAgent):
@@ -622,15 +622,29 @@ async def test_critic_gate_recognises_the_abstain_payload():
             yield Event(invocation_id=ctx.invocation_id, author=self.name)
 
     critic = _RecordingCritic(name="critic", ran=[])
-    gate = CriticGate(name="critic_gate", sub_agents=[critic])
+    gate = CriticGate(
+        name="critic_gate", sub_agents=[critic], payload_authors=("format_gate", "formatter")
+    )
 
     service = InMemorySessionService()
-    session = await service.create_session(
-        app_name="gub",
-        user_id="u",
-        state={"answer_payload": {"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}},
+    session = await service.create_session(app_name="gub", user_id="u")
+    # The executor looked (a tool call this turn) and found nothing: its text
+    # is NOT the bare marker — only the payload says abstain.
+    await service.append_event(
+        session,
+        Event(
+            invocation_id=INV,
+            author=AGENT_NAME,
+            content=genai_types.Content(
+                role="model",
+                parts=[
+                    genai_types.Part(
+                        function_call=genai_types.FunctionCall(name="org_query", args={})
+                    )
+                ],
+            ),
+        ),
     )
-    # Executor text that is NOT the bare marker — only the payload says abstain.
     await service.append_event(
         session,
         Event(
@@ -638,6 +652,19 @@ async def test_critic_gate_recognises_the_abstain_payload():
             author=AGENT_NAME,
             content=genai_types.Content(
                 role="model", parts=[genai_types.Part(text="I cannot answer that from GUB.")]
+            ),
+        ),
+    )
+    # …and the format gate rendered that as the typed abstention.
+    await service.append_event(
+        session,
+        Event(
+            invocation_id=INV,
+            author="format_gate",
+            actions=EventActions(
+                state_delta={
+                    "answer_payload": {"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}
+                }
             ),
         ),
     )

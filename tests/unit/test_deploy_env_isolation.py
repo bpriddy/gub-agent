@@ -153,6 +153,45 @@ async def test_production_deploy_declares_emit_thinking_explicitly():
     )
 
 
+async def test_both_deploy_envs_declare_the_file_search_flag():
+    """search-01's kill switch, stated rather than defaulted — in BOTH files.
+
+    Its value is a rollout decision (the rollout enables it only after the GUB
+    it calls has FILE_SEARCH on, because a disabled backend answers `200 []`
+    and the tool reads that as "no such file"), so this pins the DECLARATION,
+    not the setting: an operator turning it on should be editing a line that is
+    already in front of them, and a reader should not have to open config.py to
+    learn which way an engine is running.
+    """
+    for path in (_prod_env_file(), _sandbox_env_file()):
+        assert "FILE_SEARCH_ENABLED" in _env(path), (
+            f"{path.name}: keep FILE_SEARCH_ENABLED explicit — it is the kill "
+            "switch for the file-search tool, and its default is off"
+        )
+
+
+async def test_both_deploy_envs_state_the_latency_switches():
+    """Each latency change has its own rollback, and each rollback is a line in
+    BOTH files — the same value, so a sandbox run measures what production
+    runs. Pins the declaration and the parity, not the setting."""
+    switches = (
+        "CRITIC_PARALLEL",
+        "CRITIC_SKIP_FINAL_PASS",
+        "ROUTER_THINKING_OFF",
+        "FORMATTER_THINKING_OFF",
+        "SPECULATIVE_DEEP",
+    )
+    prod, sandbox = _env(_prod_env_file()), _env(_sandbox_env_file())
+    for key in switches:
+        assert key in prod and key in sandbox, (
+            f"keep {key} explicit in both deploy env files — it is a rollback, and "
+            "an operator should be editing a line that is already there"
+        )
+        assert _flag_on(prod, key) == _flag_on(sandbox, key), (
+            f"{key} differs between production and the sandbox"
+        )
+
+
 async def test_production_deploy_verifies_the_env_landed():
     """A deploy that cannot fail on a skipped env file will hide the next one."""
     text = DEPLOY_WORKFLOW.read_text()

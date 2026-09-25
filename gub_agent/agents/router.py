@@ -1,7 +1,7 @@
 """
 router.py — the intent router (blend 04, gub-agent#23).
 
-One LlmAgent, no tools, `output_schema=RouterDecision`, thinking at LOW: it
+One LlmAgent, no tools, `output_schema=RouterDecision`, thinking off: it
 classifies the question and stops. The dispatcher (`agents/dispatcher.py`)
 then picks a branch in plain code, so the routing decision is inspectable and
 testable rather than implied by whatever the executor felt like doing.
@@ -22,7 +22,10 @@ Two wiring notes:
 
 Prior-turn tool payloads are pruned from its request for the same reason the
 critic prunes them: the router classifies the CURRENT question, and a previous
-turn's 50-row org_query result is nothing but tokens.
+turn's 50-row org_query result is nothing but tokens. That pruning has to work
+on TEXT here (`strip_prior_turn_tool_text`) — the router never sees a function
+part, only ADK's rendering of the executor's — and the router is windowed to
+the same per-session number of turns as the executor.
 """
 
 from __future__ import annotations
@@ -35,12 +38,22 @@ from google.adk.agents import LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
 from pydantic import ValidationError
 
-from ..config import build_model, build_thinking_planner
+from ..config import build_model
 from ..instruction_utils import with_current_date
+from ..models import bind_model_call
 from ..prompts import ROUTER_INSTRUCTION
-from ..sandbox import ROUTER_THINKING_LEVEL, sandbox_before_model, sandbox_instruction
+from ..sandbox import (
+    ROUTER_THINKING_LEVEL,
+    baseline_planner,
+    sandbox_before_model,
+    sandbox_instruction,
+)
 from ..schemas.router import FALLBACK_DECISION, RouterDecision
-from .context_pruning import strip_prior_turn_tool_parts
+from .context_pruning import (
+    strip_prior_turn_tool_parts,
+    strip_prior_turn_tool_text,
+    trim_to_recent_turns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,20 +63,33 @@ ROUTER_STATE_KEY = "router_decision"
 
 def _router_before_model(callback_context, llm_request):
     """Sandbox overrides first (model / router_thinking_level / temperature — a
-    no-op without state["sandbox"]), then the same prior-turn pruning the
-    critic has always had.
+    no-op without state["sandbox"]), then the conversation window, then the
+    prior-turn pruning.
 
-    The conversation window is DEFERRED here, not excluded (memory-00 §3.5).
-    The router does benefit from history — resolving "and Q3?" needs the
-    previous turn — but it is the agent most affected by boundary inflation,
-    so it is only windowed once the executor's `context_window:` log line has
-    confirmed the real turn count in production. When it is enabled it uses
-    the same function and the same config value. If the router's transcript
-    cost has to be cut sooner, the right instrument is a content filter rather
-    than a turn window: foreign-context contents older than the current turn
-    are pure text and carry no tool pairs, so dropping them is always safe."""
+    The window was DEFERRED here by memory-00 §3.5 until the executor's
+    `context_window:` line had confirmed the real turn count in production —
+    the router being the agent most exposed to boundary inflation. That line
+    has since gated the executor's rollout, and thread-topics cannot leave the
+    router unbounded: a thread keeps up to 200 turns, and the router runs on
+    every one of them, fast path included. Same function, same per-session
+    value, so "the last N exchanges" means one thing across the pipeline.
+
+    The pruning is the content filter that note anticipated, narrowed: rather
+    than dropping earlier foreign-context contents whole, which would take the
+    executor's previous ANSWER with it — the very text "and Q3?" is resolved
+    against — `strip_prior_turn_tool_text` drops only their tool-call and
+    tool-result text and keeps the prose. `strip_prior_turn_tool_parts` stays
+    in front of it and removes nothing today (the router has no tools, and ADK
+    renders another agent's function parts as text); it is here so a future
+    ADK that relays native function parts is still pruned.
+
+    Order: the window first, so the pruners rebuild fewer contents — the same
+    cost argument as the executor's chain (agent.py:_before_model)."""
+    bind_model_call(callback_context)  # who is calling, for the model_call line
     sandbox_before_model(callback_context, llm_request, role="router")
-    return strip_prior_turn_tool_parts(callback_context, llm_request)
+    trim_to_recent_turns(callback_context, llm_request, role="router")
+    strip_prior_turn_tool_parts(callback_context, llm_request)
+    return strip_prior_turn_tool_text(callback_context, llm_request)
 
 
 router_agent = LlmAgent(
@@ -75,10 +101,11 @@ router_agent = LlmAgent(
     # practical way to drive the misroute rate down without a redeploy.
     # InstructionProvider — appends today's date deterministically per request.
     instruction=sandbox_instruction(with_current_date(ROUTER_INSTRUCTION), role="router"),
-    # LOW, from sandbox.py so the provenance can't drift from what runs. The
-    # router exists to save model turns; giving it a deliberation budget would
-    # spend them again.
-    planner=build_thinking_planner(thinking_level=ROUTER_THINKING_LEVEL),
+    # Thinking off (thinking_budget=0; LOW with ROUTER_THINKING_OFF=0), from
+    # sandbox.py so the provenance can't drift from what runs. The router exists
+    # to save model turns; at LOW its ~99 thought tokens a call put TTFT p90 at
+    # 3.2 s against 1.1 s off, for the same intent on 19 of 20 replayed requests.
+    planner=baseline_planner(ROUTER_THINKING_LEVEL),
     # THE routing contract — a violation is a pydantic error the dispatcher
     # treats as "exploratory at confidence 0", i.e. the deep path.
     output_schema=RouterDecision,
@@ -102,8 +129,16 @@ def _texts_of(event: Any) -> str:
 def _from_events(ctx: InvocationContext) -> Any:
     """The router's own event text, newest first — the fallback for a decision
     that has not landed in state (a state_delta is committed when the runner
-    consumes the event, and the ordering is ADK's business, not ours)."""
+    consumes the event, and the ordering is ADK's business, not ours).
+
+    THIS invocation's events only. Session events are never trimmed, so an
+    unfiltered newest-first scan that finds no router text this turn walks
+    straight back into an earlier turn and returns ITS decision — a fast path
+    run against the previous question's entity. Absent is the honest answer
+    here: `decision_from` turns it into the deep path."""
     for event in reversed(ctx.session.events):
+        if event.invocation_id != ctx.invocation_id:
+            continue
         if event.author != ROUTER_NAME:
             continue
         text = _texts_of(event).strip()

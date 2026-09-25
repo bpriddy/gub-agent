@@ -36,14 +36,23 @@ thought parts (`Part.thought=True`) — ADK's Claude class maps itself.
 Prod is untouched: with SANDBOX_ENABLED=0 the sandbox never writes
 `llm_request.model`, so the router only ever sees the deployed Gemini id and
 forwards the request object unchanged.
+
+Every call through the router — either vendor — ends in ONE `model_call:` log
+line (`_ModelCall`): time to first chunk, time to last chunk, the token counts
+and the outcome. It is the $0 measurement for latency work: the engine logs
+already carry it, so no eval run is needed to see where a turn's time went.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
@@ -52,6 +61,8 @@ from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 from pydantic import PrivateAttr
 from typing_extensions import override
+
+from .tenant import label_of
 
 logger = logging.getLogger("gub_agent.models")
 
@@ -115,6 +126,29 @@ class VendorRouter(BaseLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
+        # The same responses in the same order, only timed on the way through:
+        # the measurement sits here because this is the one object that sees
+        # every chunk of every agent's call, whichever vendor serves it.
+        call = _ModelCall.begin(self, llm_request, stream)
+        try:
+            async for response in self._generate(llm_request, stream):
+                call.saw(response)
+                yield response
+        except GeneratorExit:
+            call.status = "error:closed"  # the consumer stopped reading
+            raise
+        except asyncio.CancelledError:
+            call.status = "error:cancelled"  # e.g. the caller's stream deadline
+            raise
+        except Exception as exc:
+            call.status = f"error:{_error_code(exc)}"
+            raise
+        finally:
+            call.log()
+
+    async def _generate(
+        self, llm_request: LlmRequest, stream: bool
+    ) -> AsyncGenerator[LlmResponse, None]:
         if not is_claude(llm_request.model):
             async for response in self.gemini.generate_content_async(llm_request, stream=stream):
                 yield response
@@ -124,6 +158,180 @@ class VendorRouter(BaseLlm):
         request, wants_json = adapt_request_for_claude(llm_request)
         async for response in llm.generate_content_async(request, stream=stream):
             yield trim_json_reply(response) if wants_json and not response.partial else response
+
+
+# ── The per-call line ─────────────────────────────────────────────────────────
+#
+#   model_call: agent=… model=… stream=0|1 ttft_ms=<n>|- dur_ms=… prompt=… cached=…
+#     thoughts=… out=… status=ok|error:<code> retries=<n>|- inv=… tenant=…
+#
+# One line per call, written when the call ends — never per streamed chunk.
+# `ttft_ms` is the wait for the first chunk (a non-streamed call has one, so
+# there it equals `dur_ms`), and `-` when none arrived: a call cancelled or
+# failed before its first chunk has no first-token time, and its duration in
+# that field would read as a first-token stall. `dur_ms` runs to the LAST
+# chunk (to the end of the call, when none arrived), not to the end of the
+# generator: after a function-call reply ADK runs the tools while this
+# generator is suspended, and tool time is not model time. Both are measured
+# where ADK reads them, so a streamed call's gaps include ADK's own handling of
+# each chunk. Token counts are the last usage_metadata the call reported (0
+# when it reported none, as a call with no chunk never does): `cached` is the
+# part of `prompt` served from the context cache, `thoughts` are billed as
+# output beside `out`. `prompt=` is a COUNT: no request or reply text is ever
+# logged here.
+#
+# Count calls with `textPayload:"model_call: agent="`. `tenant=` goes last, as
+# on the dispatcher line — numerator and denominator need the same clause.
+
+
+@dataclass(frozen=True)
+class _Caller:
+    """Who is about to call the model, as its before_model_callback saw it."""
+
+    agent: str
+    invocation_id: str
+    tenant: str
+
+
+# Set by `bind_model_call`, read by the call that follows it. A ContextVar and
+# not a module global because ParallelAgent runs its branches as asyncio tasks
+# (parallel_agent.py), each with its own copy of the context: the format gate's
+# formatter and the speculative critic bind and call side by side without
+# seeing each other's caller.
+_CALLER: ContextVar[_Caller | None] = ContextVar("gub_model_caller", default=None)
+_IN_FLIGHT: ContextVar[_ModelCall | None] = ContextVar("gub_model_call", default=None)
+
+
+def bind_model_call(callback_context: Any) -> None:
+    """First step of every model agent's before_model_callback: record the
+    agent, invocation and tenant for the `model_call:` line of the call that
+    follows. The model object never sees the invocation, so the one place that
+    does hands it over; the request is not touched.
+
+    Every LlmAgent in the tree calls this (pinned by
+    tests/unit/test_model_call_log.py). A call it did not precede still logs,
+    with `inv=- tenant=-` rather than a neighbour's."""
+    _CALLER.set(
+        _Caller(
+            agent=getattr(callback_context, "agent_name", None) or "-",
+            invocation_id=getattr(callback_context, "invocation_id", None) or "-",
+            tenant=label_of(callback_context),
+        )
+    )
+
+
+# genai retries 429/408/5xx inside the request (HttpRetryOptions, config.py)
+# and says so only by logging "Retrying …" through tenacity's before_sleep hook
+# at INFO on this logger — there is no callback. A logging filter reads those
+# records without touching genai: it counts the retry against the call in
+# flight in the same task and always lets the record through. The logger name
+# and the message are genai's, not an API; if either changes the count reads 0,
+# never wrong in the other direction. And a record below the logger's level is
+# never created, so where INFO is off for genai the line says `retries=-`.
+_GENAI_LOGGER = logging.getLogger("google_genai._api_client")
+
+
+class _CountRetries(logging.Filter):
+    gub_retry_counter = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if str(record.msg).startswith("Retrying"):
+                call = _IN_FLIGHT.get()
+                if call is not None:
+                    call.retries += 1
+        except Exception:  # noqa: BLE001 — a log filter must never fail genai's request
+            pass
+        return True
+
+
+if not any(getattr(f, "gub_retry_counter", False) for f in _GENAI_LOGGER.filters):
+    _GENAI_LOGGER.addFilter(_CountRetries())
+
+
+def _error_code(exc: BaseException) -> str:
+    """The HTTP status of a failed call when the SDK carries one (genai's
+    APIError.code, Anthropic's status_code), else the exception's type."""
+    for attr in ("code", "status_code"):
+        code = getattr(exc, attr, None)
+        if isinstance(code, (int, str)) and str(code).strip():
+            return _token(code)
+    return type(exc).__name__
+
+
+def _token(value: object) -> str:
+    """One space-free token, so the line splits on spaces."""
+    return "_".join(str(value).split()) or "-"
+
+
+def _count(usage: Any, field_name: str) -> int:
+    value = getattr(usage, field_name, None) if usage is not None else None
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+class _ModelCall:
+    """One model call's clock, token counts and outcome, logged once."""
+
+    def __init__(self, agent: str, model: str, stream: bool, caller: _Caller | None, genai: bool):
+        self.agent = agent
+        self.model = model
+        self.stream = stream
+        # The caller counts only if it bound for THIS agent; anything else is a
+        # leftover from an earlier call in the same task.
+        self.caller = caller if caller is not None and caller.agent == agent else None
+        self.genai = genai
+        self.started = time.monotonic()
+        self.first: float | None = None
+        self.last: float | None = None
+        self.usage: Any = None
+        self.status = "ok"
+        self.retries = 0
+
+    @classmethod
+    def begin(cls, router: VendorRouter, llm_request: LlmRequest, stream: bool) -> _ModelCall:
+        caller = _CALLER.get()
+        config = getattr(llm_request, "config", None)
+        labels = getattr(config, "labels", None) or {}
+        # ADK labels every request with the calling agent's name (base_llm_flow:
+        # _ADK_AGENT_NAME_LABEL_KEY) just before it calls the model.
+        agent = labels.get("adk_agent_name") or (caller.agent if caller else "-")
+        model = str(llm_request.model or router.model)
+        call = cls(agent, model, stream, caller, genai=not is_claude(model))
+        _IN_FLIGHT.set(call)
+        return call
+
+    def saw(self, response: LlmResponse) -> None:
+        now = time.monotonic()
+        if self.first is None:
+            self.first = now
+        self.last = now
+        if response.usage_metadata is not None:
+            self.usage = response.usage_metadata
+        if response.error_code:
+            # A reply with no usable content (a block, a malformed call).
+            self.status = f"error:{_token(response.error_code)}"
+
+    def log(self) -> None:
+        end = time.monotonic()
+        last = self.last if self.last is not None else end
+        observable = self.genai and _GENAI_LOGGER.isEnabledFor(logging.INFO)
+        (logger.info if self.status == "ok" else logger.warning)(
+            "model_call: agent=%s model=%s stream=%d ttft_ms=%s dur_ms=%d prompt=%d "
+            "cached=%d thoughts=%d out=%d status=%s retries=%s inv=%s tenant=%s",
+            self.agent,
+            self.model,
+            1 if self.stream else 0,
+            "-" if self.first is None else round((self.first - self.started) * 1000),
+            round((last - self.started) * 1000),
+            _count(self.usage, "prompt_token_count"),
+            _count(self.usage, "cached_content_token_count"),
+            _count(self.usage, "thoughts_token_count"),
+            _count(self.usage, "candidates_token_count"),
+            self.status,
+            self.retries if observable else "-",
+            self.caller.invocation_id if self.caller else "-",
+            self.caller.tenant if self.caller else "-",
+        )
 
 
 # ── Request adaptation ────────────────────────────────────────────────────────

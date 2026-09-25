@@ -69,7 +69,15 @@ still needed. Also check:
   aggregating go through `org_query`, not list-and-reason. Fuzzy name
   lookups use `find` (when the entity type is unknown) or `org_query` with
   the `similar_to` operator (when the type is known); a piece or idea reached
-  via find → get_piece / get_idea is a valid retrieval, not a gap.
+  via find → get_piece / get_idea is a valid retrieval, not a gap. A
+  WHICH-FILE question ("do we have the BHAC 30 second teaser?") is retrieved
+  with `find_files`, which searches Drive file NAMES — that is the right tool,
+  and an EMPTY result from it is a COMPLETE answer, not a gap. We index names,
+  not document text, so there is no follow-up query that would find it: pass
+  the turn, and never demand a retry or another tool for it. That holds when
+  the turn ends in an ABSTENTION too — a search that found nothing leaves
+  nothing to cite, and abstaining is the correct ending for it, not a sign the
+  executor stopped short.
 - For multi-part or multi-entity questions, was each part queried (chained
   `org_query` calls using the `in` operator as the join)?
 - If the executor made NO tool calls but the question needs data, the
