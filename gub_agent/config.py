@@ -206,12 +206,30 @@ FILE_SEARCH_ENABLED: bool = os.environ.get("FILE_SEARCH_ENABLED", "false").lower
 # code after the formatter — an abstain payload (21 of 155) — whose verdict is
 # then discarded unseen.
 #
-# Off is the rollback, and it is exact: the tree is then the serial one this
-# replaced, [executor, format_gate, critic_gate, loop_escalator], built from the
-# same objects. Read at import — a change needs a redeploy. Set explicitly in
-# both deploy env files for the reason CONTEXT_TURN_WINDOW is: an operator
-# under pressure should be editing a line that is already in front of them.
+# Off is the rollback of the TREE: the serial one this replaced, [executor,
+# format_gate, critic_gate, loop_escalator], built from the same objects. It is
+# not a rollback to b11e400's behaviour. The last-pass skip below has its own
+# switch, and the serial gate reads this pass's payload off its events like the
+# resolver does — a fix both wirings keep (agents/critic.py:_this_pass_payload).
+# Read at import — a change needs a redeploy. Set explicitly in both deploy env
+# files for the reason CONTEXT_TURN_WINDOW is: an operator under pressure should
+# be editing a line that is already in front of them.
 CRITIC_PARALLEL: bool = os.environ.get("CRITIC_PARALLEL", "1").lower() in ("1", "true", "yes")
+
+# No critic LLM on the deep loop's LAST iteration (agents/critic.py:
+# _is_final_pass): its verdict there cannot buy another pass, so the gate writes
+# a sufficient one in code — 2.8-20.7 s off every retried production turn. The
+# price is the critic's opinion of the retry: gubCriticSufficient on a retried
+# turn is always true. Independent of CRITIC_PARALLEL, in both wirings.
+#
+# Off is its rollback: the critic LLM judges the last pass again, as it did
+# before. Read at import, set explicitly in both deploy env files, like the flag
+# above.
+CRITIC_SKIP_FINAL_PASS: bool = os.environ.get("CRITIC_SKIP_FINAL_PASS", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 

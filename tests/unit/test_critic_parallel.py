@@ -80,6 +80,13 @@ FINAL_PASS_REASON = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _skip_final_pass(monkeypatch):
+    """The default, pinned: most tests here describe the last-pass skip, and the
+    one about its rollback turns it off itself — whatever the environment says."""
+    monkeypatch.setattr(config, "CRITIC_SKIP_FINAL_PASS", True)
+
+
 # ── stand-ins for the model-backed agents ────────────────────────────────────
 
 
@@ -723,6 +730,28 @@ async def test_the_last_pass_makes_no_critic_model_call(parallel):
     assert streamed[-1].actions.escalate
     payload_events = [e for e in _complete(streamed) if e.author in ("formatter", "format_gate")]
     assert json.loads(payload_events[-1].content.parts[0].text) == ANSWER_2
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_critic_skip_final_pass_0_asks_the_model_on_the_last_pass(parallel, monkeypatch):
+    """The skip's own rollback, in both wirings: the model judges pass 2 again
+    and the verdict the bot reads last is the model's, not one written in code.
+    CRITIC_PARALLEL alone could not bring this back — it only picks the tree."""
+    monkeypatch.setattr(config, "CRITIC_SKIP_FINAL_PASS", False)
+    critic, model = _llm_critic([INSUFFICIENT, SUFFICIENT])
+    loop, executor, _, _ = _pipeline(
+        parallel=parallel,
+        executor_passes=[(True, "12 live campaigns."), (True, "The Q3 push is live.")],
+        payloads=[ANSWER, ANSWER_2],
+        critic=critic,
+    )
+
+    streamed, state, _ = await _run(loop)
+
+    assert model.calls == 2 and executor.runs == 2
+    assert _critic_verdicts(streamed) == [INSUFFICIENT, SUFFICIENT]
+    assert state["critic_verdict"] == SUFFICIENT
+    assert streamed[-1].author == "loop_escalator" and streamed[-1].actions.escalate
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])

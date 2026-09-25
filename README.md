@@ -77,11 +77,14 @@ The critic LLM never runs on the loop's LAST iteration: its verdict there
 cannot buy another pass, so `critic_gate` writes a sufficient one in code,
 authored `critic` like the LLM's (`_is_final_pass` in
 `gub_agent/agents/critic.py`). On a retried turn that is 2.8-20.7 s saved.
+`CRITIC_SKIP_FINAL_PASS=0` is its rollback: the critic judges the retry again.
 
 `CRITIC_PARALLEL=0` restores the serial order — format_gate, then critic_gate
 running the critic — with no code change (`build_deep_agent` in
-`gub_agent/agent.py`). The critic never reads the formatter's payload, so
-waiting for it only cost time: p50 2.8 s / p90 8.9 s per deep turn.
+`gub_agent/agent.py`). It restores the tree only: the last-pass skip keeps its
+own switch, and both gates read the abstain payload off THIS pass's events,
+never a stale one left in state. The critic never reads the formatter's
+payload, so waiting for it only cost time: p50 2.8 s / p90 8.9 s per deep turn.
 
 The deep path is the Agentic-RAG "critic-before-commit" pattern: on a clean
 answer the loop exits after one pass; on a flagged answer the executor runs

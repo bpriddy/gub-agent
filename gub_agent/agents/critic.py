@@ -12,7 +12,8 @@ Reads the conversation + executor's response and emits a structured verdict
                      the issue
 
 On the last iteration no verdict can buy another pass, so the gate writes a
-sufficient one in code instead of running the LLM (`_is_final_pass`).
+sufficient one in code instead of running the LLM (`_is_final_pass`;
+CRITIC_SKIP_FINAL_PASS=0 runs the LLM there again).
 
 The critic is deliberately narrow: it doesn't second-guess data values
 it can't verify, and — since the answer contract (blend 03) — it doesn't
@@ -53,6 +54,7 @@ from google.adk.events import Event, EventActions
 from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 
+from .. import config
 from ..config import AGENT_NAME, build_model, build_thinking_planner
 from ..instruction_utils import current_date_note
 from ..models import bind_model_call
@@ -312,7 +314,13 @@ def _is_final_pass(agent: BaseAgent, ctx: InvocationContext) -> bool:
     speculative critic one level down in the ParallelAgent), so the bound
     follows `max_iterations` instead of restating it. Outside a bounded loop —
     a gate driven on its own, as the unit tests do — no pass is final.
+
+    CRITIC_SKIP_FINAL_PASS=0 makes no pass final: the critic LLM judges the
+    last one as it did before, in either wiring. Read per call off config, so
+    the switch is the one place both gates and the speculative branch ask.
     """
+    if not config.CRITIC_SKIP_FINAL_PASS:
+        return False
     loop = agent.parent_agent
     while loop is not None and not isinstance(loop, LoopAgent):
         loop = loop.parent_agent
