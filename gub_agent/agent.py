@@ -45,6 +45,11 @@ invisible at the boundary, the way the LoopAgent's introduction was in June.
 
 sandbox_echo stays FIRST: the provenance event must precede any work.
 
+With SPECULATIVE_DEEP=1 (the default) the router and the dispatcher run inside
+`speculative_dispatch`, which starts the deep path at the same moment as the
+router and keeps it only when the dispatcher picks it (agents/speculation.py);
+0 is the tree above, exactly (`build_root`).
+
 The executor's instruction text lives in `prompts/executor.py` (edit it
 there); the critic's lives in `prompts/critic.py`, the router's in
 `prompts/router.py`.
@@ -76,6 +81,7 @@ from .agents.fast_path import fast_path
 from .agents.format_gate import format_gate
 from .agents.round_limiter import reset_rounds, round_limit
 from .agents.router import router_agent
+from .agents.speculation import SPECULATIVE_DEEP, SpeculativeDispatch
 from .agents.tool_gate import tool_gate
 from .config import AGENT_NAME, CRITIC_PARALLEL, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
@@ -273,6 +279,7 @@ deep_agent = build_deep_agent(
 # adopting it (`agents/fast_path.py`).
 dispatcher = Dispatcher(name="dispatcher", sub_agents=[fast_path, deep_agent])
 
+
 # The root: provenance, then routing, then exactly one branch.
 #
 # sandbox_echo leads — on an experiment run it records what the run resolved
@@ -284,7 +291,33 @@ dispatcher = Dispatcher(name="dispatcher", sub_agents=[fast_path, deep_agent])
 # ignores by author (blend 03 step 0) — an engine deployed with this root in
 # front of a bot WITHOUT that routing would put routing JSON in the user's
 # bubble.
-root_agent = SequentialAgent(
-    name="gub_root",
-    sub_agents=[sandbox_echo, router_agent, dispatcher],
-)
+def build_root(
+    echo: BaseAgent,
+    router: BaseAgent,
+    dispatch: Dispatcher,
+    *,
+    speculative: bool,
+) -> SequentialAgent:
+    """The root, with the deep path started beside the router or after it.
+
+    Serial (`speculative=False`) is the tree as it was, piece for piece:
+    [sandbox_echo, router, dispatcher]. Speculative wraps the last two in
+    `SpeculativeDispatch`, which runs the router live and the dispatcher's
+    deep agent at the same time on a fork of the session, then makes the
+    dispatcher's decision and keeps the deep run only if that is the branch
+    it picks (agents/speculation.py). Either way every agent below is the
+    same object, and every event reaches the caller under its own author.
+
+    A function over the agents, like `build_deep_agent`, so both shapes can be
+    built in one process for the tests; the module builds one.
+    """
+    if speculative:
+        middle: list[BaseAgent] = [
+            SpeculativeDispatch(name="speculative_dispatch", sub_agents=[router, dispatch])
+        ]
+    else:
+        middle = [router, dispatch]
+    return SequentialAgent(name="gub_root", sub_agents=[echo, *middle])
+
+
+root_agent = build_root(sandbox_echo, router_agent, dispatcher, speculative=SPECULATIVE_DEEP)

@@ -208,10 +208,17 @@ def test_the_router_is_a_no_tool_typed_classifier():
 
 def test_the_root_is_echo_then_router_then_dispatcher():
     """The boundary contract: same engine, same stream_query, and sandbox_echo
-    still first so the provenance event precedes any work."""
+    still first so the provenance event precedes any work. With
+    SPECULATIVE_DEEP (the default) the router and the dispatcher sit inside
+    `speculative_dispatch` (tests/unit/test_speculation.py pins both shapes)."""
     from gub_agent.agent import deep_agent, root_agent
+    from gub_agent.agents.speculation import SPECULATIVE_DEEP
 
-    assert [a.name for a in root_agent.sub_agents] == ["sandbox_echo", "router", "dispatcher"]
+    names = [a.name for a in root_agent.sub_agents]
+    if SPECULATIVE_DEEP:
+        assert names == ["sandbox_echo", "speculative_dispatch"]
+        names = [names[0], *(a.name for a in root_agent.sub_agents[1].sub_agents)]
+    assert names == ["sandbox_echo", "router", "dispatcher"]
     # The deep path is the pipeline as it was, minus the echo that moved up —
     # with the format gate and the critic side by side unless CRITIC_PARALLEL=0
     # (tests/unit/test_critic_parallel.py pins both shapes).

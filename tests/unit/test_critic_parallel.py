@@ -344,7 +344,9 @@ print(json.dumps({
 def test_critic_parallel_0_builds_the_serial_tree_it_replaced():
     """The rollback. Read at import, so it is checked in a fresh interpreter:
     the tree must be today's serial one, built from the same module objects."""
-    env = {**os.environ, "CRITIC_PARALLEL": "0", "PYTHONPATH": str(REPO)}
+    # SPECULATIVE_DEEP=0 too, so the root is today's as well; the speculative
+    # root is pinned in tests/unit/test_speculation.py.
+    env = {**os.environ, "CRITIC_PARALLEL": "0", "SPECULATIVE_DEEP": "0", "PYTHONPATH": str(REPO)}
     out = subprocess.run(
         [sys.executable, "-W", "ignore", "-c", _DUMP],
         cwd=REPO,
