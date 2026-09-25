@@ -90,12 +90,32 @@ SPECULATIVE_DEEP=0 would have raised it; a cancelled one drops it (logged as
 `error=<type>`), because the branch that ran instead never needed it — the
 held-exception rule of the critic's speculation (`critic.py`).
 
-Timestamps. A held event keeps its object, but the copy the Runner is handed
-is stamped when it is relayed (monotonic, one microsecond apart at least).
-Relayed as created, the kept events would be timestamped BEFORE the router's
-event that precedes them in the session, and a session store that orders by
-timestamp — the Vertex one appends each event with its own — would read the
-turn back in another order than it was streamed.
+Snapshots. What is held is each event AS IT WAS YIELDED: its content and its
+actions are deep-copied in the pump, before the run takes another step. The
+Runner serialises a live event — to the stream and to the Vertex store —
+before it asks for the next one; a held event is serialised only when it is
+relayed, rounds later. Anything the run writes in between into an object the
+event shares would reach the stream and the store through it, and two such
+writes are known:
+- ADK builds every chunk of one model call as a shallow copy of one event
+  (base_llm_flow: `_finalize_model_response_event`), so the partials share
+  the complete event's EventActions — and the output_key save writes the
+  agent's whole output into its state_delta. A formatter partial held until
+  then was relayed carrying the entire answer payload, which the serial
+  run_async stream never shows on a partial.
+- The executor's `_sources` masking once assigned into the session's own
+  FunctionResponse (ADK shares it with the request for a model-issued call
+  id), and every kept turn relayed its tool results without `_sources`,
+  `_cited` and `_sourcesTotal` — the bot's source chips and [n] list
+  (context_pruning.py: `strip_source_metadata`, now copy-on-write).
+The copy costs about what the event's serialisation costs.
+
+Timestamps. The copy the Runner is handed is stamped when it is relayed
+(monotonic, one microsecond apart at least). Relayed as created, the kept
+events would be timestamped BEFORE the router's event that precedes them in
+the session, and a session store that orders by timestamp — the Vertex one
+appends each event with its own — would read the turn back in another order
+than it was streamed.
 
 One line per turn, next to `dispatcher: intent` (`dispatcher.log_speculation`):
 
@@ -234,10 +254,12 @@ def _fork_session(ctx: InvocationContext, *, decision: RouterDecision, router_na
     State is deep-copied (it is small, and a nested write must not reach the
     real one) and carries `decision` as the router decision. Events are the
     same objects in a new list, minus this turn's router events: past events
-    are never mutated by the agents that read them (context_pruning.py copies
-    on write, ADK copies contents for each request), and deep-copying a
-    200-turn thread's tool payloads on every turn would be the cost this
-    change exists to remove."""
+    are never written to by the agents that read them (ADK copies each part
+    for a request, and context_pruning.py writes only to its own copies), and
+    deep-copying a 200-turn thread's tool payloads on every turn would be the
+    cost this change exists to remove. This turn's events are another matter:
+    they are relayed rounds after they were yielded, so they are held as
+    snapshots (`_as_yielded`)."""
     state = copy.deepcopy(dict(ctx.session.state))
     state[ROUTER_STATE_KEY] = decision.model_dump(exclude_none=True)
     events = [
@@ -248,23 +270,26 @@ def _fork_session(ctx: InvocationContext, *, decision: RouterDecision, router_na
     return ctx.session.model_copy(update={"state": state, "events": events})
 
 
-def _delta_of(event: Event) -> dict | None:
-    """The event's state_delta as yielded — BEFORE the fork's append trims its
-    temp: keys in place — so the copy the Runner gets carries all of it."""
-    delta = event.actions.state_delta if event.actions else None
-    return dict(delta) if delta else None
+def _as_yielded(event: Event) -> Event:
+    """The event as its agent yielded it: a copy with its content and its
+    actions deep-copied, so nothing the run does later — to the event, or to
+    an object it shares with a later chunk or a later request — changes what
+    is relayed (module docstring, "Snapshots"). Its state_delta is therefore
+    the one yielded, BEFORE the fork's append trims its temp: keys in place,
+    so the Runner applies all of it to the real session, as it would have."""
+    update: dict[str, Any] = {}
+    if event.content is not None:
+        update["content"] = event.content.model_copy(deep=True)
+    if event.actions is not None:
+        update["actions"] = event.actions.model_copy(deep=True)
+    return event.model_copy(update=update) if update else event
 
 
-def _for_caller(event: Event, delta: dict | None, timestamp: float) -> Event:
-    """The copy of a fork event that the Runner appends to the real session.
-
-    A copy, because the fork's event object stays in the fork's history and
-    the Runner's append rewrites fields in place (the temp: trim). Same id,
-    content and author; the state_delta as it was yielded; stamped now."""
-    update: dict[str, Any] = {"timestamp": timestamp}
-    if delta is not None and event.actions is not None:
-        update["actions"] = event.actions.model_copy(update={"state_delta": delta})
-    return event.model_copy(update=update)
+def _for_caller(held: Event, timestamp: float) -> Event:
+    """The held event as the Runner gets it: stamped now (module docstring,
+    "Timestamps"). The Runner's append then rewrites the held copy's own
+    actions (the temp: trim), which nothing else holds."""
+    return held.model_copy(update={"timestamp": timestamp})
 
 
 _END = object()  # queue marker: the speculative run has ended
@@ -312,11 +337,14 @@ class _Speculation:
         try:
             async with aclosing(agent.run_async(self.ctx)) as events:
                 async for event in events:
-                    delta = _delta_of(event)
+                    # The snapshot before the next await: the fork's append
+                    # trims the delta in place, and the run's next step may
+                    # write into what the event shares.
+                    held = _as_yielded(event)
                     if not event.partial:
                         await self.ctx.session_service.append_event(self.session, event)
                     self.produced += 1
-                    self._queue.put_nowait((event, delta))
+                    self._queue.put_nowait(held)
         except Exception as exc:  # noqa: BLE001 — held for relay(); see the module docstring
             self.error = exc
         finally:
@@ -348,14 +376,13 @@ class _Speculation:
         Runner; then the run's exception, if it raised one."""
         last = 0.0
         while True:
-            item = await self._queue.get()
-            if item is _END:
+            held = await self._queue.get()
+            if held is _END:
                 if self.error is not None:
                     raise self.error
                 return
-            event, delta = item
             last = max(time.time(), last + _TICK)
-            yield _for_caller(event, delta, last)
+            yield _for_caller(held, last)
 
     async def close(self) -> None:
         """Cancel the run if it is still going, and wait until it has stopped:

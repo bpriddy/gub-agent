@@ -31,12 +31,22 @@ stub tools. No model is ever called.
 - an exception inside the speculative run fails only a turn that keeps it;
 - a caller that goes away cancels whatever is running;
 - the per-pass round and tool budgets, the sandbox overrides, the tenant label
-  and the conversation window reach the fork.
+  and the conversation window reach the fork;
+- tool results reach the stream and the store with their `_sources` /
+  `_cited` / `_sourcesTotal`, however late a held event is relayed.
+
+Every stream is compared as serialised when it is YIELDED, and every session
+as serialised when each event is APPENDED — what the Agent Engine's SSE
+consumer and the Vertex store see — never as the live objects after the turn,
+which a later round could have written into. And the stub executor issues its
+own call ids, as gemini-3.5-flash does: ADK treats those differently from the
+`adk-` ids it makes up (it shares their function_response with the request).
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -143,16 +153,21 @@ def _rendered(llm_request) -> dict:
     }
 
 
+_CALL_IDS = itertools.count()
+
+
 class _Scripted(BaseLlm):
     """A model that answers from a script after a delay, and remembers what it
     was asked. A reply is text (streamed as two partial chunks and then the
-    whole, when the call streams), a dict (one function call), or an exception
-    to raise. The last reply repeats."""
+    whole, when the call streams), a dict (one function call, with the model's
+    own call id unless `model_ids` is off — then ADK makes up an `adk-` one),
+    or an exception to raise. The last reply repeats."""
 
     replies: list = []
     delay: float = 0.0
     delays: list = []  # per call, overriding `delay` for the first len(delays) calls
     until: Any = None  # reply only once this zero-argument callable is true
+    model_ids: bool = True
     requests: list = []
     calls: int = 0
     in_flight: int = 0
@@ -184,7 +199,11 @@ class _Scripted(BaseLlm):
         if isinstance(reply, BaseException):
             raise reply
         if isinstance(reply, dict):
-            call = genai_types.FunctionCall(name=reply["name"], args=reply.get("args", {}))
+            call = genai_types.FunctionCall(
+                name=reply["name"],
+                args=reply.get("args", {}),
+                id=f"stub{next(_CALL_IDS):05d}" if self.model_ids else None,
+            )
             yield LlmResponse(
                 content=genai_types.Content(
                     role="model", parts=[genai_types.Part(function_call=call)]
@@ -247,12 +266,23 @@ def ran_to_end(models: SimpleNamespace) -> bool:
     return models.executor.calls > 0 and not _speculating()
 
 
+PLUMBING = ("_sources", "_cited", "_sourcesTotal")  # what the bot binds links from
+
+
 async def org_query(entity: str, tool_context: ToolContext) -> dict:
     """Query org records for an entity."""
     # temp: state lives for the invocation and is trimmed before it is stored.
     tool_context.state["temp:looked_up"] = entity
     await asyncio.sleep(TOOL_DELAY)
-    return {"results": [{"id": "a1", "name": "chevy", "status": "live"}], "total": 1}
+    return {
+        "results": [{"id": "a1", "name": "chevy", "status": "live"}],
+        "total": 1,
+        # Masked from every model request (context_pruning), and read by the
+        # bot off the stream and the stored session.
+        "_sources": [{"fileId": "f1", "name": "chevy brief"}],
+        "_cited": {"f1": {"name": "chevy brief"}},
+        "_sourcesTotal": 1,
+    }
 
 
 async def find_files(query: str) -> dict:
@@ -346,12 +376,30 @@ def _use_fast_path(monkeypatch, built: SimpleNamespace, lookup) -> None:
     monkeypatch.setitem(fp._LOOKUPS, "campaign_status", lookup)
 
 
+def _frozen(event: Event) -> Event:
+    """The event as serialised NOW — what the SSE consumer sends when it is
+    yielded, what a Vertex store POSTs when it is appended — read back."""
+    return Event.model_validate(event.model_dump(mode="json", exclude_none=True))
+
+
 class _Session:
-    """One conversation on one runner, turn after turn."""
+    """One conversation on one runner, turn after turn. Keeps every event the
+    store was handed, serialised the moment its append returned."""
 
     def __init__(self, root: BaseAgent) -> None:
         self.runner = InMemoryRunner(agent=root, app_name="gub")
         self.id: str | None = None
+        self.stored: list[Event] = []
+        service = self.runner.session_service
+        append = service.append_event
+
+        async def append_event(session, event):
+            appended = await append(session=session, event=event)
+            if not event.partial:
+                self.stored.append(_frozen(event))
+            return appended
+
+        service.append_event = append_event
 
     async def open(self, state: dict | None = None) -> _Session:
         session = await self.runner.session_service.create_session(
@@ -370,15 +418,18 @@ class _Session:
         )
 
     async def turn(self, question: str = "how is chevy doing?") -> SimpleNamespace:
+        """`streamed` as serialised at yield time, `events` as serialised at
+        append time; `state` is the stored one."""
         started = time.monotonic()
-        streamed = [event async for event in self.stream(question)]
+        streamed = [_frozen(event) async for event in self.stream(question)]
         wall = time.monotonic() - started
         final = await self.runner.session_service.get_session(
             app_name="gub", user_id="u", session_id=self.id
         )
+        assert [e.id for e in self.stored] == [e.id for e in final.events]  # saw every append
         return SimpleNamespace(
             streamed=streamed,
-            events=final.events,
+            events=list(self.stored),
             state=dict(final.state),
             wall=wall,
             inv=final.events[-1].invocation_id,
@@ -1069,6 +1120,88 @@ async def test_the_conversation_window_cuts_the_fork_where_it_cuts_the_session()
     assert not any("first question" in p or "second question" in p for p in texts)
 
 
+# ── tool results keep their plumbing ─────────────────────────────────────────
+
+
+def round_two_in_flight(models: SimpleNamespace) -> bool:
+    """The executor's second call is in flight: its callbacks have already run
+    on a request that carries the (held) tool result."""
+    return models.executor.calls >= 2 and models.executor.in_flight > 0
+
+
+def _tool_results(events: list[Event]) -> list[genai_types.FunctionResponse]:
+    return [
+        part.function_response
+        for event in events
+        for part in (event.content.parts if event.content else None) or []
+        if part.function_response
+    ]
+
+
+PLUMBED = [
+    pytest.param(False, None, True, id="serial"),
+    pytest.param(True, ran_to_end, True, id="kept-after-the-run-finished"),
+    pytest.param(True, round_two_in_flight, True, id="kept-mid-run"),
+    pytest.param(True, round_two_in_flight, False, id="kept-mid-run-adk-ids"),
+]
+
+
+@pytest.mark.parametrize("speculative,router_until,model_ids", PLUMBED)
+async def test_tool_results_reach_the_stream_and_the_store_with_their_plumbing(
+    speculative, router_until, model_ids, caplog
+):
+    """The bot builds its source chips, its [n] list and the blend-08 names
+    from `_sources` / `_cited` / `_sourcesTotal` on the streamed and the stored
+    tool results. The executor's next round masks them from its own request;
+    that must never reach an event — least of all a held one, relayed after
+    that round has run. `adk-` ids are the control: ADK copies those."""
+
+    built = _build(speculative=speculative, router=[_decision()], router_until=router_until)
+    built.models.executor.model_ids = model_ids
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
+        after = await _one_turn(built)
+
+    # The round after the tool result ran, and its request had the plumbing masked.
+    assert built.models.executor.calls == 2
+    sent = [p for c in built.models.executor.requests[1]["contents"] for p in c[1]]
+    assert any(p.startswith("result:org_query:") for p in sent)
+    assert not any(key in p for p in sent for key in PLUMBING)
+    for events in (after.streamed, after.events):
+        [result] = _tool_results(events)
+        assert result.id.startswith("adk-") is (not model_ids)
+        assert set(PLUMBING) <= set(result.response)
+        assert result.response["_sources"] == [{"fileId": "f1", "name": "chevy brief"}]
+    if speculative:
+        assert _lines(caplog, "speculation:")[-1].startswith("speculation: outcome=kept ")
+
+
+def _masking_in_place(callback_context, llm_request) -> None:
+    """The masking as it once was: the scrubbed payload assigned INTO the
+    request's FunctionResponse — the session event's own, for a model id."""
+    for content in llm_request.contents or []:
+        for part in content.parts or []:
+            fr = part.function_response
+            if fr is not None and isinstance(fr.response, dict):
+                fr.response = {k: v for k, v in fr.response.items() if k not in PLUMBING}
+
+
+async def test_a_held_event_is_relayed_as_it_was_yielded(monkeypatch):
+    """Belt and braces. Were a callback to write into what a held event shares
+    with a later request again, the relay still carries the event as it was
+    yielded — which is what the serial root's stream and store carry, since
+    they serialise it before the next round runs."""
+    monkeypatch.setattr(agent_module, "strip_source_metadata", _masking_in_place)
+    before = await _one_turn(_build(speculative=False, router=[_decision()]))
+    built = _build(speculative=True, router=[_decision()], router_until=round_two_in_flight)
+    after = await _one_turn(built)
+
+    for events in (before.streamed, before.events, after.streamed, after.events):
+        [result] = _tool_results(events)
+        assert set(PLUMBING) <= set(result.response)
+    assert _shape(after.streamed) == _shape(before.streamed)
+    assert _shape(after.events) == _shape(before.events)
+
+
 # ── the pieces ───────────────────────────────────────────────────────────────
 
 
@@ -1151,12 +1284,30 @@ async def test_the_agent_engine_path_keeps_and_streams_the_same(caplog):
         runner = InMemoryRunner(agent=built.root, app_name="gub")
         session = await runner.session_service.create_session(app_name="gub", user_id="u")
         with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
-            streamed = await asyncio.to_thread(lambda: list(_sync_stream(runner, session.id)))
+            streamed = await asyncio.to_thread(
+                lambda: [_frozen(e) for e in _sync_stream(runner, session.id)]
+            )
         results.append(streamed)
 
     before, after = results
-    assert _shape(after) == _shape(before)
+    # A partial's state keys are compared apart. ADK builds every chunk of a
+    # model call from one event and shares its EventActions, into which the
+    # output_key save writes on the complete event; the sync Runner.run hands
+    # events over a thread queue without waiting, so what a SERIAL partial
+    # carries depends on when the consumer gets to it. The speculative root
+    # relays the formatter's chunks as they were yielded: without any.
+    assert _shape(_without_partial_deltas(after)) == _shape(_without_partial_deltas(before))
+    assert not any(e.actions.state_delta for e in after if e.partial and e.author == "formatter")
     assert _lines(caplog, "speculation:")[-1].startswith("speculation: outcome=kept ")
+
+
+def _without_partial_deltas(events: list[Event]) -> list[Event]:
+    return [
+        e.model_copy(update={"actions": e.actions.model_copy(update={"state_delta": {}})})
+        if e.partial
+        else e
+        for e in events
+    ]
 
 
 async def test_the_agent_engine_path_cancels_the_run_when_the_caller_closes_early():
