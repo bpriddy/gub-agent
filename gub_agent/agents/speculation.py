@@ -10,8 +10,21 @@ max 67 s (n=212, router-era turns), because gemini-3.5-flash sometimes waits
 path is what the dispatcher picks on 155/212 of those turns (24/26 recently).
 Starting it at the same moment as the router hides the router's WHOLE duration
 on those turns, whatever the stall's cause: an upper bound of p50 -5.9 s,
-mean -10.8 s, p90 -28 s per deep turn. What it costs on the other turns is the
-speculative work thrown away: 1-2 executor rounds (~$0.015-0.03 each).
+mean -10.8 s, p90 -28 s per deep turn.
+
+Two kinds of turn gain nothing from it and pay for it:
+- A turn the dispatcher does not send down the deep path — about a third of
+  the anomaly tenant's production turns (2026-09-17..24) — throws the
+  speculation away, with whatever it had done by the time the router
+  answered. That is NOT bounded to 1-2 executor rounds (~$0.015-0.03 each,
+  the figure this was first sized on): the slower the router, the more of
+  the deep path runs, and with a stalled router — the very case this
+  exists for — it can be the WHOLE deep path: every executor round, the
+  critic, the formatter, and the GUB calls, which count against the
+  per-subject rate limit the user's real turns share.
+- A `file_lookup` turn (~10% of deep turns) while FILE_SEARCH_ENABLED is on,
+  as in production, is always restarted (`_stale_reason`): it saves about
+  nothing and pays for the run it threw away.
 
     SpeculativeDispatch("speculative_dispatch")      replaces [router, dispatcher]
       ├─ router       — run live; its events are yielded as they come
