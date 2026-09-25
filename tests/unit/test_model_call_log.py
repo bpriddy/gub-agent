@@ -6,7 +6,9 @@ what is pinned here is that it can be trusted as one:
 
 - exactly one line per call, written when the call ends — never per streamed
   chunk — with every field present and numeric: ttft_ms, dur_ms and the four
-  token counts;
+  token counts — except ttft_ms, which is `-` when no chunk arrived (a
+  cancelled or failed call's duration there would read as a first-token
+  stall);
 - a failed call still logs, as `status=error:<code>`, and the error still
   propagates unchanged;
 - the agent, invocation and tenant are the CALLER's: bound by the agent's own
@@ -59,6 +61,7 @@ FIELDS = [
     "tenant",
 ]
 NUMERIC = ["stream", "ttft_ms", "dur_ms", "prompt", "cached", "thoughts", "out"]
+NO_CHUNK_NUMERIC = [f for f in NUMERIC if f != "ttft_ms"]
 USAGE = genai_types.GenerateContentResponseUsageMetadata(
     prompt_token_count=1200,
     cached_content_token_count=800,
@@ -227,8 +230,9 @@ async def test_a_failed_call_logs_its_status_and_the_error_propagates(logs):
     assert raised.value is boom
     [line] = _lines(logs)
     assert line["status"] == "error:503" and line["_level"] == "WARNING"
-    assert all(line[f].isdigit() for f in NUMERIC)
-    assert line["ttft_ms"] == line["dur_ms"]  # no chunk arrived: both run to the failure
+    assert all(line[f].isdigit() for f in NO_CHUNK_NUMERIC)
+    assert line["ttft_ms"] == "-"  # no chunk arrived: no first-token time
+    assert int(line["dur_ms"]) >= 10  # the duration runs to the failure
 
 
 async def test_a_stream_that_dies_mid_way_keeps_its_first_chunk_time(logs):
@@ -265,6 +269,35 @@ async def test_a_cancelled_call_logs_once(logs):
 
     [line] = _lines(logs)
     assert line["status"] == "error:cancelled"
+    # Cancelled before any chunk: a first-token time of `-`, not the wait.
+    assert line["ttft_ms"] == "-" and int(line["dur_ms"]) >= 10
+    assert all(line[f].isdigit() for f in NO_CHUNK_NUMERIC)
+
+
+async def test_a_call_cancelled_after_its_first_chunk_keeps_its_first_token_time(logs):
+    router, _ = _router(_text("par", partial=True), 5.0, _text("never"))
+    _bind()
+
+    stream = router.generate_content_async(_request(), stream=True)
+    task = asyncio.create_task(_drain(stream))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    [line] = _lines(logs)
+    assert line["status"] == "error:cancelled"
+    assert int(line["ttft_ms"]) < 15  # the chunk came at once; the cancel later
+
+
+async def test_a_call_that_yields_nothing_has_no_first_token_time(logs):
+    router, _ = _router()
+    _bind()
+
+    assert await _drain(router.generate_content_async(_request())) == []
+
+    [line] = _lines(logs)
+    assert line["status"] == "ok" and line["ttft_ms"] == "-"
 
 
 # ── whose call it is ─────────────────────────────────────────────────────────

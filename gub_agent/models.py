@@ -162,19 +162,23 @@ class VendorRouter(BaseLlm):
 
 # ── The per-call line ─────────────────────────────────────────────────────────
 #
-#   model_call: agent=… model=… stream=0|1 ttft_ms=… dur_ms=… prompt=… cached=…
+#   model_call: agent=… model=… stream=0|1 ttft_ms=<n>|- dur_ms=… prompt=… cached=…
 #     thoughts=… out=… status=ok|error:<code> retries=<n>|- inv=… tenant=…
 #
 # One line per call, written when the call ends — never per streamed chunk.
 # `ttft_ms` is the wait for the first chunk (a non-streamed call has one, so
-# there it equals `dur_ms`); `dur_ms` runs to the LAST chunk, not to the end of
-# the generator: after a function-call reply ADK runs the tools while this
+# there it equals `dur_ms`), and `-` when none arrived: a call cancelled or
+# failed before its first chunk has no first-token time, and its duration in
+# that field would read as a first-token stall. `dur_ms` runs to the LAST
+# chunk (to the end of the call, when none arrived), not to the end of the
+# generator: after a function-call reply ADK runs the tools while this
 # generator is suspended, and tool time is not model time. Both are measured
 # where ADK reads them, so a streamed call's gaps include ADK's own handling of
-# each chunk. Token counts are the last usage_metadata the call reported:
-# `cached` is the part of `prompt` served from the context cache, `thoughts`
-# are billed as output beside `out`. `prompt=` is a COUNT: no request or reply
-# text is ever logged here.
+# each chunk. Token counts are the last usage_metadata the call reported (0
+# when it reported none, as a call with no chunk never does): `cached` is the
+# part of `prompt` served from the context cache, `thoughts` are billed as
+# output beside `out`. `prompt=` is a COUNT: no request or reply text is ever
+# logged here.
 #
 # Count calls with `textPayload:"model_call: agent="`. `tenant=` goes last, as
 # on the dispatcher line — numerator and denominator need the same clause.
@@ -309,16 +313,15 @@ class _ModelCall:
 
     def log(self) -> None:
         end = time.monotonic()
-        first = self.first if self.first is not None else end
         last = self.last if self.last is not None else end
         observable = self.genai and _GENAI_LOGGER.isEnabledFor(logging.INFO)
         (logger.info if self.status == "ok" else logger.warning)(
-            "model_call: agent=%s model=%s stream=%d ttft_ms=%d dur_ms=%d prompt=%d "
+            "model_call: agent=%s model=%s stream=%d ttft_ms=%s dur_ms=%d prompt=%d "
             "cached=%d thoughts=%d out=%d status=%s retries=%s inv=%s tenant=%s",
             self.agent,
             self.model,
             1 if self.stream else 0,
-            round((first - self.started) * 1000),
+            "-" if self.first is None else round((self.first - self.started) * 1000),
             round((last - self.started) * 1000),
             _count(self.usage, "prompt_token_count"),
             _count(self.usage, "cached_content_token_count"),
