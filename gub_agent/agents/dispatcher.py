@@ -149,7 +149,17 @@ def log_speculation(
     error: str | None = None,
 ) -> None:
     """The per-turn `speculation:` line — one per turn, next to the
-    `dispatcher: intent` line, so the two count the same turns.
+    `dispatcher: intent` line, so the two count the same turns, with ONE
+    exception: `cancelled:aborted`, a turn that ended before the router's
+    decision (the caller went away while it ran), has no `dispatcher: intent`
+    line — the serial root logs nothing at all for such a turn. It is logged
+    anyway because that turn is where a speculation can cost the most: a
+    router stalled past the caller's deadline while the deep path ran on, GUB
+    calls and all, and this line is the only per-turn record of that cost.
+    So the `speculation:` lines minus `outcome=cancelled:aborted` count exactly
+    the `dispatcher: intent` lines; `cancelled:aborted` never follows a
+    decision (`agents/speculation.py` writes every other outcome before
+    anything after the decision can be interrupted).
 
     `result` is `kept`, `cancelled:<branch>`, `restarted:<reason>` or `off`
     (`agents/speculation.py`); `off` is this dispatcher's, which runs only

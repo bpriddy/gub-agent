@@ -172,6 +172,7 @@ class _Scripted(BaseLlm):
     delays: list = []  # per call, overriding `delay` for the first len(delays) calls
     until: Any = None  # reply only once this zero-argument callable is true
     model_ids: bool = True
+    linger: float = 0.0  # how long a cancelled call takes to stop
     requests: list = []
     calls: int = 0
     in_flight: int = 0
@@ -197,6 +198,8 @@ class _Scripted(BaseLlm):
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             self.cancelled += 1
+            if self.linger:
+                await asyncio.sleep(self.linger)
             raise
         finally:
             self.in_flight -= 1
@@ -1036,6 +1039,57 @@ async def test_a_caller_that_goes_away_before_the_decision_cancels_the_speculati
     assert _pending_tasks() <= pending
     [line] = _lines(caplog, "speculation:")
     assert line.startswith("speculation: outcome=cancelled:aborted ")
+    # The one outcome with no decision beside it (dispatcher.log_speculation).
+    assert _lines(caplog, "dispatcher: intent") == []
+
+
+AFTER_THE_DECISION = [
+    pytest.param(_decision("smalltalk", 0.97), False, "cancelled:smalltalk", id="no-data"),
+    pytest.param(_decision("file_lookup", 0.9), True, "restarted:file_lookup", id="restart"),
+    pytest.param(
+        _decision("campaign_status", 0.95, entity_surface="Silverado"),
+        False,
+        "cancelled:fast",
+        id="fast",
+    ),
+]
+
+
+@pytest.mark.parametrize("decision,file_search,outcome", AFTER_THE_DECISION)
+async def test_a_caller_that_goes_away_after_the_decision_gets_the_branchs_outcome(
+    decision, file_search, outcome, monkeypatch, caplog
+):
+    """The decision is logged, and the caller leaves while the speculation is
+    still being stopped. The turn has its `dispatcher: intent` line, so its
+    `speculation:` line names the branch — `cancelled:aborted` is only ever a
+    turn with no decision."""
+    monkeypatch.setattr(config, "FILE_SEARCH_ENABLED", file_search)
+    built = _build(speculative=True, router=[decision], exec_delays=[5.0], router_until=mid_call)
+    built.models.executor.linger = 5.0  # stopping it takes a while
+    _use_fast_path(monkeypatch, built, _declined)
+    session = await _Session(built.root).open()
+    pending = _pending_tasks()
+
+    stream = session.stream("how is chevy doing?")
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
+        async for event in stream:
+            if event.author == "router" and not event.partial:
+                break
+        read = asyncio.ensure_future(anext(stream))  # the root decides, then stops the run
+        for _ in range(500):
+            if built.models.executor.cancelled:
+                break
+            await asyncio.sleep(0.01)
+        assert built.models.executor.cancelled == 1 and not read.done()
+        read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read
+        await stream.aclose()
+
+    assert _pending_tasks() <= pending
+    assert len(_lines(caplog, "dispatcher: intent")) == 1
+    [line] = _lines(caplog, "speculation:")
+    assert line.startswith(f"speculation: outcome={outcome} ")
 
 
 async def test_a_caller_that_goes_away_mid_relay_cancels_the_rest_of_the_run():

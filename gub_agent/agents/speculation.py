@@ -127,8 +127,11 @@ run, when it had already finished), `buffered` how many events it held then.
 `kept` + `lead_ms` is the time saved, bounded by the router's duration;
 `cancelled:*` and `restarted:*` are what the speculation cost.
 
-`cancelled:aborted` is a turn that ended before any decision (the caller went
-away). `off` is logged by the plain `Dispatcher`: SPECULATIVE_DEEP=0, or a
+`cancelled:aborted` is a turn that ended before any decision — the caller went
+away while the router ran — and the one outcome with no `dispatcher: intent`
+line beside it (`dispatcher.log_speculation` says why it is logged anyway).
+Every other outcome is written the moment it is known, before anything after
+the decision can be interrupted. `off` is logged by the plain `Dispatcher`: SPECULATIVE_DEEP=0, or a
 resumable invocation, which this root runs serially (forking one would fork
 its agent states, and nothing deployed is resumable).
 
@@ -532,7 +535,13 @@ class SpeculativeDispatch(BaseAgent):
                     yield event
             return
 
+        # The `speculation:` line is written as soon as the branch's outcome is
+        # known, before anything after the decision can be interrupted, so
+        # `cancelled:aborted` means exactly "no `dispatcher: intent` line"
+        # (dispatcher.log_speculation).
         logged = False
+        decided: str | None = None  # the branch, once `dispatcher: intent` is out
+        at_decision: dict[str, Any] = {}
         try:
             # ── the router, live ──
             router_error: Exception | None = None
@@ -563,6 +572,7 @@ class SpeculativeDispatch(BaseAgent):
                 decision = _decision_of_this_turn(ctx)
             branch = dp.choose(decision)
             dp.log_decision(ctx, decision, branch)
+            decided = branch
             at_decision = run.progress()
 
             # ── the deep branch: keep, or restart ──
@@ -575,9 +585,9 @@ class SpeculativeDispatch(BaseAgent):
                         async for event in events:
                             yield event
                     return
-                await run.discard(ctx)
                 dp.log_speculation(ctx, f"restarted:{reason}", **at_decision)
                 logged = True
+                await run.discard(ctx)
                 run = _Speculation(
                     deep, ctx, decision=decision, router_name=router.name, speculative=False
                 )
@@ -589,9 +599,9 @@ class SpeculativeDispatch(BaseAgent):
             # ── every other branch runs with nothing beside it ──
             payload = dp.no_data_payload(ctx, decision, branch)
             if payload is not None:
-                await run.discard(ctx)
                 dp.log_speculation(ctx, f"cancelled:{branch}", **at_decision)
                 logged = True
+                await run.discard(ctx)
                 yield payload
                 return
 
@@ -599,13 +609,15 @@ class SpeculativeDispatch(BaseAgent):
             # stopped first (module docstring). One that has already finished
             # will never read the stores again, so only its entries go; its
             # events wait out the fast path, and a decline uses them — a FAST
-            # intent is never one the tool gate treats apart.
-            if run.done:
-                run.clear(ctx)
-            else:
-                await run.discard(ctx)
+            # intent is never one the tool gate treats apart. Its outcome is
+            # logged when the fast path is done — or interrupted, stopping
+            # the run included.
             declined = False
             try:
+                if run.done:
+                    run.clear(ctx)
+                else:
+                    await run.discard(ctx)
                 async with aclosing(dp.fast_path.run_async(ctx)) as events:
                     async for event in events:
                         yield event
@@ -632,7 +644,12 @@ class SpeculativeDispatch(BaseAgent):
         finally:
             # A caller that went away, an exception anywhere above, or a run
             # that ended: nothing speculative outlives the turn.
-            unlogged = None if logged else run.progress()
+            if logged:
+                unlogged = None
+            elif decided is None:  # before any decision: no `dispatcher: intent` line
+                unlogged = ("cancelled:aborted", run.progress())
+            else:  # after it (only a synchronous error gets here): that branch's line
+                unlogged = (f"cancelled:{decided}", at_decision)
             await run.close()
             if unlogged is not None:
-                dp.log_speculation(ctx, "cancelled:aborted", **unlogged)
+                dp.log_speculation(ctx, unlogged[0], **unlogged[1])
