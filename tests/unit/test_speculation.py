@@ -33,7 +33,10 @@ stub tools. No model is ever called.
 - the per-pass round and tool budgets, the sandbox overrides, the tenant label
   and the conversation window reach the fork;
 - tool results reach the stream and the store with their `_sources` /
-  `_cited` / `_sourcesTotal`, however late a held event is relayed.
+  `_cited` / `_sourcesTotal`, however late a held event is relayed;
+- every `gub_agent` line the speculation emits ends in ` spec=1`, and the
+  logs-first rule (drop those unless the turn's outcome is `kept`) leaves the
+  lines the serial root logs.
 
 Every stream is compared as serialised when it is YIELDED, and every session
 as serialised when each event is APPENDED — what the Agent Engine's SSE
@@ -84,6 +87,7 @@ from gub_agent.agents.critic import CriticVerdict, EscalateIfSufficient
 from gub_agent.agents.evidence_index import evidence_index, record_evidence
 from gub_agent.agents.format_gate import FormatGate
 from gub_agent.config import AGENT_NAME
+from gub_agent.models import VendorRouter
 from gub_agent.sandbox import SandboxEcho
 from gub_agent.schemas import AnswerPayload, RouterDecision
 from gub_agent.tenant import tenant_instruction
@@ -1095,7 +1099,10 @@ async def test_sandbox_overrides_and_the_tenant_reach_the_fork(monkeypatch, capl
     assert after.events[1].author == "sandbox_echo"  # provenance, before any work
     [line] = _lines(caplog, "speculation:")
     assert line.startswith("speculation: outcome=kept") and line.endswith("tenant=chevy")
-    assert all(line.endswith("tenant=chevy") for line in _lines(caplog, "turn_window: agent="))
+    assert all(
+        line.removesuffix(speculation.SPEC_MARK).endswith("tenant=chevy")
+        for line in _lines(caplog, "turn_window: agent=")
+    )
 
 
 async def test_the_conversation_window_cuts_the_fork_where_it_cuts_the_session():
@@ -1200,6 +1207,197 @@ async def test_a_held_event_is_relayed_as_it_was_yielded(monkeypatch):
         assert set(PLUMBING) <= set(result.response)
     assert _shape(after.streamed) == _shape(before.streamed)
     assert _shape(after.events) == _shape(before.events)
+
+
+# ── the speculation's log lines ──────────────────────────────────────────────
+
+
+def _with_model_call_lines(built: SimpleNamespace) -> SimpleNamespace:
+    """Every stub model behind the real VendorRouter, so each call logs its
+    `model_call:` line as it does in production."""
+
+    def wrap(agent: BaseAgent) -> None:
+        if isinstance(agent, LlmAgent) and not isinstance(agent.model, VendorRouter):
+            agent.model = VendorRouter(model="stub", gemini=agent.model)
+        for sub in agent.sub_agents:
+            wrap(sub)
+
+    wrap(built.root)
+    return built
+
+
+def _gub_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name.split(".")[0] == "gub_agent"]
+
+
+def _marked(line: str) -> bool:
+    return line.endswith(speculation.SPEC_MARK)
+
+
+def _counted(lines: list[str]) -> list[str]:
+    """The logs-first rule of speculation.py, on ONE turn's lines: a `spec=1`
+    line counts only when the turn's `speculation: outcome=` is `kept`."""
+    kept = any(line.startswith("speculation: outcome=kept ") for line in lines)
+    return [line for line in lines if kept or not _marked(line)]
+
+
+def _kind(line: str) -> str:
+    """A line without its numbers and ids: its prefix, and for model_call
+    the agent and the status."""
+    words = line.removesuffix(speculation.SPEC_MARK).split()
+    if words[0] == "model_call:":
+        fields = dict(w.split("=", 1) for w in words[1:] if "=" in w)
+        return f"model_call: agent={fields['agent']} status={fields['status']}"
+    if words[0] == "turn_window:":
+        return " ".join(words[:2])
+    return f"{words[0]} {words[1].split('=')[0]}" if len(words) > 1 else words[0]
+
+
+def _root_or_router(line: str) -> bool:
+    """Logged by the speculative root itself or by the router, which runs live."""
+    return line.startswith(
+        ("dispatcher: ", "speculation: ", "model_call: agent=router ", "turn_window: agent=router ")
+    )
+
+
+async def _declined(decision, shim, question):
+    return None
+
+
+LOGGED = [
+    # decision, router_until, exec_delays, file search, fast path lookup
+    pytest.param(_decision("smalltalk", 0.97), "ran_to_end", None, False, None, id="cancelled"),
+    pytest.param(
+        _decision("smalltalk", 0.97), "mid_call", [5.0], False, None, id="cancelled-mid-call"
+    ),
+    pytest.param(_decision(), None, None, False, None, id="kept"),
+    pytest.param(
+        _decision("file_lookup", 0.9), "mid_call", [5.0], True, None, id="restarted-file-lookup"
+    ),
+    pytest.param(
+        _decision("campaign_status", 0.95, entity_surface="Silverado"),
+        "mid_call",
+        [5.0],
+        False,
+        _declined,
+        id="restarted-fast-declined",
+    ),
+]
+
+
+@pytest.mark.parametrize("decision,until,exec_delays,file_search,lookup", LOGGED)
+async def test_the_speculations_lines_are_marked_and_the_rule_leaves_the_serial_ones(
+    decision, until, exec_delays, file_search, lookup, monkeypatch, caplog
+):
+    """A thrown-away run logs like a real one — same inv=, same tenant= —
+    so without a mark it would inflate every logs-first metric. Its lines end
+    in ` spec=1`; the root's own lines and the router's never do; a
+    restarted run is the turn's real deep run and is not marked. Dropping
+    the marked lines of a turn that did not keep the speculation leaves
+    exactly the lines the serial root logs for that turn."""
+    monkeypatch.setattr(config, "FILE_SEARCH_ENABLED", file_search)
+    runs = {}
+    for speculative in (False, True):
+        router_until = {"ran_to_end": ran_to_end, "mid_call": mid_call}.get(until)
+        built = _build(
+            speculative=speculative,
+            router=[decision],
+            exec_delays=exec_delays if speculative else None,
+            router_until=router_until if speculative else None,
+        )
+        if lookup is not None:
+            _use_fast_path(monkeypatch, built, lookup)
+        _with_model_call_lines(built)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="gub_agent"):
+            turn = await _one_turn(built)
+        runs[speculative] = (built, turn, _gub_lines(caplog))
+
+    _, _, serial = runs[False]
+    built, turn, lines = runs[True]
+    assert not any(map(_marked, serial))
+    marked = [line for line in lines if _marked(line)]
+    assert marked  # the speculation logged something
+    for line in marked:
+        assert not _root_or_router(line), line
+        assert line.count("spec=1") == 1
+        if " tenant=" in line:
+            assert line.endswith(f"tenant=anomaly{speculation.SPEC_MARK}")
+    [outcome] = _lines(caplog, "speculation:")
+    restarted = outcome.startswith("speculation: outcome=restarted:")
+    # Every deep-path line is the speculation's — unless a restart ran too.
+    deep = [line for line in lines if not _root_or_router(line)]
+    assert all(map(_marked, deep)) is not restarted
+    if until == "mid_call":
+        # Only the call in flight at the cancel says so; it is marked too.
+        calls = [line for line in lines if line.startswith(f"model_call: agent={AGENT_NAME} ")]
+        [cancelled] = [line for line in calls if "status=error:cancelled" in line]
+        assert _marked(cancelled)
+    # The rule recovers the serial root's lines, kind for kind.
+    assert sorted(map(_kind, _counted(lines))) == sorted(map(_kind, serial))
+    assert f"inv={turn.inv}" in outcome and not _marked(outcome)
+
+
+async def test_a_restarted_run_logs_unmarked(monkeypatch, caplog):
+    monkeypatch.setattr(config, "FILE_SEARCH_ENABLED", True)
+    built = _with_model_call_lines(
+        _build(
+            speculative=True,
+            router=[_decision("file_lookup", 0.9)],
+            exec_delays=[5.0],
+            router_until=mid_call,
+        )
+    )
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        await _one_turn(built)
+
+    calls = [m for m in _gub_lines(caplog) if m.startswith(f"model_call: agent={AGENT_NAME} ")]
+    assert [(_marked(m), "status=error:cancelled" in m) for m in calls] == [
+        (True, True),  # the speculation, cancelled mid-call
+        (False, False),  # the restarted run: the turn's real deep path
+        (False, False),
+    ]
+
+
+async def test_the_mark_is_the_speculations_context_and_the_gub_agent_loggers_only():
+    records = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append((record.name, record.getMessage()))
+
+    handler = Keep(logging.INFO)
+    loggers = [logging.getLogger(n) for n in ("gub_agent.models", "google_adk.x", "gub_agentx")]
+    for lg in loggers:
+        lg.addHandler(handler)
+        lg.setLevel(logging.INFO)
+
+    def log_all(where: str) -> None:
+        for lg in loggers:
+            lg.info("%s: n=%d", where, 1)
+
+    async def inside() -> None:
+        speculation._SPECULATIVE.set(True)
+        log_all("inside")
+        await asyncio.sleep(0)
+        await asyncio.create_task(asyncio.to_thread(log_all, "child"))
+
+    try:
+        log_all("before")
+        await asyncio.create_task(inside())
+        log_all("after")  # the task's context stayed its own
+    finally:
+        for lg in loggers:
+            lg.removeHandler(handler)
+            lg.setLevel(logging.NOTSET)
+
+    assert [m for n, m in records if n == "gub_agent.models"] == [
+        "before: n=1",
+        "inside: n=1 spec=1",
+        "child: n=1 spec=1",
+        "after: n=1",
+    ]
+    assert not any(_marked(m) for n, m in records if n != "gub_agent.models")
 
 
 # ── the pieces ───────────────────────────────────────────────────────────────

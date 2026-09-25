@@ -126,10 +126,36 @@ One line per turn, next to `dispatcher: intent` (`dispatcher.log_speculation`):
 run, when it had already finished), `buffered` how many events it held then.
 `kept` + `lead_ms` is the time saved, bounded by the router's duration;
 `cancelled:*` and `restarted:*` are what the speculation cost.
+
 `cancelled:aborted` is a turn that ended before any decision (the caller went
 away). `off` is logged by the plain `Dispatcher`: SPECULATIVE_DEEP=0, or a
 resumable invocation, which this root runs serially (forking one would fork
 its agent states, and nothing deployed is resumable).
+
+The speculation's own lines end in ` spec=1`. The run started beside the
+router logs like any deep run — `turn_window:`, `context_window`,
+`model_call`, `format_gate:`, the round limiter's and the circuit breaker's
+lines — under the turn's `inv=` and `tenant=`, and on a cancelled or
+restarted turn every one of them is work thrown away. So every `gub_agent`
+line it emits gets ` spec=1` appended, after `tenant=` (added, never
+interleaved: an existing substring filter matches the line as before). The
+mark is a ContextVar set inside the run's pump task, which is a context of its
+own (the ParallelAgent's branch tasks copy it from there), read by a
+log-record factory (`_marking`); a logger filter would not do, since a
+filter on `gub_agent` never sees its child loggers' records. A restarted
+run — the turn's real deep run — and everything logged by this root carry no
+mark: `dispatcher: intent` and `speculation:` keep their bytes.
+
+The logs-first rule that follows: a `spec=1` line counts only when its inv's
+`speculation: outcome=` is `kept`. On any other outcome it is the price of the
+speculation, not the turn's traffic, and it stays out of every per-turn
+proportion (format_gate drops, rounds, model_call latency, turn_window). A
+log filter cannot join on inv, so: the lines matching `NOT textPayload:"spec=1"`,
+plus the `spec=1` lines of the invs that `textPayload:"speculation:
+outcome=kept"` lists (`context_window` carries no inv; count its per-call twin,
+`turn_window: agent=executor`). Only the model call in flight at the cancel
+logs `status=error:cancelled`; the rounds a cancelled run had finished log
+`status=ok`, exactly like a kept run's.
 """
 
 from __future__ import annotations
@@ -139,8 +165,9 @@ import copy
 import logging
 import os
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
+from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any
 
@@ -171,6 +198,40 @@ SPECULATIVE_DEEP: bool = os.environ.get("SPECULATIVE_DEEP", "1").lower() in ("1"
 # Relayed events are stamped at least this far apart (seconds): one
 # microsecond, the resolution a session store's datetime keeps.
 _TICK = 1e-6
+
+
+# ── the speculation's log lines (module docstring: ` spec=1`) ────────────────
+
+SPEC_MARK = " spec=1"
+_PACKAGE = __name__.split(".")[0]  # "gub_agent": the loggers whose lines are marked
+# True inside the pump task of the run started beside the router, and in every
+# task it starts; the default everywhere else.
+_SPECULATIVE: ContextVar[bool] = ContextVar("gub_speculative_deep", default=False)
+
+
+def _marking(make_record: Callable[..., logging.LogRecord]) -> Callable[..., logging.LogRecord]:
+    """A log-record factory around `make_record` that appends SPEC_MARK to
+    the message of every `gub_agent` record made inside the speculation."""
+
+    def make(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = make_record(*args, **kwargs)
+        try:
+            if _SPECULATIVE.get() and (
+                record.name == _PACKAGE or record.name.startswith(_PACKAGE + ".")
+            ):
+                record.msg = f"{record.msg}{SPEC_MARK}"
+        except Exception:  # noqa: BLE001 — a log line must never fail the turn
+            pass
+        return record
+
+    make.gub_spec_mark = True  # type: ignore[attr-defined]
+    return make
+
+
+# Once per process, whatever imports this module first; chained, so a factory
+# installed earlier (Cloud Logging's, a test's) still makes the record.
+if not getattr(logging.getLogRecordFactory(), "gub_spec_mark", False):
+    logging.setLogRecordFactory(_marking(logging.getLogRecordFactory()))
 
 
 # ── what the deep path reads from the router ─────────────────────────────────
@@ -301,7 +362,11 @@ class _Speculation:
     The pump plays the Runner's part inside the fork — append each non-partial
     event before asking for the next — and never waits for the real caller,
     so the deep path runs on while its events wait. `relay()` hands them to
-    the caller in order: first those held, then the rest as they come."""
+    the caller in order: first those held, then the rest as they come.
+
+    `speculative` is True for the run started beside the router, whose log
+    lines end in ` spec=1`; a restarted run is the turn's real deep run and
+    logs as the deep path always has."""
 
     def __init__(
         self,
@@ -310,6 +375,7 @@ class _Speculation:
         *,
         decision: RouterDecision,
         router_name: str,
+        speculative: bool,
     ) -> None:
         self.session = _fork_session(ctx, decision=decision, router_name=router_name)
         self.ctx = ctx.model_copy(
@@ -322,6 +388,7 @@ class _Speculation:
                 "end_of_agents": dict(ctx.end_of_agents),
             }
         )
+        self.speculative = speculative
         self.produced = 0
         self.error: Exception | None = None
         self.discarded = False
@@ -334,6 +401,8 @@ class _Speculation:
         )
 
     async def _pump(self, agent: BaseAgent) -> None:
+        if self.speculative:
+            _SPECULATIVE.set(True)  # this task's own context, and its children's
         try:
             async with aclosing(agent.run_async(self.ctx)) as events:
                 async for event in events:
@@ -444,7 +513,13 @@ class SpeculativeDispatch(BaseAgent):
         run: _Speculation | None = None
         if not ctx.is_resumable:
             try:
-                run = _Speculation(deep, ctx, decision=FALLBACK_DECISION, router_name=router.name)
+                run = _Speculation(
+                    deep,
+                    ctx,
+                    decision=FALLBACK_DECISION,
+                    router_name=router.name,
+                    speculative=True,
+                )
             except Exception:  # noqa: BLE001 — no speculation must never cost the turn
                 logger.exception(
                     "speculation: could not fork the session (inv=%s) tenant=%s — serial",
@@ -503,7 +578,9 @@ class SpeculativeDispatch(BaseAgent):
                 await run.discard(ctx)
                 dp.log_speculation(ctx, f"restarted:{reason}", **at_decision)
                 logged = True
-                run = _Speculation(deep, ctx, decision=decision, router_name=router.name)
+                run = _Speculation(
+                    deep, ctx, decision=decision, router_name=router.name, speculative=False
+                )
                 async with aclosing(run.relay()) as events:
                     async for event in events:
                         yield event
@@ -546,7 +623,9 @@ class SpeculativeDispatch(BaseAgent):
             dp.log_fast_path_declined(ctx)
             if not reuse:
                 await run.discard(ctx)
-                run = _Speculation(deep, ctx, decision=decision, router_name=router.name)
+                run = _Speculation(
+                    deep, ctx, decision=decision, router_name=router.name, speculative=False
+                )
             async with aclosing(run.relay()) as events:
                 async for event in events:
                     yield event
