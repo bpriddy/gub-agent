@@ -238,6 +238,9 @@ def build_deep_agent(
     A function over the agents, not over the module singletons, so both
     shapes can be built in one process for the tests; the module builds one.
     """
+    # Both gates read the payload off THIS pass's events by these authors, never
+    # off state, which can still hold an earlier turn's (critic.py:_this_pass_payload).
+    payload_authors = (gate.name, *(agent.name for agent in gate.sub_agents))
     if parallel:
         speculation = SpeculativeCritic(name="critic_speculation", sub_agents=[critic])
         middle: list[BaseAgent] = [
@@ -245,11 +248,14 @@ def build_deep_agent(
             CriticResolver(
                 name="critic_gate",
                 critic_name=critic.name,
-                payload_authors=(gate.name, *(agent.name for agent in gate.sub_agents)),
+                payload_authors=payload_authors,
             ),
         ]
     else:
-        middle = [gate, CriticGate(name="critic_gate", sub_agents=[critic])]
+        middle = [
+            gate,
+            CriticGate(name="critic_gate", sub_agents=[critic], payload_authors=payload_authors),
+        ]
     return LoopAgent(
         name="gub_pipeline",
         sub_agents=[executor, *middle, escalator],

@@ -45,7 +45,8 @@ from .evidence_index import formatter_brief
 
 FORMATTER_NAME = "formatter"
 # The bot writes the payload it finds under this state key… nowhere — but the
-# CriticGate reads it (abstain recognition) and tests assert on it.
+# critic gate reads it off this pass's events (abstain recognition) and tests
+# assert on it.
 ANSWER_STATE_KEY = "answer_payload"
 
 

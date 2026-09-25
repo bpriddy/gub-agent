@@ -29,7 +29,8 @@ that genuinely improves dependability.
 Two wirings, chosen by CRITIC_PARALLEL (agent.py:build_deep_agent):
 
 - serial (0):   executor → format_gate → CriticGate → escalator. The gate
-                reads the formatter's payload from state, then runs the LLM.
+                reads this pass's payload off the format gate's events, then
+                runs the LLM.
 - parallel (1): executor → ParallelAgent(format_gate, SpeculativeCritic)
                 → CriticResolver → escalator. The critic LLM runs while the
                 formatter does, and the resolver — named `critic_gate`, so
@@ -342,6 +343,11 @@ class CriticGate(BaseAgent):
     one run means skipping it here rather than rebuilding the pipeline.
     """
 
+    #: The authors of this pass's payload: the format gate and its formatter
+    #: (agent.py:build_deep_agent). Empty, no payload is ever this pass's and
+    #: the critic LLM judges every abstain — the old behaviour, never a skip.
+    payload_authors: tuple[str, ...] = ()
+
     def _critic_name(self) -> str:
         """The critic LLM's name: the author of its verdicts, and of ours when
         a verdict has to read as the critic's (`_requery_event`)."""
@@ -499,7 +505,7 @@ class CriticGate(BaseAgent):
         if reason is not None:
             yield self._pass_event(ctx, reason)
             return
-        verdict = self._abstain_verdict(ctx, ctx.session.state.get("answer_payload"))
+        verdict = self._abstain_verdict(ctx, _this_pass_payload(ctx, self.payload_authors))
         # Last, so the abstain pass keeps its reason on a retry that abstains.
         if verdict is None and _is_final_pass(self, ctx):
             verdict = self._final_pass_event(ctx)
@@ -588,12 +594,13 @@ def _this_pass_payload(ctx: InvocationContext, authors: tuple[str, ...]) -> dict
     executor that produced no text, which the gate answers with silence on
     purpose — leaves it holding an earlier one: the previous turn's, because
     session state outlives the turn. That payload's abstention would then
-    settle this turn's verdict.
+    settle this turn's verdict: in the serial wiring, a from-memory re-query
+    of a turn that had nothing to do with the earlier abstain.
 
-    The pass's gate events are the ones after the executor's last event: the
-    resolver runs straight after the join, and the critic's events are still
-    held, so the first event of this invocation by any other author is the
-    edge of the pass.
+    The pass's gate events are the ones after the executor's last event. Both
+    gates run straight after the format gate — CriticGate next to it, the
+    resolver after the join, with the critic's events still held — so the
+    first event of this invocation by any other author is the edge of the pass.
     """
     for event in reversed(ctx.session.events):
         if event.invocation_id != ctx.invocation_id or _is_bookkeeping(event):
@@ -673,8 +680,6 @@ class CriticResolver(CriticGate):
 
     #: The critic LLM's name — the author of its verdicts and of a re-query.
     critic_name: str = "critic"
-    #: The authors of this pass's payload: the format gate and its formatter.
-    payload_authors: tuple[str, ...] = ()
 
     def _critic_name(self) -> str:
         return self.critic_name

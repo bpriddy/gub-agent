@@ -519,29 +519,35 @@ async def test_a_from_memory_abstain_is_sent_back_after_the_join():
     assert streamed[-1].author == "loop_escalator"
 
 
-async def test_a_stale_payload_left_in_state_by_an_earlier_turn_is_not_read():
+def _an_earlier_abstain() -> dict:
+    """An earlier turn that ended in an abstain payload: its gate event, and
+    the state it left behind."""
+    earlier = Event(
+        invocation_id="inv-earlier",
+        author="format_gate",
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part(text=json.dumps(ABSTAIN))]
+        ),
+        actions=EventActions(state_delta={"answer_payload": ABSTAIN}),
+    )
+    return {"state": {"answer_payload": ABSTAIN}, "prior": [earlier]}
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_a_stale_payload_left_in_state_by_an_earlier_turn_is_not_read(parallel):
     """The gate emits nothing when the executor produced no text — on purpose.
     State then still holds the previous turn's abstain payload, and a gate that
-    read state would settle THIS turn on it (here: a from-memory re-query).
-    The resolver reads this pass's payload, finds none, and asks the critic."""
-    earlier = [
-        Event(
-            invocation_id="inv-earlier",
-            author="format_gate",
-            content=genai_types.Content(
-                role="model", parts=[genai_types.Part(text=json.dumps(ABSTAIN))]
-            ),
-            actions=EventActions(state_delta={"answer_payload": ABSTAIN}),
-        )
-    ]
+    read state would settle THIS turn on it (here: a from-memory re-query —
+    two executor passes and a `sufficient: false` the bot restarts its bubble
+    on). Both gates read this pass's payload, find none, and ask the critic."""
     loop, executor, _, critic = _pipeline(
-        parallel=True,
+        parallel=parallel,
         executor_passes=[(False, "Thanks, noted.")],
         payloads=[None],
         verdicts=[SUFFICIENT],
     )
 
-    streamed, state, _ = await _run(loop, state={"answer_payload": ABSTAIN}, prior=earlier)
+    streamed, state, _ = await _run(loop, **_an_earlier_abstain())
 
     assert state["answer_payload"] == ABSTAIN  # still there, still stale
     assert len(critic.ran) == 1
@@ -836,26 +842,33 @@ async def test_the_stream_keeps_its_order_and_its_authors():
 
 
 @pytest.mark.parametrize(
-    "executor_passes,payloads,verdicts",
+    "executor_passes,payloads,verdicts,earlier_abstain",
     [
-        pytest.param([(True, "12 live.")], [ANSWER], [SUFFICIENT], id="answer-sufficient"),
+        pytest.param([(True, "12 live.")], [ANSWER], [SUFFICIENT], False, id="answer-sufficient"),
         pytest.param(
             [(True, "12 live."), (True, "Q3 live.")],
             [ANSWER, ANSWER],
             [INSUFFICIENT, SUFFICIENT],
+            False,
             id="retry",
         ),
-        pytest.param([(True, "No such account.")], [ABSTAIN], [INSUFFICIENT], id="abstain"),
+        pytest.param([(True, "No such account.")], [ABSTAIN], [INSUFFICIENT], False, id="abstain"),
         pytest.param(
             [(False, "Copied."), (True, "12 live.")],
             [ABSTAIN, ANSWER],
             [SUFFICIENT],
+            False,
             id="from-memory",
         ),
-        pytest.param([(False, "NO_COMPANY_RECORDS")], [ABSTAIN], [SUFFICIENT], id="marker"),
+        pytest.param([(False, "NO_COMPANY_RECORDS")], [ABSTAIN], [SUFFICIENT], False, id="marker"),
+        # The gate emits nothing and state still holds the previous turn's
+        # abstain payload: neither wiring may read it as this pass's.
+        pytest.param([(False, "Thanks, noted.")], [None], [SUFFICIENT], True, id="stale-state"),
     ],
 )
-async def test_both_wirings_reach_the_same_decisions(executor_passes, payloads, verdicts):
+async def test_both_wirings_reach_the_same_decisions(
+    executor_passes, payloads, verdicts, earlier_abstain
+):
     """Same turn, both trees: same passes, same verdict in state, and the same
     complete events in the same order. What differs is only WHEN the critic ran
     and, on an abstain, that the parallel one ran it for nothing."""
@@ -867,7 +880,7 @@ async def test_both_wirings_reach_the_same_decisions(executor_passes, payloads, 
             payloads=payloads,
             verdicts=verdicts,
         )
-        streamed, state, _ = await _run(loop)
+        streamed, state, _ = await _run(loop, **(_an_earlier_abstain() if earlier_abstain else {}))
         results.append(
             (
                 executor.runs,
