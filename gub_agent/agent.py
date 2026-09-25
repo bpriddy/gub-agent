@@ -23,7 +23,8 @@ The question is ROUTED first and only then answered (blend 04):
     ├─ critic_gate — evaluates information sufficiency; emits structured
     │                  verdict {sufficient, reason, feedback} into state
     │                  (with CRITIC_PARALLEL=1: resolves the held verdict
-    │                  against THIS pass's payload)
+    │                  against THIS pass's payload). On the last iteration it
+    │                  passes in code: no verdict could buy another pass
     └─ loop_escalator — exits the loop early when critic verdict is sufficient
 
   With CRITIC_PARALLEL=0 the middle is the serial pair it replaced —
@@ -203,7 +204,9 @@ executor_agent = Agent(
 # back once for a re-query). On clean answers the
 # critic emits sufficient=true, escalator triggers loop exit after one
 # iteration. On flagged failures, the executor runs again seeing the critic's
-# feedback in session state. Capped at 2 iterations.
+# feedback in session state. Capped at 2 iterations — and the second is not
+# judged by the critic LLM, whose verdict there could not buy a third
+# (agents/critic.py:_is_final_pass).
 #
 # sandbox_echo moved up to the root (below) with blend 04 — it must still
 # precede any work, and the router is now the first thing that runs.

@@ -1,8 +1,8 @@
 """
 critic.py — quality-control specialist for the GUB pipeline.
 
-Runs after the executor on every iteration of the LoopAgent. Reads the
-conversation + executor's response and emits a structured verdict
+Runs after the executor on every iteration of the LoopAgent but the last.
+Reads the conversation + executor's response and emits a structured verdict
 (sufficient, reason, feedback). Verdict drives loop exit and retry:
 
 - sufficient=true  → escalator_agent triggers actions.escalate=True →
@@ -10,6 +10,9 @@ conversation + executor's response and emits a structured verdict
 - sufficient=false → LoopAgent runs the next iteration; the executor's
                      prompt reads critic_verdict.feedback and addresses
                      the issue
+
+On the last iteration no verdict can buy another pass, so the gate writes a
+sufficient one in code instead of running the LLM (`_is_final_pass`).
 
 The critic is deliberately narrow: it doesn't second-guess data values
 it can't verify, and — since the answer contract (blend 03) — it doesn't
@@ -42,7 +45,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
-from google.adk.agents import BaseAgent, LlmAgent
+from google.adk.agents import BaseAgent, LlmAgent, LoopAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.events import Event, EventActions
@@ -266,6 +269,55 @@ def _pass_reason_before_format(ctx: InvocationContext) -> str | None:
     return None
 
 
+def _passes_judged(ctx: InvocationContext) -> int:
+    """How many of this turn's passes already carry a verdict.
+
+    Every judged pass writes one `critic_verdict` — the critic LLM's (through
+    output_key), a deterministic pass, or a re-query — and the loop reaches
+    another pass only after one of them, so the count is the index of the pass
+    now being judged. A pass that wrote none (a critic reply ADK could not
+    parse) makes the count LOW, never high: the critic then runs on a pass it
+    could have skipped, which is the old behaviour, and is never skipped on a
+    pass whose verdict could still buy a retry.
+    """
+    judged = 0
+    for event in ctx.session.events:
+        if event.invocation_id != ctx.invocation_id:
+            continue
+        delta = event.actions.state_delta if event.actions else None
+        if "critic_verdict" in (delta or {}):
+            judged += 1
+    return judged
+
+
+def _is_final_pass(agent: BaseAgent, ctx: InvocationContext) -> bool:
+    """This is the enclosing loop's last iteration: whatever the critic says,
+    the loop ends after it.
+
+    The critic LLM is there to send the executor back, and here it cannot:
+    `sufficient: false` on the last iteration buys nothing, `true` ends the
+    loop the way running out of iterations does. So its call is pure latency —
+    2.8-20.7 s on each retried production turn, and one of the five 120 s bot
+    timeouts was a critic retry. b11e400's from-memory re-query makes retries
+    more common, not less (~8% of deep turns).
+
+    What is lost is the critic's opinion of the retry itself: the bot's
+    gubCriticSufficient on a retried turn is now always true, where it used to
+    carry the second verdict. Nothing acted on it; it was logged and shown.
+
+    The loop is found by walking up (the serial gate sits in it, the
+    speculative critic one level down in the ParallelAgent), so the bound
+    follows `max_iterations` instead of restating it. Outside a bounded loop —
+    a gate driven on its own, as the unit tests do — no pass is final.
+    """
+    loop = agent.parent_agent
+    while loop is not None and not isinstance(loop, LoopAgent):
+        loop = loop.parent_agent
+    if loop is None or loop.max_iterations is None:
+        return False
+    return _passes_judged(ctx) + 1 >= loop.max_iterations
+
+
 class CriticGate(BaseAgent):
     """Deterministic pre-check in front of the critic LLM.
 
@@ -343,6 +395,40 @@ class CriticGate(BaseAgent):
                 "from what the tools return."
             ),
         }
+        return self._critic_event(ctx, verdict)
+
+    def _final_pass_event(self, ctx: InvocationContext) -> Event:
+        """The sufficient verdict for the loop's last pass, WITHOUT running the
+        critic LLM (`_is_final_pass`).
+
+        Authored as the critic with the verdict as text, like `_requery_event`,
+        because that is what the readers of a retried turn count: the bot logs
+        one critic iteration per complete `critic` event and the LAST one's
+        `sufficient` (gubCriticIterations / gubCriticSufficient, gub-gchat-bot
+        src/agent/client.ts), and the sandbox UI closes an iteration on each.
+        Authored `critic_gate`, the turn would read as one iteration whose last
+        verdict was pass 1's rejection. Sufficient, so the escalator ends the
+        loop exactly where a satisfied critic did.
+        """
+        logger.info(
+            "critic_gate: final pass — critic LLM skipped (inv=%s) tenant=%s",
+            ctx.invocation_id,
+            label_of(ctx),
+        )
+        verdict = {
+            "info_sufficient": True,
+            "answer_satisfies": True,
+            "sufficient": True,
+            "reason": (
+                "Deterministic pass: final loop iteration, no retry left to "
+                "request (no critic LLM run)."
+            ),
+            "feedback": "",
+        }
+        return self._critic_event(ctx, verdict)
+
+    def _critic_event(self, ctx: InvocationContext, verdict: dict) -> Event:
+        """A verdict decided in code, shaped like the critic LLM's own event."""
         return Event(
             invocation_id=ctx.invocation_id,
             author=self._critic_name(),
@@ -412,6 +498,9 @@ class CriticGate(BaseAgent):
             yield self._pass_event(ctx, reason)
             return
         verdict = self._abstain_verdict(ctx, ctx.session.state.get("answer_payload"))
+        # Last, so the abstain pass keeps its reason on a retry that abstains.
+        if verdict is None and _is_final_pass(self, ctx):
+            verdict = self._final_pass_event(ctx)
         if verdict is not None:
             yield verdict
             return
@@ -545,8 +634,9 @@ class SpeculativeCritic(BaseAgent):
     critic speculatively must not change that.
 
     The payload-independent passes (sandbox off, the bare NO_COMPANY_RECORDS
-    marker) are known before the fork, so for them no call is made at all.
-    Only an abstain payload costs a call whose verdict is then dropped.
+    marker, the loop's last iteration) are known before the fork, so for them
+    no call is made at all. Only an abstain payload costs a call whose verdict
+    is then dropped.
     """
 
     async def _run_async_impl(
@@ -554,7 +644,7 @@ class SpeculativeCritic(BaseAgent):
         ctx: InvocationContext,
     ) -> AsyncGenerator[Event, None]:
         _SPECULATIONS.pop(ctx.invocation_id, None)  # never an earlier pass's
-        if _pass_reason_before_format(ctx) is not None:
+        if _pass_reason_before_format(ctx) is not None or _is_final_pass(self, ctx):
             return
         run = _Speculation()
         try:
@@ -573,9 +663,10 @@ class CriticResolver(CriticGate):
     Named `critic_gate` in the tree, so a deterministic pass is authored as it
     always was, and the verdicts it relays keep the critic's own author. The
     checks run in CriticGate's order — the payload-independent passes, then
-    the abstain payload of THIS pass (`_this_pass_payload`), and only then the
-    critic's verdict. A held verdict the checks overrule is dropped without
-    reaching the stream or state, exactly as if the critic had never run.
+    the abstain payload of THIS pass (`_this_pass_payload`), then the loop's
+    last iteration, and only then the critic's verdict. A held verdict the
+    checks overrule is dropped without reaching the stream or state, exactly
+    as if the critic had never run.
     """
 
     #: The critic LLM's name — the author of its verdicts and of a re-query.
@@ -597,6 +688,9 @@ class CriticResolver(CriticGate):
             if reason is not None
             else self._abstain_verdict(ctx, _this_pass_payload(ctx, self.payload_authors))
         )
+        # The branch counted the same verdicts at the fork and held nothing.
+        if verdict is None and _is_final_pass(self, ctx):
+            verdict = self._final_pass_event(ctx)
         if verdict is not None:
             if held is not None:
                 # The measurable price of running the critic beside the gate:

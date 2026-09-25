@@ -20,6 +20,9 @@ stand-ins only for the three model-backed agents):
   verdict they overrule never reaches the stream, the state or the bot;
 - the stream keeps its order and its authors: the last payload event is the
   format gate's, the verdict follows it;
+- the loop's last iteration makes no critic MODEL call (counted on a stub
+  model under a real LlmAgent), and still ends on the escalator with a
+  verdict authored `critic`, as the bot's per-pass count expects;
 - CRITIC_PARALLEL=0 builds the serial tree it replaced, and makes the same
   decisions as the parallel one on the same turns.
 """
@@ -35,9 +38,11 @@ import sys
 from pathlib import Path
 
 import pytest
-from google.adk.agents import BaseAgent, LoopAgent, ParallelAgent
+from google.adk.agents import BaseAgent, LlmAgent, LoopAgent, ParallelAgent
 from google.adk.events import Event, EventActions
 from google.adk.flows.llm_flows.contents import _get_contents
+from google.adk.models.base_llm import BaseLlm
+from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
 
@@ -46,6 +51,7 @@ from gub_agent.agent import build_deep_agent
 from gub_agent.agents.critic import (
     CriticGate,
     CriticResolver,
+    CriticVerdict,
     EscalateIfSufficient,
     SpeculativeCritic,
 )
@@ -69,6 +75,9 @@ INSUFFICIENT = {
     "reason": "LLM: the Q3 campaign was never read",
     "feedback": "call get_campaign for the Q3 push",
 }
+FINAL_PASS_REASON = (
+    "Deterministic pass: final loop iteration, no retry left to request (no critic LLM run)."
+)
 
 
 # ── stand-ins for the model-backed agents ────────────────────────────────────
@@ -211,18 +220,20 @@ def _pipeline(
     payloads: list,
     verdicts: list | None = None,
     critic_raises: Exception | None = None,
+    critic: BaseAgent | None = None,
 ) -> tuple[LoopAgent, _Executor, _Formatter, _Critic]:
     executor = _Executor(name=AGENT_NAME, passes=executor_passes, runs=0)
     formatter = _Formatter(name="formatter", payloads=payloads, runs=0)
     gate = _Gate(name="format_gate", sub_agents=[formatter])
-    critic = _Critic(
-        name="critic",
-        verdicts=verdicts or [SUFFICIENT],
-        ran=[],
-        saw=[],
-        session_authors=[],
-        raises=critic_raises,
-    )
+    if critic is None:
+        critic = _Critic(
+            name="critic",
+            verdicts=verdicts or [SUFFICIENT],
+            ran=[],
+            saw=[],
+            session_authors=[],
+            raises=critic_raises,
+        )
     escalator = EscalateIfSufficient(name="loop_escalator")
     loop = build_deep_agent(executor, gate, critic, escalator, parallel=parallel)
     return loop, executor, formatter, critic
@@ -542,7 +553,8 @@ async def test_the_first_passes_payload_is_not_the_seconds():
     """Same edge inside one turn: pass 1 abstained from memory and was sent
     back; pass 2's executor called a tool but wrote nothing, so its gate
     emitted nothing. Pass 1's abstain payload is this invocation's, and still
-    not this PASS's — the critic decides pass 2, not a second abstain pass."""
+    not this PASS's — pass 2 is settled as the loop's last pass, not as a
+    second abstain pass."""
     loop, executor, _, critic = _pipeline(
         parallel=True,
         executor_passes=[(False, "Copied from memory."), (True, "")],
@@ -553,7 +565,8 @@ async def test_the_first_passes_payload_is_not_the_seconds():
     _, state, _ = await _run(loop, question="whats new")
 
     assert executor.runs == 2
-    assert state["critic_verdict"] == SUFFICIENT
+    assert state["critic_verdict"]["reason"] == FINAL_PASS_REASON
+    assert len(critic.ran) == 1  # pass 1's speculation, dropped; none on pass 2
 
 
 async def test_the_bare_marker_makes_no_critic_call():
@@ -620,6 +633,177 @@ async def test_a_pass_with_nothing_held_falls_back_to_the_serial_order(monkeypat
     assert state["critic_verdict"] == SUFFICIENT
     assert _authors(streamed)[-2:] == ["critic", "loop_escalator"]
     assert "critic_speculation: nothing held" in caplog.text
+
+
+# ── the loop's last pass ─────────────────────────────────────────────────────
+
+
+ANSWER_2 = {"kind": "answer", "headline": "the Q3 push is live", "citations": ["org_query:a2"]}
+
+
+class _CriticModel(BaseLlm):
+    """The critic's MODEL, not a stand-in agent: the real LlmAgent (output
+    schema, output_key) runs over it, and every generate call is counted."""
+
+    verdicts: list = []  # one per call
+    calls: int = 0
+
+    @classmethod
+    def supported_models(cls):
+        return [r".*"]
+
+    async def generate_content_async(self, llm_request, stream=False):
+        verdict = self.verdicts[min(self.calls, len(self.verdicts) - 1)]
+        self.calls += 1
+        yield LlmResponse(
+            content=genai_types.Content(
+                role="model", parts=[genai_types.Part.from_text(text=json.dumps(verdict))]
+            )
+        )
+
+
+def _llm_critic(verdicts: list) -> tuple[LlmAgent, _CriticModel]:
+    model = _CriticModel(model="stub-critic", verdicts=verdicts, calls=0)
+    critic = LlmAgent(
+        name="critic",
+        model=model,
+        instruction="Judge the executor's tool coverage.",
+        output_schema=CriticVerdict,
+        output_key="critic_verdict",
+    )
+    return critic, model
+
+
+def _critic_verdicts(events: list[Event]) -> list[dict]:
+    """What the bot reads per judged pass: every complete `critic` event's text."""
+    return [
+        json.loads(event.content.parts[0].text)
+        for event in _complete(events)
+        if event.author == "critic"
+    ]
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_the_last_pass_makes_no_critic_model_call(parallel):
+    """Iteration 2 of max_iterations=2: the critic's verdict could not buy a
+    third pass, so its model is never called there. The loop still ends on the
+    escalator, the answer is pass 2's, and the verdict the bot reads last is a
+    sufficient one authored `critic` — pass 1 judged exactly as before."""
+    critic, model = _llm_critic([INSUFFICIENT, SUFFICIENT])
+    loop, executor, formatter, _ = _pipeline(
+        parallel=parallel,
+        executor_passes=[(True, "12 live campaigns."), (True, "The Q3 push is live.")],
+        payloads=[ANSWER, ANSWER_2],
+        critic=critic,
+    )
+
+    streamed, state, _ = await _run(loop)
+
+    assert model.calls == 1  # pass 1 only
+    assert executor.runs == 2 and formatter.runs == 2
+    assert _authors(streamed) == [
+        *[AGENT_NAME] * 3,
+        "formatter",
+        "critic",  # pass 1: the LLM's verdict
+        *[AGENT_NAME] * 3,
+        "formatter",
+        "critic",  # pass 2: settled in code
+        "loop_escalator",
+    ]
+    first, last = _critic_verdicts(streamed)
+    assert first == INSUFFICIENT
+    assert last["sufficient"] is True and last["reason"] == FINAL_PASS_REASON
+    assert state["critic_verdict"] == last
+    assert streamed[-1].actions.escalate
+    payload_events = [e for e in _complete(streamed) if e.author in ("formatter", "format_gate")]
+    assert json.loads(payload_events[-1].content.parts[0].text) == ANSWER_2
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_the_first_pass_still_asks_the_critic_model(parallel):
+    critic, model = _llm_critic([SUFFICIENT])
+    loop, executor, _, _ = _pipeline(
+        parallel=parallel,
+        executor_passes=[(True, "12 live campaigns.")],
+        payloads=[ANSWER],
+        critic=critic,
+    )
+
+    streamed, state, _ = await _run(loop)
+
+    assert model.calls == 1 and executor.runs == 1
+    assert _critic_verdicts(streamed) == [SUFFICIENT]
+    assert state["critic_verdict"] == SUFFICIENT
+    assert streamed[-1].author == "loop_escalator" and streamed[-1].actions.escalate
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_a_from_memory_retry_is_not_judged_by_the_model_either(parallel):
+    """Pass 1 is sent back in code (the from-memory re-query), pass 2 is the
+    last: neither pass is judged by the model. The parallel wiring still spends
+    pass 1's speculative call — the abstain payload is only known after the
+    join — and drops its verdict; pass 2 makes none."""
+    critic, model = _llm_critic([INSUFFICIENT])
+    loop, executor, _, _ = _pipeline(
+        parallel=parallel,
+        executor_passes=[(False, "Here is what's new: 3 hires."), (True, "3 hires, 12 live.")],
+        payloads=[ABSTAIN, ANSWER],
+        critic=critic,
+    )
+
+    streamed, state, _ = await _run(loop, question="whats new")
+
+    assert model.calls == (1 if parallel else 0) and executor.runs == 2
+    requery, last = _critic_verdicts(streamed)
+    assert requery["sufficient"] is False and "NO tool call" in requery["feedback"]
+    assert last["reason"] == FINAL_PASS_REASON
+    assert streamed[-1].author == "loop_escalator"
+
+
+async def test_a_retry_that_abstains_keeps_the_abstain_reason():
+    """The abstain pass is decided BEFORE the last-pass check, so a retry that
+    abstains after a tool call reads as it always did."""
+    loop, _, _, critic = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "12 live campaigns."), (True, "GUB has no such campaign.")],
+        payloads=[ANSWER, ABSTAIN],
+        verdicts=[INSUFFICIENT],
+    )
+
+    _, state, _ = await _run(loop)
+
+    assert len(critic.ran) == 1
+    assert state["critic_verdict"]["reason"] == (
+        "Deterministic pass: abstain AnswerPayload (no critic LLM run)."
+    )
+
+
+def test_the_deployed_tree_finds_its_loop_bound():
+    """`_is_final_pass` walks up to the LoopAgent from wherever the gate sits
+    in the tree this process built (serial or parallel), and a gate outside a
+    loop never sees a last pass."""
+    from types import SimpleNamespace
+
+    from gub_agent.agent import deep_agent
+    from gub_agent.agents.critic import _is_final_pass
+
+    def ctx(verdicts: int):
+        judged = Event(
+            invocation_id="inv",
+            author="critic",
+            actions=EventActions(state_delta={"critic_verdict": SUFFICIENT}),
+        )
+        other = Event(invocation_id="inv-earlier", author="critic", actions=judged.actions)
+        return SimpleNamespace(
+            invocation_id="inv", session=SimpleNamespace(events=[other] + [judged] * verdicts)
+        )
+
+    gates = [a for a in deep_agent.sub_agents if a.name == "critic_gate"]
+    speculation = deep_agent.find_agent("critic_speculation")
+    for agent in [*gates, *([speculation] if speculation else [])]:
+        assert _is_final_pass(agent, ctx(0)) is False
+        assert _is_final_pass(agent, ctx(1)) is True
+    assert _is_final_pass(CriticGate(name="loose"), ctx(1)) is False
 
 
 # ── the stream the bot reads ─────────────────────────────────────────────────

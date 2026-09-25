@@ -73,6 +73,11 @@ deep_agent = LoopAgent("gub_pipeline", max_iterations=2)
   └─ escalator   — exits the loop early when the critic is satisfied
 ```
 
+The critic LLM never runs on the loop's LAST iteration: its verdict there
+cannot buy another pass, so `critic_gate` writes a sufficient one in code,
+authored `critic` like the LLM's (`_is_final_pass` in
+`gub_agent/agents/critic.py`). On a retried turn that is 2.8-20.7 s saved.
+
 `CRITIC_PARALLEL=0` restores the serial order — format_gate, then critic_gate
 running the critic — with no code change (`build_deep_agent` in
 `gub_agent/agent.py`). The critic never reads the formatter's payload, so
