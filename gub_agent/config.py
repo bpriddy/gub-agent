@@ -241,8 +241,8 @@ def build_model() -> BaseLlm:
     blip still clears (most do on the first retry), but a genuinely overloaded
     turn fails fast instead of dragging toward the timeout. Retriable codes are
     the genai defaults (408/429/5xx) — genuine client errors (400/403/404) are
-    NOT retried. Retries are logged by genai at INFO (before_sleep); a dedicated
-    retry counter is a worthwhile follow-up for prod visibility.
+    NOT retried. Retries are logged by genai at INFO (before_sleep), and each
+    call's `model_call:` line counts its own (`retries=`, models.py).
     """
     from .models import VendorRouter  # noqa: PLC0415 — models.py imports config
 

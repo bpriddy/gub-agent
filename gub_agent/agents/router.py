@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from ..config import build_model, build_thinking_planner
 from ..instruction_utils import with_current_date
+from ..models import bind_model_call
 from ..prompts import ROUTER_INSTRUCTION
 from ..sandbox import ROUTER_THINKING_LEVEL, sandbox_before_model, sandbox_instruction
 from ..schemas.router import FALLBACK_DECISION, RouterDecision
@@ -79,6 +80,7 @@ def _router_before_model(callback_context, llm_request):
 
     Order: the window first, so the pruners rebuild fewer contents — the same
     cost argument as the executor's chain (agent.py:_before_model)."""
+    bind_model_call(callback_context)  # who is calling, for the model_call line
     sandbox_before_model(callback_context, llm_request, role="router")
     trim_to_recent_turns(callback_context, llm_request, role="router")
     strip_prior_turn_tool_parts(callback_context, llm_request)

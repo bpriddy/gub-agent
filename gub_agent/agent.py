@@ -79,6 +79,7 @@ from .agents.router import router_agent
 from .agents.tool_gate import tool_gate
 from .config import AGENT_NAME, CRITIC_PARALLEL, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
+from .models import bind_model_call
 from .prompts import EXECUTOR_INSTRUCTION
 from .sandbox import (
     EXECUTOR_THINKING_LEVEL,
@@ -141,6 +142,7 @@ def _before_model(callback_context, llm_request):
       Withholding one tool and withdrawing all of them compose in one
       direction only.
     """
+    bind_model_call(callback_context)  # who is calling, for the model_call line
     sandbox_before_model(callback_context, llm_request, role="executor")
     trim_to_recent_turns(callback_context, llm_request, role="executor")
     strip_prior_turn_tool_parts(callback_context, llm_request)

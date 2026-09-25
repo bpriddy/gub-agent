@@ -36,6 +36,7 @@ from google.genai import types as genai_types
 
 from ..config import build_model, build_thinking_planner
 from ..instruction_utils import current_date_note
+from ..models import bind_model_call
 from ..prompts import FORMATTER_INSTRUCTION
 from ..sandbox import FORMATTER_THINKING_LEVEL, sandbox_before_model, sandbox_instruction
 from ..schemas import AnswerPayload
@@ -59,6 +60,7 @@ def _formatter_before_model(callback_context: Any, llm_request: Any) -> None:
     a no-op without state["sandbox"]), then replace the request contents with
     the gate-composed brief: the formatter's input is exactly the executor's
     answer + ALLOWED_EVIDENCE, nothing else."""
+    bind_model_call(callback_context)  # who is calling, for the model_call line
     sandbox_before_model(callback_context, llm_request, role="formatter")
     invocation_id = getattr(callback_context, "invocation_id", "") or "?"
     brief = formatter_brief(invocation_id)

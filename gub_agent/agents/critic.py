@@ -54,6 +54,7 @@ from pydantic import BaseModel, Field
 
 from ..config import AGENT_NAME, build_model, build_thinking_planner
 from ..instruction_utils import current_date_note
+from ..models import bind_model_call
 from ..prompts import CRITIC_INSTRUCTION
 from ..sandbox import (
     CRITIC_THINKING_LEVEL,
@@ -183,6 +184,7 @@ def _critic_before_model(callback_context, llm_request):
     every earlier turn's full tool results, which ADK hands it as text that
     `strip_prior_turn_tool_parts` cannot see. The critic judges this turn; the
     earlier turns' payloads were only ever cost."""
+    bind_model_call(callback_context)  # who is calling, for the model_call line
     sandbox_before_model(callback_context, llm_request, role="critic")
     trim_to_recent_turns(callback_context, llm_request, role="critic")
     strip_prior_turn_tool_parts(callback_context, llm_request)
