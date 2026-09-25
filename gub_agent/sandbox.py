@@ -359,10 +359,11 @@ def _thinking_config(level: str) -> genai_types.ThinkingConfig:
             include_thoughts=config.EMIT_THINKING,
         )
     if level == THINKING_OFF:
-        # Matches build_thinking_planner(thinking_budget=0) — no thinking.
+        # Matches build_thinking_planner(thinking_budget=0) — no thinking, so
+        # no thought summaries to ask for either.
         return genai_types.ThinkingConfig(
             thinking_budget=0,
-            include_thoughts=config.EMIT_THINKING,
+            include_thoughts=False,
         )
     return genai_types.ThinkingConfig(
         thinking_level=level,

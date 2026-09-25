@@ -119,10 +119,15 @@ def build_thinking_planner(
                 include_thoughts=EMIT_THINKING,
             ),
         )
+    budget = -1 if thinking_budget is None else thinking_budget
     return BuiltInPlanner(
         thinking_config=genai_types.ThinkingConfig(
-            thinking_budget=-1 if thinking_budget is None else thinking_budget,
-            include_thoughts=EMIT_THINKING,
+            thinking_budget=budget,
+            # Nothing to summarise at budget 0, and include_thoughts=true with
+            # thinking off is a pairing production has never sent — the sandbox
+            # engine runs EMIT_THINKING=1, where a rejection would reach the
+            # caller as an empty 200 stream.
+            include_thoughts=EMIT_THINKING and budget != 0,
         ),
     )
 

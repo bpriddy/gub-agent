@@ -69,13 +69,26 @@ def _level(cfg: genai_types.ThinkingConfig) -> str | None:
 def test_a_budget_is_its_own_shape():
     off = build_thinking_planner(thinking_budget=0).thinking_config
     assert off.thinking_budget == 0 and off.thinking_level is None
-    assert off.include_thoughts == config.EMIT_THINKING
+    assert off.include_thoughts is False
 
     low = build_thinking_planner(thinking_level="LOW").thinking_config
     assert _level(low) == "LOW" and low.thinking_budget is None
 
     dynamic = build_thinking_planner().thinking_config
     assert dynamic.thinking_budget == -1 and dynamic.thinking_level is None
+
+
+def test_thinking_off_never_asks_for_thoughts(monkeypatch):
+    """The sandbox engine runs EMIT_THINKING=1. With thinking off there is
+    nothing to summarise, and include_thoughts=true beside budget 0 is a
+    pairing production has never sent, so neither path may produce it."""
+    from gub_agent import sandbox
+
+    monkeypatch.setattr(config, "EMIT_THINKING", True)
+    assert build_thinking_planner(thinking_budget=0).thinking_config.include_thoughts is False
+    assert sandbox._thinking_config(sandbox.THINKING_OFF).include_thoughts is False
+    assert build_thinking_planner(thinking_level="LOW").thinking_config.include_thoughts is True
+    assert sandbox._thinking_config("LOW").include_thoughts is True
 
 
 def test_a_level_and_a_budget_together_are_refused():
