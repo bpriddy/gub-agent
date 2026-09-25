@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -739,4 +740,13 @@ class CriticResolver(CriticGate):
         if held.error is not None:
             raise held.error
         for event in held.events:
+            # Stamped as relayed, not as made. The critic made them while the
+            # formatter was still rendering, so their own timestamps predate the
+            # payload events they now follow, and the session store is handed
+            # each event's timestamp on append (ADK's sqlite and database
+            # services order by it; the Agent Engine store is sent it). Reloaded
+            # — by the next turn, or by a reader of sessions/{id}/events — the
+            # turn would read [critic, formatter] where the stream had
+            # [formatter, critic].
+            event.timestamp = time.time()
             yield event

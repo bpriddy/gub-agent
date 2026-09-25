@@ -43,7 +43,8 @@ from google.adk.events import Event, EventActions
 from google.adk.flows.llm_flows.contents import _get_contents
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_response import LlmResponse
-from google.adk.runners import InMemoryRunner
+from google.adk.runners import InMemoryRunner, Runner
+from google.adk.sessions.sqlite_session_service import SqliteSessionService
 from google.genai import types as genai_types
 
 from gub_agent import config
@@ -152,6 +153,7 @@ class _Formatter(BaseAgent):
     done: asyncio.Event | None = None  # set once its payload is committed
     wait_for: asyncio.Event | None = None
     timeout: float = 2.0
+    delay: float = 0.0  # rendering time, before the payload is made
 
     async def _run_async_impl(self, ctx):
         payload = self.payloads[min(self.runs, len(self.payloads) - 1)]
@@ -160,6 +162,8 @@ class _Formatter(BaseAgent):
             self.started.set()
         if self.wait_for is not None:
             await asyncio.wait_for(self.wait_for.wait(), timeout=self.timeout)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if payload is not None:
             yield Event(
                 invocation_id=ctx.invocation_id,
@@ -868,6 +872,35 @@ async def test_the_stream_keeps_its_order_and_its_authors():
     payload_events = [e for e in streamed if e.author in ("formatter", "format_gate")]
     assert json.loads(payload_events[-1].content.parts[0].text) == ANSWER
     assert streamed[4].partial and not streamed[5].partial
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_a_reloaded_turn_reads_in_the_streamed_order(parallel, tmp_path):
+    """The formatter is the slower branch here, so the critic MADE its events
+    before the payload they follow in the stream. A session store orders a turn
+    by event timestamp (ADK's sqlite service here; the Agent Engine store is
+    handed the same field on append), so a relayed event that kept its creation
+    time reloads ahead of the payload: [critic, formatter] where the stream had
+    [formatter, critic]."""
+    loop, _, formatter, _ = _pipeline(
+        parallel=parallel, executor_passes=[(True, "12 live campaigns.")], payloads=[ANSWER]
+    )
+    formatter.delay = 0.05
+    service = SqliteSessionService(db_path=str(tmp_path / "sessions.db"))
+    runner = Runner(agent=loop, app_name="gub", session_service=service)
+    session = await service.create_session(app_name="gub", user_id="u")
+    message = genai_types.Content(role="user", parts=[genai_types.Part(text="how is chevy?")])
+
+    streamed = [
+        event
+        async for event in runner.run_async(user_id="u", session_id=session.id, new_message=message)
+    ]
+    stored = await service.get_session(app_name="gub", user_id="u", session_id=session.id)
+
+    stamps = [event.timestamp for event in _complete(streamed)]
+    assert stamps == sorted(stamps)
+    assert [event.author for event in stored.events][1:] == _authors(streamed)
+    assert _authors(streamed)[-3:] == ["formatter", "critic", "loop_escalator"]
 
 
 @pytest.mark.parametrize(
