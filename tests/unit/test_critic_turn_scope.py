@@ -161,10 +161,20 @@ async def test_this_turns_abstention_still_skips_the_critic():
 
 
 async def _gate_on_abstain_payload(events: list[Event]) -> tuple[_RecordingCritic, list[Event]]:
+    """The gate right after a format gate that emitted an abstain payload this
+    pass — as an event, which is where the gate reads it from."""
     critic = _RecordingCritic(name="critic", ran=[])
-    gate = CriticGate(name="critic_gate", sub_agents=[critic])
-    ctx = await invocation_ctx(invocation_id=NOW, events=events)
-    ctx.session.state["answer_payload"] = {"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}
+    gate = CriticGate(
+        name="critic_gate", sub_agents=[critic], payload_authors=("format_gate", "formatter")
+    )
+    payload = Event(
+        invocation_id=NOW,
+        author="format_gate",
+        actions=EventActions(
+            state_delta={"answer_payload": {"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}}
+        ),
+    )
+    ctx = await invocation_ctx(invocation_id=NOW, events=[*events, payload])
     return critic, [e async for e in gate.run_async(ctx)]
 
 

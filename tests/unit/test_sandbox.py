@@ -34,6 +34,8 @@ from google.adk.utils import instructions_utils
 from gub_agent import config
 from gub_agent.agents.critic import CriticGate, CriticVerdict
 from gub_agent.sandbox import (
+    FORMATTER_THINKING_LEVEL,
+    ROUTER_THINKING_LEVEL,
     SandboxEcho,
     read_overrides,
     resolved_config,
@@ -178,15 +180,16 @@ async def test_model_without_named_thinking_support_needs_dynamic(sandbox_on):
         read_overrides({"sandbox": {"model": "gemini-2.5-pro"}})
     assert "thinking_level=MEDIUM" in str(exc.value)  # the baseline that would apply
     assert "critic_thinking_level=LOW" in str(exc.value)
-    assert "formatter_thinking_level=LOW" in str(exc.value)
-    assert "router_thinking_level=LOW" in str(exc.value)
+    # OFF by default, LOW with the flags at 0 (tests/unit/test_router_formatter_thinking.py)
+    assert f"formatter_thinking_level={FORMATTER_THINKING_LEVEL}" in str(exc.value)
+    assert f"router_thinking_level={ROUTER_THINKING_LEVEL}" in str(exc.value)
 
     # One role fixed is not enough while the critic still runs.
     with pytest.raises(ValueError, match="critic_thinking_level=LOW"):
         read_overrides({"sandbox": {"model": "gemini-2.5-pro", "thinking_level": "DYNAMIC"}})
 
     # The formatter always runs — its level must be DYNAMIC for such a model too.
-    with pytest.raises(ValueError, match="formatter_thinking_level=LOW"):
+    with pytest.raises(ValueError, match=f"formatter_thinking_level={FORMATTER_THINKING_LEVEL}"):
         read_overrides(
             {
                 "sandbox": {
@@ -199,7 +202,7 @@ async def test_model_without_named_thinking_support_needs_dynamic(sandbox_on):
 
     # And so does the router (blend 04) — it runs BEFORE any retrieval, so its
     # 400 would empty the stream before the turn had done anything at all.
-    with pytest.raises(ValueError, match="router_thinking_level=LOW"):
+    with pytest.raises(ValueError, match=f"router_thinking_level={ROUTER_THINKING_LEVEL}"):
         read_overrides(
             {
                 "sandbox": {
@@ -474,10 +477,10 @@ async def test_resolved_config_reports_what_actually_ran(sandbox_on):
     assert len(resolved["executor_prompt_sha256"]) == 12
     assert resolved["critic_prompt_source"] == "baseline"
     assert resolved["critic_prompt_sha256"] is None
-    assert resolved["formatter_thinking_level"] == "LOW"  # untouched baseline
+    assert resolved["formatter_thinking_level"] == FORMATTER_THINKING_LEVEL  # untouched
     assert resolved["formatter_prompt_source"] == "baseline"
     assert resolved["formatter_prompt_sha256"] is None
-    assert resolved["router_thinking_level"] == "LOW"  # untouched baseline
+    assert resolved["router_thinking_level"] == ROUTER_THINKING_LEVEL  # untouched baseline
     assert resolved["router_prompt_source"] == "baseline"
     assert resolved["router_prompt_sha256"] is None
     assert resolved["overridden_keys"] == [

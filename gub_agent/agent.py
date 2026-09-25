@@ -15,12 +15,20 @@ The question is ROUTED first and only then answered (blend 04):
 
   deep_agent = LoopAgent("gub_pipeline", max_iterations=2)
     ├─ executor_agent — runs the existing tool-using LLM
-    ├─ format_gate — renders the answer into the typed AnswerPayload
-    │                  (agents/formatter.py) and enforces the contract in
-    │                  code (agents/format_gate.py, blend 03)
+    ├─ format_and_critic — ParallelAgent, both at once (CRITIC_PARALLEL=1):
+    │   ├─ format_gate — renders the answer into the typed AnswerPayload
+    │   │                (agents/formatter.py) and enforces the contract in
+    │   │                code (agents/format_gate.py, blend 03)
+    │   └─ critic_speculation — the critic LLM, its verdict held
     ├─ critic_gate — evaluates information sufficiency; emits structured
     │                  verdict {sufficient, reason, feedback} into state
+    │                  (with CRITIC_PARALLEL=1: resolves the held verdict
+    │                  against THIS pass's payload). On the last iteration it
+    │                  passes in code: no verdict could buy another pass
     └─ loop_escalator — exits the loop early when critic verdict is sufficient
+
+  With CRITIC_PARALLEL=0 the middle is the serial pair it replaced —
+  format_gate, then critic_gate running the critic LLM (`build_deep_agent`).
 
 The deep path is the pipeline as it was, renamed: the critic-before-commit
 pattern from the Agentic RAG architecture, with the per-pass budget resets
@@ -37,6 +45,11 @@ invisible at the boundary, the way the LoopAgent's introduction was in June.
 
 sandbox_echo stays FIRST: the provenance event must precede any work.
 
+With SPECULATIVE_DEEP=1 (the default) the router and the dispatcher run inside
+`speculative_dispatch`, which starts the deep path at the same moment as the
+router and keeps it only when the dispatcher picks it (agents/speculation.py);
+0 is the tree above, exactly (`build_root`).
+
 The executor's instruction text lives in `prompts/executor.py` (edit it
 there); the critic's lives in `prompts/critic.py`, the router's in
 `prompts/router.py`.
@@ -47,7 +60,7 @@ included (`router_instruction`, `router_variant`, `router_thinking_level`).
 With no such key every override point is a no-op.
 """
 
-from google.adk.agents import Agent, LoopAgent, SequentialAgent
+from google.adk.agents import Agent, BaseAgent, LoopAgent, ParallelAgent, SequentialAgent
 
 from .agents.circuit_breaker import circuit_breaker, reset_tool_budget
 from .agents.context_pruning import (
@@ -55,16 +68,24 @@ from .agents.context_pruning import (
     strip_source_metadata,
     trim_to_recent_turns,
 )
-from .agents.critic import critic_gate, escalator_agent
+from .agents.critic import (
+    CriticGate,
+    CriticResolver,
+    SpeculativeCritic,
+    critic_agent,
+    escalator_agent,
+)
 from .agents.dispatcher import Dispatcher
 from .agents.evidence_index import record_evidence, reset_evidence_index
 from .agents.fast_path import fast_path
 from .agents.format_gate import format_gate
 from .agents.round_limiter import reset_rounds, round_limit
 from .agents.router import router_agent
+from .agents.speculation import SPECULATIVE_DEEP, SpeculativeDispatch
 from .agents.tool_gate import tool_gate
-from .config import AGENT_NAME, build_model, build_thinking_planner
+from .config import AGENT_NAME, CRITIC_PARALLEL, build_model, build_thinking_planner
 from .instruction_utils import with_current_date
+from .models import bind_model_call
 from .prompts import EXECUTOR_INSTRUCTION
 from .sandbox import (
     EXECUTOR_THINKING_LEVEL,
@@ -127,6 +148,7 @@ def _before_model(callback_context, llm_request):
       Withholding one tool and withdrawing all of them compose in one
       direction only.
     """
+    bind_model_call(callback_context)  # who is calling, for the model_call line
     sandbox_before_model(callback_context, llm_request, role="executor")
     trim_to_recent_turns(callback_context, llm_request, role="executor")
     strip_prior_turn_tool_parts(callback_context, llm_request)
@@ -176,8 +198,10 @@ executor_agent = Agent(
     after_tool_callback=record_evidence,
 )
 
+
 # The DEEP path: wrap [executor → format-gate → critic-gate → escalator] in a
-# LoopAgent.
+# LoopAgent (`build_deep_agent` below: the format gate and the critic now run
+# side by side unless CRITIC_PARALLEL=0).
 # The format gate (blend 03) turns the executor's prose into the typed
 # AnswerPayload and enforces the contract in code — validation retries happen
 # INSIDE the gate, never through this loop. The critic gate then judges
@@ -188,14 +212,65 @@ executor_agent = Agent(
 # back once for a re-query). On clean answers the
 # critic emits sufficient=true, escalator triggers loop exit after one
 # iteration. On flagged failures, the executor runs again seeing the critic's
-# feedback in session state. Capped at 2 iterations.
+# feedback in session state. Capped at 2 iterations — and the second is not
+# judged by the critic LLM, whose verdict there could not buy a third
+# (agents/critic.py:_is_final_pass).
 #
 # sandbox_echo moved up to the root (below) with blend 04 — it must still
 # precede any work, and the router is now the first thing that runs.
-deep_agent = LoopAgent(
-    name="gub_pipeline",
-    sub_agents=[executor_agent, format_gate, critic_gate, escalator_agent],
-    max_iterations=2,
+def build_deep_agent(
+    executor: BaseAgent,
+    gate: BaseAgent,
+    critic: BaseAgent,
+    escalator: BaseAgent,
+    *,
+    parallel: bool,
+) -> LoopAgent:
+    """The deep-path loop, serial or with the critic beside the format gate.
+
+    Serial (`parallel=False`) is the tree as it was, piece for piece:
+    [executor, format_gate, critic_gate(critic), loop_escalator].
+
+    Parallel runs the critic LLM WHILE the formatter renders. The critic
+    judges the executor's tool coverage and never reads the formatter's
+    payload, so the only thing the serial order bought was the wait: over 155
+    router-era deep turns, p50 2.8 s / p90 8.9 s per turn. What the critic
+    gate decided from the payload — the abstain pass and the from-memory
+    re-query — moves to a resolver after the join (agents/critic.py:
+    CriticResolver), which reads THIS pass's payload and holds the critic's
+    events until it has decided, so the stream and the state see what they
+    saw before: payload, verdict, escalator.
+
+    A function over the agents, not over the module singletons, so both
+    shapes can be built in one process for the tests; the module builds one.
+    """
+    # Both gates read the payload off THIS pass's events by these authors, never
+    # off state, which can still hold an earlier turn's (critic.py:_this_pass_payload).
+    payload_authors = (gate.name, *(agent.name for agent in gate.sub_agents))
+    if parallel:
+        speculation = SpeculativeCritic(name="critic_speculation", sub_agents=[critic])
+        middle: list[BaseAgent] = [
+            ParallelAgent(name="format_and_critic", sub_agents=[gate, speculation]),
+            CriticResolver(
+                name="critic_gate",
+                critic_name=critic.name,
+                payload_authors=payload_authors,
+            ),
+        ]
+    else:
+        middle = [
+            gate,
+            CriticGate(name="critic_gate", sub_agents=[critic], payload_authors=payload_authors),
+        ]
+    return LoopAgent(
+        name="gub_pipeline",
+        sub_agents=[executor, *middle, escalator],
+        max_iterations=2,
+    )
+
+
+deep_agent = build_deep_agent(
+    executor_agent, format_gate, critic_agent, escalator_agent, parallel=CRITIC_PARALLEL
 )
 
 # The branch decision. `sub_agents` puts both destinations in the agent tree;
@@ -203,6 +278,7 @@ deep_agent = LoopAgent(
 # the fast path invokes the shared format_gate through `run_async` instead of
 # adopting it (`agents/fast_path.py`).
 dispatcher = Dispatcher(name="dispatcher", sub_agents=[fast_path, deep_agent])
+
 
 # The root: provenance, then routing, then exactly one branch.
 #
@@ -215,7 +291,33 @@ dispatcher = Dispatcher(name="dispatcher", sub_agents=[fast_path, deep_agent])
 # ignores by author (blend 03 step 0) — an engine deployed with this root in
 # front of a bot WITHOUT that routing would put routing JSON in the user's
 # bubble.
-root_agent = SequentialAgent(
-    name="gub_root",
-    sub_agents=[sandbox_echo, router_agent, dispatcher],
-)
+def build_root(
+    echo: BaseAgent,
+    router: BaseAgent,
+    dispatch: Dispatcher,
+    *,
+    speculative: bool,
+) -> SequentialAgent:
+    """The root, with the deep path started beside the router or after it.
+
+    Serial (`speculative=False`) is the tree as it was, piece for piece:
+    [sandbox_echo, router, dispatcher]. Speculative wraps the last two in
+    `SpeculativeDispatch`, which runs the router live and the dispatcher's
+    deep agent at the same time on a fork of the session, then makes the
+    dispatcher's decision and keeps the deep run only if that is the branch
+    it picks (agents/speculation.py). Either way every agent below is the
+    same object, and every event reaches the caller under its own author.
+
+    A function over the agents, like `build_deep_agent`, so both shapes can be
+    built in one process for the tests; the module builds one.
+    """
+    if speculative:
+        middle: list[BaseAgent] = [
+            SpeculativeDispatch(name="speculative_dispatch", sub_agents=[router, dispatch])
+        ]
+    else:
+        middle = [router, dispatch]
+    return SequentialAgent(name="gub_root", sub_agents=[echo, *middle])
+
+
+root_agent = build_root(sandbox_echo, router_agent, dispatcher, speculative=SPECULATIVE_DEEP)

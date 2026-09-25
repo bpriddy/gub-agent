@@ -109,6 +109,99 @@ def choose(decision: RouterDecision) -> str:
     return DEEP
 
 
+# ── the per-turn pieces, shared with the speculative root ─────────────────────
+#
+# `agents/speculation.py` (SPECULATIVE_DEEP) makes the same decision and runs
+# the same branches as `Dispatcher` below, with the deep path started before
+# the router has answered. These are the parts it takes from here rather than
+# restating, so the log lines stay one string each and a branch cannot drift
+# between the two roots.
+
+
+def log_decision(ctx: InvocationContext, decision: RouterDecision, branch: str) -> None:
+    """The per-turn `dispatcher: intent` line."""
+    # `tenant` is APPENDED, never interleaved: this line is the denominator
+    # of every per-turn proportion measured from the logs, and existing
+    # queries match on the `intent=`/`confidence=`/`branch=` substrings.
+    # One engine serves more than one branded Chat app, so without the label
+    # those proportions silently mix two bots' traffic (gub_agent/tenant.py).
+    logger.info(
+        "dispatcher: intent=%s confidence=%.2f branch=%s (inv=%s) tenant=%s",
+        decision.intent,
+        decision.confidence,
+        branch,
+        ctx.invocation_id,
+        label_of(ctx),
+    )
+
+
+def log_fast_path_declined(ctx: InvocationContext) -> None:
+    logger.info("dispatcher: fast path declined (inv=%s) — deep path", ctx.invocation_id)
+
+
+def log_speculation(
+    ctx: InvocationContext,
+    result: str,
+    *,
+    lead_ms: int | None = None,
+    buffered: int = 0,
+    finished: bool = False,
+    error: str | None = None,
+) -> None:
+    """The per-turn `speculation:` line — one per turn, next to the
+    `dispatcher: intent` line, so the two count the same turns, with ONE
+    exception: `cancelled:aborted`, a turn that ended before the router's
+    decision (the caller went away while it ran), has no `dispatcher: intent`
+    line — the serial root logs nothing at all for such a turn. It is logged
+    anyway because that turn is where a speculation can cost the most: a
+    router stalled past the caller's deadline while the deep path ran on, GUB
+    calls and all, and this line is the only per-turn record of that cost.
+    So the `speculation:` lines minus `outcome=cancelled:aborted` count exactly
+    the `dispatcher: intent` lines; `cancelled:aborted` never follows a
+    decision (`agents/speculation.py` writes every other outcome before
+    anything after the decision can be interrupted).
+
+    `result` is `kept`, `cancelled:<branch>`, `restarted:<reason>` or `off`
+    (`agents/speculation.py`); `off` is this dispatcher's, which runs only
+    when nothing was started beside the router. `lead_ms` is how far the
+    speculative deep run had got when the router's decision landed (`-` when
+    there was none), `buffered` how many of its events were held at that
+    moment, `finished` whether it had already run to its end, `error` the
+    type of what it raised (`-` for nothing). `tenant` last, as on every
+    per-turn line."""
+    logger.info(
+        "speculation: outcome=%s lead_ms=%s buffered=%d finished=%d error=%s inv=%s tenant=%s",
+        result,
+        "-" if lead_ms is None else lead_ms,
+        buffered,
+        1 if finished else 0,
+        error or "-",
+        ctx.invocation_id,
+        label_of(ctx),
+    )
+
+
+def no_data_payload(ctx: InvocationContext, decision: RouterDecision, branch: str) -> Event | None:
+    """The one event of a branch that needs no data — abstain, smalltalk,
+    clarify — or None for the two that do (fast, deep)."""
+    if branch == ABSTAIN:
+        # GUB gets out of the way; the bot hides its section entirely
+        # (`chat/cards.ts:660-675`) and the Workspace spoke owns the answer.
+        return payload_event(ctx, abstain_payload())
+    if branch == SMALLTALK:
+        return payload_event(ctx, smalltalk_payload(decision.language))
+    if branch == CLARIFY:
+        return payload_event(
+            ctx,
+            clarify_intent_payload(
+                decision.intent,
+                decision.language,
+                decision.entity_surface,
+            ),
+        )
+    return None
+
+
 class Dispatcher(BaseAgent):
     """Runs one branch. `sub_agents` is `[fast_path, deep_agent]` — the fast
     path is invoked through the module singleton (it is the same object) and
@@ -126,37 +219,15 @@ class Dispatcher(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         decision = decision_from(ctx)
         branch = choose(decision)
-        # `tenant` is APPENDED, never interleaved: this line is the denominator
-        # of every per-turn proportion measured from the logs, and existing
-        # queries match on the `intent=`/`confidence=`/`branch=` substrings.
-        # One engine serves more than one branded Chat app, so without the label
-        # those proportions silently mix two bots' traffic (gub_agent/tenant.py).
-        logger.info(
-            "dispatcher: intent=%s confidence=%.2f branch=%s (inv=%s) tenant=%s",
-            decision.intent,
-            decision.confidence,
-            branch,
-            ctx.invocation_id,
-            label_of(ctx),
-        )
+        log_decision(ctx, decision, branch)
+        # This dispatcher runs after the router, never beside it: nothing was
+        # speculated on this turn (SPECULATIVE_DEEP=0, or a turn the
+        # speculative root ran serially).
+        log_speculation(ctx, "off")
 
-        if branch == ABSTAIN:
-            # GUB gets out of the way; the bot hides its section entirely
-            # (`chat/cards.ts:660-675`) and the Workspace spoke owns the answer.
-            yield payload_event(ctx, abstain_payload())
-            return
-        if branch == SMALLTALK:
-            yield payload_event(ctx, smalltalk_payload(decision.language))
-            return
-        if branch == CLARIFY:
-            yield payload_event(
-                ctx,
-                clarify_intent_payload(
-                    decision.intent,
-                    decision.language,
-                    decision.entity_surface,
-                ),
-            )
+        event = no_data_payload(ctx, decision, branch)
+        if event is not None:
+            yield event
             return
 
         if branch == FAST:
@@ -164,7 +235,7 @@ class Dispatcher(BaseAgent):
                 yield event
             if outcome(ctx.invocation_id) == "answered":
                 return
-            logger.info("dispatcher: fast path declined (inv=%s) — deep path", ctx.invocation_id)
+            log_fast_path_declined(ctx)
 
         async for event in self._deep_agent().run_async(ctx):
             yield event

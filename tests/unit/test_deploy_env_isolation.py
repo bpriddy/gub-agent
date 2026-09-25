@@ -170,6 +170,28 @@ async def test_both_deploy_envs_declare_the_file_search_flag():
         )
 
 
+async def test_both_deploy_envs_state_the_latency_switches():
+    """Each latency change has its own rollback, and each rollback is a line in
+    BOTH files — the same value, so a sandbox run measures what production
+    runs. Pins the declaration and the parity, not the setting."""
+    switches = (
+        "CRITIC_PARALLEL",
+        "CRITIC_SKIP_FINAL_PASS",
+        "ROUTER_THINKING_OFF",
+        "FORMATTER_THINKING_OFF",
+        "SPECULATIVE_DEEP",
+    )
+    prod, sandbox = _env(_prod_env_file()), _env(_sandbox_env_file())
+    for key in switches:
+        assert key in prod and key in sandbox, (
+            f"keep {key} explicit in both deploy env files — it is a rollback, and "
+            "an operator should be editing a line that is already there"
+        )
+        assert _flag_on(prod, key) == _flag_on(sandbox, key), (
+            f"{key} differs between production and the sandbox"
+        )
+
+
 async def test_production_deploy_verifies_the_env_landed():
     """A deploy that cannot fail on a skipped env file will hide the next one."""
     text = DEPLOY_WORKFLOW.read_text()

@@ -80,9 +80,8 @@ def _without_plumbing(obj: Any) -> Any:
     built only where a key was actually removed; unchanged subtrees (and all
     scalars) are shared. So this never mutates the input in place — the
     function_response payload is shared with ADK session history, and mutating a
-    nested field there can corrupt it (safe under the eager model_dump() prod
-    persistence uses today, but a landmine under InMemorySessionService and for
-    trace consumers that read `_sources`)."""
+    nested field there corrupts it. The FunctionResponse holding the payload is
+    shared too, which is why `strip_source_metadata` never assigns to it."""
     if isinstance(obj, dict):
         new: dict = {}
         changed = False
@@ -100,26 +99,61 @@ def _without_plumbing(obj: Any) -> Any:
     return obj
 
 
+def _masked(part: Any) -> Any:
+    """`part` with the plumbing dropped from its tool response: a NEW part
+    around a NEW function_response when there was any to drop, else `part`
+    itself."""
+    fr = getattr(part, "function_response", None)
+    resp = getattr(fr, "response", None) if fr is not None else None
+    if not isinstance(resp, dict):
+        return part
+    scrubbed = _without_plumbing(resp)
+    if scrubbed is resp:
+        return part
+    try:
+        return part.model_copy(
+            update={"function_response": fr.model_copy(update={"response": scrubbed})}
+        )
+    except Exception:  # noqa: BLE001 — best-effort across ADK versions: unmasked, never corrupted
+        return part
+
+
 def strip_source_metadata(callback_context: Any, llm_request: Any) -> None:
     """Observation masking: drop `_sources` citation plumbing from every tool
     response in the request. The model is instructed to ignore it (see
     prompts/executor.py, prompts/critic.py), yet it dominates prompt size on
     portfolio questions — one account overview carried 128k tokens of file refs,
     re-sent each round. Stripping it is loss-free for the answer and roughly
-    halves prompt tokens on the heavy questions. The scrubbed copy is assigned
-    back to `function_response.response` — the original (session-shared) payload
-    is never mutated in place."""
-    for content in llm_request.contents or []:
-        for part in content.parts or []:
-            fr = getattr(part, "function_response", None)
-            resp = getattr(fr, "response", None) if fr is not None else None
-            if isinstance(resp, dict):
-                scrubbed = _without_plumbing(resp)
-                if scrubbed is not resp:
-                    try:
-                        fr.response = scrubbed
-                    except Exception:  # noqa: BLE001 — best-effort across ADK versions
-                        pass
+    halves prompt tokens on the heavy questions.
+
+    Copy-on-write all the way up: a masked part is a new Part around a new
+    FunctionResponse, in a new Content, in a new `contents` list. Nothing the
+    request was built from is written to — not the payload, not the
+    FunctionResponse, not the Part. The FunctionResponse IS the session's:
+    ADK 2.9.2 copies each Part for the request but hands its function_response
+    over by reference unless it has an `adk-` id to rewrite
+    (`flows/llm_flows/contents.py:_copy_content_for_request`), and
+    gemini-3.5-flash issues its own call ids (1740 of 2522 tool responses in
+    saved production sessions). Assigning `fr.response` there, as this did,
+    rewrote the stored event: the stream and the store lost `_sources`,
+    `_cited` and `_sourcesTotal` — the bot's source chips, its [n] list and the
+    blend-08 names — wherever an event is serialised after the next round
+    starts (a kept SPECULATIVE_DEEP run's held events; InMemorySessionService,
+    which stores the object itself). The deploy's requirements.txt does not
+    pin google-adk, so this writes to nothing it does not own, whatever the
+    installed ADK copies."""
+    contents = llm_request.contents or []
+    masked: list[Any] = []
+    changed = False
+    for content in contents:
+        parts = content.parts or []
+        new_parts = [_masked(part) for part in parts]
+        if any(new is not old for new, old in zip(new_parts, parts)):
+            content = content.model_copy(update={"parts": new_parts})
+            changed = True
+        masked.append(content)
+    if changed:
+        llm_request.contents = masked
     return None
 
 

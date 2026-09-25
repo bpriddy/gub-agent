@@ -2,7 +2,7 @@
 router.py — the intent-routing instruction (blend 04).
 
 The router runs FIRST on every question, with no tools, under
-`output_schema=RouterDecision` (`schemas/router.py`) and thinking at LOW: its
+`output_schema=RouterDecision` (`schemas/router.py`) and thinking off: its
 whole job is one classification, and a deliberation budget here would spend
 the latency the fast path exists to save. Target ≤ 1.5 s.
 
