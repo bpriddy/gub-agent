@@ -634,6 +634,17 @@ class SpeculativeCritic(BaseAgent):
     (prompts/critic.py calls the formatter's JSON "pipeline plumbing"), so
     nothing it needs is missing.
 
+    The isolation reaches further back than this pass. The branch name is the
+    same on every turn, and ADK's filter hides every event of a sibling branch
+    (flows/llm_flows/contents.py:_is_event_belongs_to_branch), so for each
+    EARLIER deep turn run in this wiring the critic sees the executor's prose
+    but not the formatter's or format_gate's payload; turns from before it
+    carry no branch and stay visible. Its request therefore differs from the
+    serial baseline's by more than this pass's formatter JSON — earlier turns'
+    rendered answers are gone too. Whether that moves its verdicts is
+    unmeasured: the tests pin the decisions around the verdict on stand-ins,
+    and no replay has compared the two wirings' verdicts on the same turns.
+
     Its events are HELD, not yielded, for three reasons:
 
     - its verdict must not reach state before the resolver has decided. On an

@@ -86,6 +86,14 @@ own switch, and both gates read the abstain payload off THIS pass's events,
 never a stale one left in state. The critic never reads the formatter's
 payload, so waiting for it only cost time: p50 2.8 s / p90 8.9 s per deep turn.
 
+One difference beyond timing: running on its own ADK branch, the critic LLM
+does not see this pass's formatter JSON — nor the formatter/format_gate
+payloads of any earlier deep turn run in the parallel wiring, because the
+branch name repeats every turn (the executor's prose for those turns is still
+there). Its request is not the serial one minus one payload, and whether its
+verdicts match the serial critic's is unmeasured
+(`SpeculativeCritic` in `gub_agent/agents/critic.py`).
+
 The deep path is the Agentic-RAG "critic-before-commit" pattern: on a clean
 answer the loop exits after one pass; on a flagged answer the executor runs
 again, sees the critic's feedback in session state, and fixes it. We keep just
