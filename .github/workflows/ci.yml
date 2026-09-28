@@ -38,10 +38,10 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Lint (ruff)
-        run: ruff check gub_agent tests
+        run: ruff check gub_agent tests services.py
 
       - name: Format check (ruff format)
-        run: ruff format --check gub_agent tests
+        run: ruff format --check gub_agent tests services.py
 
       - name: Tests (pytest)
         run: pytest
