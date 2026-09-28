@@ -275,6 +275,23 @@ CRITIC_SKIP_FINAL_PASS: bool = os.environ.get("CRITIC_SKIP_FINAL_PASS", "1").low
     "yes",
 )
 
+# Import at package load what ADK would otherwise import on the first model
+# request (gub_agent/eager_imports.py): the anthropic SDK behind ADK's content
+# builder, the genai client's async stack, auth and flow modules — 2,115
+# modules a fresh process imports on its first turn and never again, ~2 s
+# locally, and the bulk of the 6.2-16.4 s the first request of a production
+# process waited before its first model send (2026-09-17..25). Imports only:
+# nothing is constructed or called, and a module missing in another ADK
+# version is skipped. The package is loaded by the first request of any kind,
+# so this moves the cost off the first user turn onto whichever request comes
+# first after a restart — the warm-up ping's job. 0 is the rollback: exactly
+# today's lazy imports. Read at import: a redeploy either way.
+EAGER_ADK_IMPORTS: bool = os.environ.get("EAGER_ADK_IMPORTS", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 

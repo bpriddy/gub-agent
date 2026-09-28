@@ -83,7 +83,13 @@ from .agents.round_limiter import reset_rounds, round_limit
 from .agents.router import router_agent
 from .agents.speculation import SPECULATIVE_DEEP, SpeculativeDispatch
 from .agents.tool_gate import tool_gate
-from .config import AGENT_NAME, CRITIC_PARALLEL, build_model, build_thinking_planner
+from .config import (
+    AGENT_NAME,
+    CRITIC_PARALLEL,
+    EAGER_ADK_IMPORTS,
+    build_model,
+    build_thinking_planner,
+)
 from .instruction_utils import with_current_date
 from .models import bind_model_call
 from .prompts import EXECUTOR_INSTRUCTION
@@ -321,3 +327,10 @@ def build_root(
 
 
 root_agent = build_root(sandbox_echo, router_agent, dispatcher, speculative=SPECULATIVE_DEEP)
+
+# Last, once the tree exists: the modules ADK would import on the first model
+# request, imported now (config.EAGER_ADK_IMPORTS, gub_agent/eager_imports.py).
+if EAGER_ADK_IMPORTS:
+    from . import eager_imports
+
+    eager_imports.import_now()
