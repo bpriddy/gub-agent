@@ -85,6 +85,10 @@ args=(
   # the env in a per-deploy FILE either way: a config committed inside
   # gub_agent/ would be picked up by the production deploy too.
   --env_file="$ENV_FILE"
+  # The repo-root services.py, staged at /app/services.py: `adk api_server`
+  # imports it at start and it registers the agentengine:// session service
+  # (SESSION_CLIENT_REUSE). Left out, the engine silently runs ADK's stock one.
+  --extra_packages="$REPO_ROOT/services.py"
 )
 if [[ -n "$ENGINE_ID" ]]; then
   echo "Updating sandbox engine $ENGINE_ID in place."
