@@ -159,6 +159,32 @@ FORMATTER_THINKING_OFF: bool = os.environ.get("FORMATTER_THINKING_OFF", "1").low
     "yes",
 )
 
+# ── A stalled router call is sent twice ──────────────────────────────────────
+# When a ROUTER call has had no first chunk for this many milliseconds, its
+# request is sent a second time and whichever answers first is relayed; the
+# other is cancelled (models.py: VendorRouter._hedged). The router's first
+# token sometimes waits 10-67 s inside Vertex, in day-dependent episodes, and a
+# paid replay of 20 production router requests — stalled ones included — saw
+# no stall: the condition is the server's at that moment, not the request's.
+# Healthy router TTFT is p90 1.1 s with thinking off, so 4000 fires only on a
+# call already ~4x late. The deep path hides the router behind its speculative
+# run (SPECULATIVE_DEEP); this is for the turns that wait for it — smalltalk,
+# abstain, clarify, the fast path.
+#
+# Same model, same request, same config (a sandbox run's per-call overrides
+# included): the answer is unchanged, only when it arrives. The price is one
+# extra router call on the calls it fires on: the router prompt is uncached,
+# 2.6k tokens in a short session and ~20k in a long one (model_call prompt=,
+# cached=0), so ~$0.004-0.03 per fire at the Flash input rate. A call genai is
+# already retrying (a 429/5xx answered it) is not hedged; once the hedge has
+# fired, each request may still retry on its own budget.
+#
+# 0 is the rollback: nothing is ever sent twice, and every call takes the
+# unhedged path, byte for byte. Read at import (build_model below hands it to
+# every VendorRouter; only the router's calls use it): a change needs a
+# redeploy. Set explicitly in both deploy env files, like the other rollbacks.
+ROUTER_HEDGE_AFTER_MS: int = int(os.environ.get("ROUTER_HEDGE_AFTER_MS", "4000"))
+
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
 # id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
@@ -322,6 +348,10 @@ def build_model() -> BaseLlm:
     the genai defaults (408/429/5xx) — genuine client errors (400/403/404) are
     NOT retried. Retries are logged by genai at INFO (before_sleep), and each
     call's `model_call:` line counts its own (`retries=`, models.py).
+
+    The router hedge (ROUTER_HEDGE_AFTER_MS) sits above this, not inside it:
+    one second send per router call at most, never one per attempt, never
+    while the first send is retrying, and each send counts its own retries.
     """
     from .models import VendorRouter  # noqa: PLC0415 — models.py imports config
 
@@ -335,4 +365,9 @@ def build_model() -> BaseLlm:
             jitter=1.0,
         ),
     )
-    return VendorRouter(model=GEMINI_MODEL, gemini=gemini, claude_location=CLAUDE_VERTEX_LOCATION)
+    return VendorRouter(
+        model=GEMINI_MODEL,
+        gemini=gemini,
+        claude_location=CLAUDE_VERTEX_LOCATION,
+        router_hedge_after_ms=ROUTER_HEDGE_AFTER_MS,
+    )

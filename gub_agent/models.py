@@ -41,16 +41,57 @@ Every call through the router — either vendor — ends in ONE `model_call:` lo
 line (`_ModelCall`): time to first chunk, time to last chunk, the token counts
 and the outcome. It is the $0 measurement for latency work: the engine logs
 already carry it, so no eval run is needed to see where a turn's time went.
+
+The router hedge (ROUTER_HEDGE_AFTER_MS, config.py). The router agent's first
+token sometimes waits 10-67 s inside Vertex, in day-dependent episodes, and a
+replay of stalled production requests did not stall: the condition is the
+server's, not the request's. So a ROUTER call (ADK's `adk_agent_name` label,
+the one the `model_call:` line names) that has sent no first chunk after that
+many milliseconds is sent a second time — a copy of the same request object,
+taken before the first send, so the same model, contents and config, a sandbox
+run's per-call overrides included — and the stream that yields a first chunk
+first is relayed; the other is cancelled (`_hedged`). The answer is one of two
+identical requests' answers: only when it arrives changes.
+
+- Each request runs in a task of its own (`_Leg`), which reads its stream one
+  chunk per ask — nothing is read ahead of ADK, so the clocks still stop where
+  ADK reads — and closes it in that task. Each keeps its own `model_call:`
+  line: the loser's says `status=error:cancelled`, and the second request's
+  ends in ` hedge=1`, after `tenant=` like the speculation's ` spec=1`, so
+  `NOT textPayload:"hedge=1"` still counts one router line per call. When the
+  second one wins, the first one's line is cancelled at its first chunk: its
+  `dur_ms` is the wait the turn saw.
+- A failure before the hedge fires is today's failure. After it has fired, a
+  failed request leaves the other to answer; when both fail, the first one's
+  error is raised, as it would have been. A request genai is already
+  retrying (a 429/5xx answered it; `retries=`) is not hedged. Once the hedge
+  has fired, though, genai may retry either request on its own budget: each
+  line's `retries=` says so.
+- The caller's cancellation — the turn aborted, the bot gone — cancels both,
+  and nothing outlives the call.
+- One line when it fires, once the race is decided:
+
+    router_hedge: fired=1 winner=<primary|hedge|-> primary_ttft_ms=<n|->
+      hedge_ttft_ms=<n|-> inv=… tenant=…
+
+  Each first-token time is counted from its own request's start (`-`: none
+  arrived); `winner=-`: neither answered — both failed, or the caller left
+  first. Against `dispatcher: intent`
+  with the same `tenant=` clause it is the share of turns that paid for a
+  second router call (~$0.004 for a short session's 2.6k-token router prompt,
+  ~$0.03 for the ~20k-token uncached prompt of a long one).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import time
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -67,6 +108,11 @@ from .tenant import label_of
 logger = logging.getLogger("gub_agent.models")
 
 CLAUDE_PREFIX = "claude-"
+
+#: The agent whose calls are hedged: agents/router.py's ROUTER_NAME, which ADK
+#: puts in every request's `adk_agent_name` label. Not imported from there —
+#: that module imports this one; a test pins the two together.
+HEDGED_AGENT = "router"
 
 
 def is_claude(model_id: str | None) -> bool:
@@ -87,6 +133,10 @@ class VendorRouter(BaseLlm):
     #: `global` endpoint; overridable per deploy (CLAUDE_VERTEX_LOCATION).
     claude_location: str = "global"
     claude_max_tokens: int = 8192
+    #: Milliseconds a router call may go without a first chunk before its
+    #: request is sent a second time (module docstring, "The router hedge");
+    #: 0 never does. config.build_model passes ROUTER_HEDGE_AFTER_MS.
+    router_hedge_after_ms: int = 0
 
     _claude: dict[str, BaseLlm] = PrivateAttr(default_factory=dict)
 
@@ -126,6 +176,13 @@ class VendorRouter(BaseLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
+        if self.router_hedge_after_ms > 0 and _agent_of(llm_request) == HEDGED_AGENT:
+            spare = _spare_of(llm_request)
+            if spare is not None:
+                async with aclosing(self._hedged(llm_request, spare, stream)) as responses:
+                    async for response in responses:
+                        yield response
+                return
         # The same responses in the same order, only timed on the way through:
         # the measurement sits here because this is the one object that sees
         # every chunk of every agent's call, whichever vendor serves it.
@@ -158,6 +215,52 @@ class VendorRouter(BaseLlm):
         request, wants_json = adapt_request_for_claude(llm_request)
         async for response in llm.generate_content_async(request, stream=stream):
             yield trim_json_reply(response) if wants_json and not response.partial else response
+
+    async def _hedged(
+        self, llm_request: LlmRequest, spare: LlmRequest, stream: bool
+    ) -> AsyncGenerator[LlmResponse, None]:
+        """A router call whose request is sent a second time, as `spare`, when
+        its first chunk is late (module docstring, "The router hedge")."""
+        primary = _Leg(self, llm_request, stream, hedge=False)
+        legs = [primary]
+        stopping = "error:cancelled"  # what a request still going at the end logs
+        reported = False  # the `router_hedge:` line, once per fired hedge
+        try:
+            asked = primary.ask()
+            await asyncio.wait({asked}, timeout=self.router_hedge_after_ms / 1000)
+            if asked.done() or primary.call.retries:
+                # In time — a failure too, raised below exactly as it is
+                # unhedged — or genai is already retrying it: no second send.
+                winner, outcome = primary, await asked
+            else:
+                hedge = _Leg(self, spare, stream, hedge=True)
+                legs.append(hedge)
+                winner, outcome = await _race(primary, asked, hedge, hedge.ask())
+                reported = True
+                _log_hedge(primary, hedge, winner)
+                for leg in legs:
+                    if leg is not winner:
+                        leg.stop("error:cancelled")
+                if winner is None:  # both failed: the primary's error, as unhedged
+                    raise outcome.error
+            while outcome is not _END:
+                if isinstance(outcome, _Failed):
+                    raise outcome.error
+                yield outcome
+                outcome = await winner.ask()
+        except GeneratorExit:
+            stopping = "error:closed"  # the consumer stopped reading
+            raise
+        finally:
+            # A caller that went away, a winner that failed, or a stream that
+            # ended: both requests are stopped and have ended when this returns.
+            for leg in legs:
+                leg.stop(stopping)
+            await asyncio.wait({leg.task for leg in legs})
+            if len(legs) > 1 and not reported:
+                # Fired, and the caller left before either answered: the
+                # second send was still paid for, so it is still counted.
+                _log_hedge(primary, legs[1], None)
 
 
 # ── The per-call line ─────────────────────────────────────────────────────────
@@ -286,15 +389,12 @@ class _ModelCall:
         self.usage: Any = None
         self.status = "ok"
         self.retries = 0
+        self.hedge = False  # the second request of a hedged router call
 
     @classmethod
     def begin(cls, router: VendorRouter, llm_request: LlmRequest, stream: bool) -> _ModelCall:
         caller = _CALLER.get()
-        config = getattr(llm_request, "config", None)
-        labels = getattr(config, "labels", None) or {}
-        # ADK labels every request with the calling agent's name (base_llm_flow:
-        # _ADK_AGENT_NAME_LABEL_KEY) just before it calls the model.
-        agent = labels.get("adk_agent_name") or (caller.agent if caller else "-")
+        agent = _agent_of(llm_request)
         model = str(llm_request.model or router.model)
         call = cls(agent, model, stream, caller, genai=not is_claude(model))
         _IN_FLIGHT.set(call)
@@ -311,17 +411,23 @@ class _ModelCall:
             # A reply with no usable content (a block, a malformed call).
             self.status = f"error:{_token(response.error_code)}"
 
+    @property
+    def ttft_ms(self) -> int | str:
+        """Milliseconds to the first chunk, `-` when none has arrived."""
+        return "-" if self.first is None else round((self.first - self.started) * 1000)
+
     def log(self) -> None:
         end = time.monotonic()
         last = self.last if self.last is not None else end
         observable = self.genai and _GENAI_LOGGER.isEnabledFor(logging.INFO)
         (logger.info if self.status == "ok" else logger.warning)(
             "model_call: agent=%s model=%s stream=%d ttft_ms=%s dur_ms=%d prompt=%d "
-            "cached=%d thoughts=%d out=%d status=%s retries=%s inv=%s tenant=%s",
+            "cached=%d thoughts=%d out=%d status=%s retries=%s inv=%s tenant=%s"
+            + (HEDGE_MARK if self.hedge else ""),
             self.agent,
             self.model,
             1 if self.stream else 0,
-            "-" if self.first is None else round((self.first - self.started) * 1000),
+            self.ttft_ms,
             round((last - self.started) * 1000),
             _count(self.usage, "prompt_token_count"),
             _count(self.usage, "cached_content_token_count"),
@@ -332,6 +438,172 @@ class _ModelCall:
             self.caller.invocation_id if self.caller else "-",
             self.caller.tenant if self.caller else "-",
         )
+
+
+def _agent_of(llm_request: LlmRequest) -> str:
+    """The calling agent, as the `model_call:` line names it."""
+    config = getattr(llm_request, "config", None)
+    labels = getattr(config, "labels", None) or {}
+    caller = _CALLER.get()
+    # ADK labels every request with the calling agent's name (base_llm_flow:
+    # _ADK_AGENT_NAME_LABEL_KEY) just before it calls the model.
+    return labels.get("adk_agent_name") or (caller.agent if caller else "-")
+
+
+# ── The router hedge (module docstring) ───────────────────────────────────────
+
+# Appended to the second request's `model_call:` line, after `tenant=`.
+HEDGE_MARK = " hedge=1"
+
+_END = object()  # a leg's outcome: its stream ended
+
+
+@dataclass(frozen=True)
+class _Failed:
+    """A leg's outcome: its request raised. Handed to the reader as a value,
+    never left as the task's exception: the reader decides which failure the
+    caller sees, and no task exception goes unretrieved."""
+
+    error: Exception
+
+
+def _spare_of(llm_request: LlmRequest) -> LlmRequest | None:
+    """The request a hedge sends: a deep copy taken NOW, before the first
+    send. The vendor client edits the request it is handed — ADK's Gemini
+    appends a user turn after a model one and merges its tracking headers
+    into `config.http_options` — so a copy taken later would not be what the
+    first request sent, and two sends must never share one object. About
+    1 ms for a 20k-token router request. None if it cannot be copied: the
+    call then runs unhedged, exactly as with the flag off."""
+    try:
+        return llm_request.model_copy(deep=True)
+    except Exception as exc:  # noqa: BLE001 — a hedge must never cost the call
+        logger.warning("router_hedge: request not copyable (%s) — unhedged", type(exc).__name__)
+        return None
+
+
+def _settle(asked: asyncio.Future[Any] | None, outcome: Any) -> None:
+    if asked is not None and not asked.done():
+        asked.set_result(outcome)
+
+
+class _Leg:
+    """One request of a hedged router call, in a task of its own.
+
+    The task owns the vendor's generator from its first step to its close and
+    advances it one chunk per `ask()`: the stream is read when ADK reads it,
+    never ahead (so `dur_ms` still stops at the chunk ADK read last), and
+    never from another task — aiohttp's timeouts and OpenTelemetry's context
+    are bound to the task that entered them. The request's `model_call:` line
+    is written by the task when the request ends, however it ends."""
+
+    def __init__(
+        self, router: VendorRouter, llm_request: LlmRequest, stream: bool, *, hedge: bool
+    ) -> None:
+        self.role = "hedge" if hedge else "primary"
+        # Begun here, in the caller's context, so the task's copy of that
+        # context holds THIS call as the one in flight: genai's retries inside
+        # the task count on this request's line, never on the other's.
+        self.call = _ModelCall.begin(router, llm_request, stream)
+        self.call.hedge = hedge
+        self._asked: asyncio.Future[Any] | None = None
+        self._wake = asyncio.Event()
+        self._started = False
+        self._stop_status: str | None = None
+        self.task = asyncio.create_task(
+            self._run(router._generate(llm_request, stream)), name=f"router-{self.role}"
+        )
+
+    def ask(self) -> asyncio.Future[Any]:
+        """The next outcome — a response, `_END` or `_Failed` — as a future
+        the task fulfils. One at a time: the next ask follows its answer."""
+        self._asked = asyncio.get_running_loop().create_future()
+        self._wake.set()
+        return self._asked
+
+    def stop(self, status: str) -> None:
+        """Cancel the request if it is still going; its line says `status`
+        (the first one given)."""
+        if self.task.done():
+            return
+        if self._stop_status is None:
+            self._stop_status = status
+        if not self._started:
+            # Cancelled before its first step, the task never runs its body:
+            # nothing was sent, and the line is written here instead.
+            self.call.status = self._stop_status
+            self.call.log()
+        self.task.cancel()
+
+    async def _run(self, responses: AsyncGenerator[LlmResponse, None]) -> None:
+        self._started = True
+        call = self.call
+        asked: asyncio.Future[Any] | None = None
+        try:
+            while True:
+                await self._wake.wait()
+                self._wake.clear()
+                asked = self._asked
+                try:
+                    response = await anext(responses)
+                except StopAsyncIteration:
+                    _settle(asked, _END)
+                    return
+                call.saw(response)
+                _settle(asked, response)
+        except asyncio.CancelledError as exc:
+            call.status = self._stop_status or "error:cancelled"
+            # Not always our stop(): the vendor can raise one itself (a
+            # library-internal cancel). The reader hears of it as of any
+            # failure (unhedged, it reaches the caller at once) and never
+            # waits on it. After a stop() nobody reads this future any more.
+            _settle(asked, _Failed(exc))
+            raise
+        except Exception as exc:  # noqa: BLE001 — handed to the reader as _Failed
+            call.status = f"error:{_error_code(exc)}"
+            _settle(asked, _Failed(exc))
+        finally:
+            try:
+                # Closed here, in its own task. A stream that will not close
+                # cleanly is abandoned either way; its error must not become
+                # the task's.
+                with contextlib.suppress(Exception):
+                    await responses.aclose()
+            finally:
+                call.log()
+
+
+async def _race(
+    primary: _Leg, first_p: asyncio.Future[Any], hedge: _Leg, first_h: asyncio.Future[Any]
+) -> tuple[_Leg | None, Any]:
+    """The leg whose first outcome is a response (or the end of its stream),
+    and that outcome. A leg that failed leaves the race to the other; when
+    both have failed there is no winner, and the outcome is the primary's
+    failure."""
+    waiting = {first_p: primary, first_h: hedge}
+    failed: dict[str, _Failed] = {}
+    while waiting:
+        done, _ = await asyncio.wait(set(waiting), return_when=asyncio.FIRST_COMPLETED)
+        # Both in the same step: the primary first — a tie never demotes it.
+        for asked in sorted(done, key=lambda future: waiting[future] is not primary):
+            leg = waiting.pop(asked)
+            outcome = asked.result()
+            if not isinstance(outcome, _Failed):
+                return leg, outcome
+            failed[leg.role] = outcome
+    return None, failed[primary.role]
+
+
+def _log_hedge(primary: _Leg, hedge: _Leg, winner: _Leg | None) -> None:
+    caller = primary.call.caller
+    logger.info(
+        "router_hedge: fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s inv=%s tenant=%s",
+        winner.role if winner is not None else "-",
+        primary.call.ttft_ms,
+        hedge.call.ttft_ms,
+        caller.invocation_id if caller else "-",
+        caller.tenant if caller else "-",
+    )
 
 
 # ── Request adaptation ────────────────────────────────────────────────────────

@@ -68,6 +68,12 @@ jobs:
       # tripwire. --region controls where the engine RESOURCE lives; model
       # calls stay on the global endpoint via config (see README "Model
       # endpoint vs engine region").
+      #
+      # --extra_packages stages the repo-root services.py at /app/services.py
+      # (with /app on PYTHONPATH); `adk api_server` imports it at start, before
+      # it builds the agentengine:// session service. Without it the engine
+      # silently runs ADK's stock session service whatever
+      # SESSION_CLIENT_REUSE says. Absolute for the same reason as --env_file.
       - name: Deploy to Vertex AI Agent Engine
         # The dispatch input is passed as an ENV VALUE, never interpolated into
         # the script text — otherwise a crafted `description` (workflow_dispatch
@@ -85,6 +91,7 @@ jobs:
             --display_name="gub-agent" \
             --description="$DESC" \
             --env_file="$GITHUB_WORKSPACE/deploy-prod.env" \
+            --extra_packages="$GITHUB_WORKSPACE/services.py" \
             gub_agent
 
       # A skipped env file leaves a healthy engine running on defaults, which
