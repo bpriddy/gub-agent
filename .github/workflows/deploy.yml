@@ -103,12 +103,20 @@ jobs:
           AGENT_ENGINE_ID: ${{ vars.AGENT_ENGINE_ID }}
         run: deployment/verify-engine-env.sh "$GITHUB_WORKSPACE/deploy-prod.env"
 
-      # A fresh engine revision answers its FIRST request cold: measured live
-      # 2026-09-15, the router call alone took 32 s two minutes after a deploy
-      # (a warm one takes 2-4 s), so whoever asks first pays ~30 s for our
-      # deploy. Absorb it here instead: one throwaway greeting turn. Cost is
-      # one router call (~$0.001 of Gemini Flash per deploy). Failure is
-      # non-fatal - a cold first turn is slow, not broken.
+      # A fresh engine process pays a one-off cost on its first request: the
+      # agent package loads there (ADK's fast_api builds the runner - and so
+      # imports gub_agent - on the first request of ANY kind, :query included),
+      # and with EAGER_ADK_IMPORTS=1 the package also imports what ADK would
+      # otherwise import on the first model request (~2,100 modules; the first
+      # request of a process used to wait 6.2-16.4 s before its first model
+      # send). So the warm-up is one :query that loads the package and does
+      # nothing else: list_sessions for a user that has none. It reaches no
+      # model and stores no session event. It replaces a greeting turn that
+      # billed a router call and, since the speculative deep path, a cancelled
+      # executor round. It does not warm the first TLS connection to Vertex
+      # (~0.1-0.3 s on the first real turn). Failure is non-fatal - a cold
+      # first turn is slow, not broken. The same call is the 10-min ping in
+      # gcp-universal-backend terraform/engine_warmup.tf.
       - name: Warm the fresh revision
         continue-on-error: true
         env:
@@ -118,12 +126,8 @@ jobs:
         run: |
           BASE="https://$GCP_REGION-aiplatform.googleapis.com/v1/projects/$GCP_PROJECT_ID/locations/$GCP_REGION/reasoningEngines/$AGENT_ENGINE_ID"
           TOKEN=$(gcloud auth print-access-token)
-          SESSION=$(curl -sS -m 60 -X POST "$BASE:query" \
+          time curl -sS -m 120 -X POST "$BASE:query" \
             -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-            -d '{"class_method":"create_session","input":{"user_id":"deploy-warmup"}}' \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["output"]["id"])')
-          time curl -sS -m 120 -X POST "$BASE:streamQuery" \
-            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-            -d "{\"class_method\":\"stream_query\",\"input\":{\"user_id\":\"deploy-warmup\",\"session_id\":\"$SESSION\",\"message\":\"hi\"}}" \
+            -d '{"class_method":"list_sessions","input":{"user_id":"engine-warmup"}}' \
             -o /dev/null
           echo "engine warmed"
