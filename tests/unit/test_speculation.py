@@ -618,7 +618,8 @@ async def test_the_deep_path_is_asked_the_same_on_every_path_and_never_sees_this
     monkeypatch,
 ):
     """The executor's and the critic's requests: the same whether the run was
-    kept or restarted (here after a declining fast path), and the
+    kept, restarted (here after a declining fast path) or kept because the
+    fast path would have declined in code, and the
     SPECULATIVE_DEEP=0 requests with exactly one content fewer — ADK's
     rendering of this turn's router event. The previous turn's router event
     stays, as every earlier event does."""
@@ -659,8 +660,24 @@ async def test_the_deep_path_is_asked_the_same_on_every_path_and_never_sees_this
         fast,
     )
 
+    # Kept via the precheck (SPECULATIVE_FAST_PRECHECK): the same race, on a
+    # fast decision the lookup declines in code — the run in flight is kept.
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+    precheck = _build(
+        speculative=True,
+        router=[],
+        exec_delay=0.01,
+        exec_delays=[0.01, 0.01, 0.3],
+        router_until=lambda m: m.router.calls < 2 or m.executor.in_flight > 0,
+    )
+    precheck_exec, precheck_critic = await two_turns(
+        precheck, _decision("count_or_rank", 0.95, slots={"entity": "campaigns"})
+    )
+
     assert len(kept_exec) == 2 and len(kept_critic) == 1
     assert kept_exec == restarted_exec and kept_critic == restarted_critic
+    assert precheck.models.executor.cancelled == 0  # kept, not restarted
+    assert kept_exec == precheck_exec and kept_critic == precheck_critic
     assert kept_exec == _minus_this_turns_router(serial_exec)
     assert kept_critic == _minus_this_turns_router(serial_critic)
     # One content apart: the serial request holds both turns' router events,
@@ -933,6 +950,291 @@ async def test_a_fast_path_answer_after_a_finished_speculation_leaves_nothing_of
     assert [e.author for e in after.events] == ["user", "router", "format_gate"]
     assert "critic_verdict" not in after.state  # …and none of it was kept
     assert after.inv not in round_limiter_module._ROUNDS
+
+
+# ── kept: a fast path that would decline in code (SPECULATIVE_FAST_PRECHECK) ──
+
+ACCOUNT_ID = "fdb3f9ff-8094-4851-8ad4-a62f82761ad9"
+# The bot's prefix when it has a best guess (blend 02), which the router copies
+# into `entity_id` and the fast path reads as part of the question.
+GUESS = (
+    f'Best guess: account {ACCOUNT_ID} "Chevy" — the user did not choose this. Ignore the '
+    "guess if the question is not about it. Original question: "
+)
+# q9 (2026-09-28): the router itself says its slots do not cover the sentence.
+Q9 = _decision(
+    "count_or_rank",
+    0.85,
+    entity_surface="Chevy",
+    entity_id=ACCOUNT_ID,
+    slots={"entity": "campaigns", "account": "Chevy", "complete": False},
+)
+Q9_TEXT = GUESS + "Which Chevy campaigns end in the next two months?"
+
+# Production shapes the lookup declined in code (anomaly, 2026-09-18..28), and
+# how many GUB reads it made first.
+DECLINED_IN_CODE = [
+    pytest.param(Q9, Q9_TEXT, "slots_incomplete", 0, id="q9-slots-incomplete"),
+    pytest.param(
+        _decision("account_facts", 0.9, entity_id=ACCOUNT_ID),
+        GUESS + "Give me an overview of the Chevy account",
+        "no_surface",
+        0,
+        id="q4-account-by-id-only",
+    ),
+    pytest.param(
+        _decision(
+            "count_or_rank",
+            0.85,
+            entity_surface="chevy",
+            slots={"entity": "campaigns", "account": "chevy", "limit": 20, "complete": True},
+        ),
+        "give me top 20 companies of chevy",
+        "rank_no_metric",
+        1,
+        id="top-20-without-a-metric",
+    ),
+    pytest.param(
+        _decision(
+            "count_or_rank",
+            0.9,
+            entity_surface="Chevy",
+            entity_id=ACCOUNT_ID,
+            slots={"entity": "campaigns", "status": "live", "account": "Chevy", "complete": True},
+        ),
+        GUESS + "What campaigns are currently active for Chevy?",
+        "shape_other",
+        1,
+        id="which-campaigns",
+    ),
+]
+
+_FAST_TOOLS = (
+    "find",
+    "org_query",
+    "get_campaign",
+    "get_account_overview",
+    "get_staff_profile",
+    "search_staff",
+)
+
+
+def _gub_tools(monkeypatch, **answers) -> list[str]:
+    """The fast path's own GUB reads, recorded. `find` knows one account,
+    "Chevy"; every other read answers `answers[name]`, else a 500 — a decline,
+    so the module's real format gate (and its model) is never reached."""
+    calls: list[str] = []
+
+    def tool(name: str):
+        async def call(*args, **kwargs):
+            calls.append(name)
+            if name == "find":
+                return [{"type": "account", "id": ACCOUNT_ID, "name": "Chevy", "similarity": 1.0}]
+            return answers.get(name, {"error": True, "status": 500, "message": "stub"})
+
+        return call
+
+    for name in _FAST_TOOLS:
+        monkeypatch.setattr(fp, name, tool(name))
+    return calls
+
+
+def _asked(monkeypatch) -> list:
+    """Record every call to the precheck; it still answers."""
+    asked = []
+    real = fp.declined_before_lookup
+
+    async def recording(decision, question, shim):
+        asked.append(decision.intent)
+        return await real(decision, question, shim)
+
+    monkeypatch.setattr(fp, "declined_before_lookup", recording)
+    return asked
+
+
+def _decline_lines(lines: list[str]) -> list[str]:
+    return [
+        line
+        for line in lines
+        if line.startswith(
+            ("speculation:", "dispatcher: fast path declined", "fast_path: declined before")
+        )
+    ]
+
+
+@pytest.mark.parametrize("decision,question,reason,serial_reads", DECLINED_IN_CODE)
+async def test_a_fast_path_that_declines_in_code_keeps_the_speculation(
+    decision, question, reason, serial_reads, monkeypatch, caplog
+):
+    """The lookup would hand the turn back whatever GUB answers, so stopping
+    the speculation for it only starts the same deep run again. With the flag
+    on, the run in flight at the decision is kept, as on a deep turn: nothing
+    cancelled, nothing run twice, no lookup — and the answer, the session and
+    the state are the serial root's. The stream lacks exactly the fast path's
+    two progress pings; the turn still logs as a decline."""
+    calls = _gub_tools(monkeypatch)
+    runs = []
+    for speculative in (False, True):
+        if speculative:
+            monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+            built = _build(
+                speculative=True, router=[decision], exec_delays=[0.4], router_until=mid_call
+            )
+        else:
+            built = _build(speculative=False, router=[decision])
+        monkeypatch.setattr(dp, "fast_path", built.fast)
+        calls.clear()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="gub_agent"):
+            turn = await _one_turn(built, question)
+        runs.append((built, turn, list(calls), _gub_lines(caplog)))
+
+    (_, before, before_calls, _), (built, after, after_calls, lines) = runs
+    assert len(before_calls) == serial_reads  # what the lookup spent to decline
+    # Kept: the call in flight at the decision ran on (today: 1 cancelled, 3 calls).
+    assert built.models.executor.cancelled == 0
+    assert built.models.executor.calls == 2
+    assert after_calls == []  # no lookup…
+    assert not any(e.author == "fast_path" for e in after.streamed)  # …and no pings
+    assert _shape(after.events) == _shape(before.events)
+    assert after.state == before.state
+    assert _payloads(after.streamed)[-1] == _payloads(before.streamed)[-1] == ANSWER
+    pings = [e for e in before.streamed if e.author == "fast_path"]
+    assert [e.partial for e in pings] == [True, True]
+    assert _shape(after.streamed) == _shape([e for e in before.streamed if e not in pings])
+    [outcome, *_] = _decline_lines(lines)
+    assert outcome.startswith("speculation: outcome=kept ") and "finished=0 error=-" in outcome
+    assert _decline_lines(lines) == [
+        outcome,
+        f"dispatcher: fast path declined (inv={after.inv}) — deep path tenant=anomaly",
+        f"fast_path: declined before lookup reason={reason} (inv={after.inv}) tenant=anomaly",
+    ]
+    assert not any(_marked(line) for line in _decline_lines(lines))
+
+
+async def test_with_the_flag_off_a_fast_path_that_declines_in_code_restarts_as_before(
+    monkeypatch, caplog
+):
+    """The rollback: the precheck is never asked, the speculation is stopped
+    for the lookup, and the decline gets a fresh deep run — the stream, pings
+    included, is the serial root's."""
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", False)
+    asked = _asked(monkeypatch)
+    _gub_tools(monkeypatch)
+    before = _build(speculative=False, router=[Q9])
+    monkeypatch.setattr(dp, "fast_path", before.fast)
+    serial = await _one_turn(before, Q9_TEXT)
+    built = _build(speculative=True, router=[Q9], exec_delays=[5.0], router_until=mid_call)
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built, Q9_TEXT)
+
+    assert asked == []
+    assert built.models.executor.cancelled == 1
+    assert built.models.executor.calls == 3
+    assert _shape(after.streamed) == _shape(serial.streamed)
+    assert _shape(after.events) == _shape(serial.events)
+    assert after.state == serial.state
+    assert _lines(caplog, "speculation:")[-1].startswith(
+        "speculation: outcome=restarted:fast_declined "
+    )
+    assert _lines(caplog, "fast_path: declined before lookup") == []
+
+
+async def test_a_speculation_that_already_raised_is_never_kept_by_the_precheck(monkeypatch, caplog):
+    """Today a decline replaces a run that raised with a fresh one, and the
+    turn answers. Keeping it would relay its exception instead."""
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+    asked = _asked(monkeypatch)
+    calls = _gub_tools(monkeypatch)
+    built = _build(
+        speculative=True,
+        router=[Q9],
+        executor=[RuntimeError("executor model failed"), REACT],
+        router_until=ran_to_end,
+    )
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built, Q9_TEXT)  # does not raise
+
+    assert asked == []
+    assert _payloads(after.streamed)[-1] == ANSWER
+    assert built.models.executor.calls == 3  # the one that raised, then a fresh run's two
+    assert calls == []  # the lookup ran and declined in code, as today
+    assert any(e.author == "fast_path" for e in after.streamed)
+    [line] = _lines(caplog, "speculation:")
+    assert line.startswith("speculation: outcome=restarted:fast_declined ")
+    assert "finished=1 error=RuntimeError" in line
+
+
+async def test_a_precheck_that_raises_leaves_the_turn_on_todays_path(monkeypatch, caplog):
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+
+    async def broken(decision, question, shim):
+        raise RuntimeError("precheck bug")
+
+    monkeypatch.setattr(fp, "declined_before_lookup", broken)
+    _gub_tools(monkeypatch)
+    built = _build(speculative=True, router=[Q9], exec_delays=[5.0], router_until=mid_call)
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built, Q9_TEXT)
+
+    assert _payloads(after.streamed)[-1] == ANSWER
+    assert built.models.executor.cancelled == 1 and built.models.executor.calls == 3
+    assert _lines(caplog, "speculation:")[-1].startswith(
+        "speculation: outcome=restarted:fast_declined "
+    )
+    [raised] = [r for r in caplog.records if r.getMessage().startswith("fast_path: precheck")]
+    assert raised.getMessage() == (
+        f"fast_path: precheck raised (inv={after.inv}) tenant=anomaly — lookup as before"
+    )
+    assert raised.exc_info is not None
+
+
+NEEDS_THE_LOOKUP = [
+    # A complete count: the lookup answers it, so the speculation is stopped.
+    pytest.param(
+        _decision(
+            "count_or_rank",
+            0.95,
+            slots={"entity": "campaigns", "status": "live", "complete": True},
+        ),
+        "how many live campaigns do we have?",
+        {"org_query": {"error": True, "status": 404, "message": "not found"}},
+        "cancelled:fast",
+        ["org_query"],
+        id="complete-count-answers",
+    ),
+    # A name only `/org/search` can settle: it does not resolve, so a restart.
+    pytest.param(
+        _decision("campaign_status", 0.95, entity_surface="Silverado"),
+        "how is Silverado doing?",
+        {},
+        "restarted:fast_declined",
+        ["find"],
+        id="unresolved-name-restarts",
+    ),
+]
+
+
+@pytest.mark.parametrize("decision,question,answers,outcome,reads", NEEDS_THE_LOOKUP)
+async def test_with_the_flag_on_a_decline_only_gub_can_decide_takes_todays_path(
+    decision, question, answers, outcome, reads, monkeypatch, caplog
+):
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+    asked = _asked(monkeypatch)
+    calls = _gub_tools(monkeypatch, **answers)
+    built = _build(speculative=True, router=[decision], exec_delays=[5.0], router_until=mid_call)
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        await _one_turn(built, question)
+
+    assert asked == [json.loads(decision)["intent"]]  # asked, and it had no reason
+    assert calls == reads
+    assert built.models.executor.cancelled == 1
+    assert _lines(caplog, "speculation:")[-1].startswith(f"speculation: outcome={outcome} ")
+    assert _lines(caplog, "fast_path: declined before lookup") == []
 
 
 # ── a broken router ──────────────────────────────────────────────────────────
@@ -1500,7 +1802,9 @@ def test_the_log_lines_keep_their_bytes(caplog):
         "dispatcher: intent=assessment confidence=0.81 branch=deep (inv=e-1) tenant=chevy",
         "speculation: outcome=off lead_ms=- buffered=0 finished=0 error=- inv=e-1 tenant=chevy",
         "speculation: outcome=kept lead_ms=5812 buffered=7 finished=0 error=- inv=e-1 tenant=chevy",
-        "dispatcher: fast path declined (inv=e-1) — deep path",
+        # `tenant=` appended: the decline rate's numerator carries the same
+        # clause as its denominator.
+        "dispatcher: fast path declined (inv=e-1) — deep path tenant=chevy",
     ]
 
 

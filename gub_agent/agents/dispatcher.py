@@ -136,7 +136,14 @@ def log_decision(ctx: InvocationContext, decision: RouterDecision, branch: str) 
 
 
 def log_fast_path_declined(ctx: InvocationContext) -> None:
-    logger.info("dispatcher: fast path declined (inv=%s) — deep path", ctx.invocation_id)
+    # `tenant` APPENDED, as on the `dispatcher: intent` line: this line is
+    # the numerator of the decline rate, and a count over it must carry the
+    # same `tenant=` clause as its denominator.
+    logger.info(
+        "dispatcher: fast path declined (inv=%s) — deep path tenant=%s",
+        ctx.invocation_id,
+        label_of(ctx),
+    )
 
 
 def log_speculation(

@@ -11,7 +11,9 @@ wherever the test is not about the gate itself.
 
 from __future__ import annotations
 
+import itertools
 import json
+import logging
 from importlib import import_module
 
 import pytest
@@ -660,3 +662,412 @@ async def test_an_intent_with_no_lookup_announces_nothing(gub, gate):
 
     assert _progress(events) == []
     assert _answers(events) == []
+
+
+# ── declined_before_lookup: a decline decided before any call ─────────────────
+#
+# The speculative root (SPECULATIVE_FAST_PRECHECK) keeps the deep run already
+# started beside the router when this says the lookup would decline. The one
+# thing it may never do is name a reason for a question the lookup would have
+# answered: that would change which branch answers the turn.
+
+
+class AllSucceed:
+    """Every GUB read the fast path can make, answered with data — the most
+    accepting GUB there is. A lookup that declines against it declines on any
+    answer."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def get(self, path: str, tool_context=None, **params):
+        self.calls.append(("GET", path))
+        if path == "/org/search":  # one exact-name hit of every type the lookups ask for
+            return [
+                {"type": t, "id": f"{t}-1", "name": params["q"], "similarity": 1.0}
+                for t in ("account", "campaign", "staff")
+            ]
+        if path == "/org/staff":
+            return {"staff": [{"id": "staff-1", "name": params.get("q")}], "total": 1}
+        if path.endswith("/campaigns"):
+            return {"campaigns": []}
+        if path.endswith("/metadata"):
+            return {"metadata": []}
+        return {"id": path.rsplit("/", 1)[-1], "name": "chevy", "status": "live"}
+
+    async def post(self, path: str, body: dict, tool_context=None) -> dict:
+        self.calls.append(("POST", path))
+        return {"results": [{"count": 3}], "total": 3, "truncated": False}
+
+
+@pytest.fixture
+def all_succeed(monkeypatch) -> AllSucceed:
+    fake = AllSucceed()
+    for name in ("accounts", "discovery", "staff"):
+        monkeypatch.setattr(import_module(f"gub_agent.tools.{name}"), "gub_get", fake.get)
+    monkeypatch.setattr(import_module("gub_agent.tools.org_query"), "gub_post", fake.post)
+    return fake
+
+
+ACCOUNT_ID = "fdb3f9ff-8094-4851-8ad4-a62f82761ad9"
+# The bot's prefix when it has a best guess (blend 02) — `user_text` carries it.
+GUESS = (
+    f'Best guess: account {ACCOUNT_ID} "Chevy" — the user did not choose this. Ignore the '
+    "guess if the question is not about it. Original question: "
+)
+
+PURE_DECLINES = [
+    # Production shapes (anomaly, 2026-09-18..28): each declined, and each
+    # lost the speculation's lead to a restart.
+    pytest.param(
+        {"intent": "account_facts", "entity_surface": None, "entity_id": ACCOUNT_ID},
+        GUESS + "Give me an overview of the Chevy account",
+        "no_surface",
+        id="q4-account-by-id-only",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "entity_surface": "Chevy",
+            "entity_id": ACCOUNT_ID,
+            "slots": {"entity": "campaigns", "account": "Chevy", "complete": False},
+        },
+        GUESS + "Which Chevy campaigns end in the next two months?",
+        "slots_incomplete",
+        id="q9-slots-incomplete",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "entity_surface": "chevy",
+            "slots": {"entity": "campaigns", "account": "chevy", "limit": 20, "complete": True},
+        },
+        "give me top 20 companies of chevy",
+        "rank_no_metric",
+        id="top-20-without-a-metric",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "entity_surface": "Chevy",
+            "entity_id": ACCOUNT_ID,
+            "slots": {
+                "entity": "campaigns",
+                "status": "live",
+                "account": "Chevy",
+                "complete": True,
+            },
+        },
+        GUESS + "What campaigns are currently active for Chevy?",
+        "shape_other",
+        id="which-campaigns",
+    ),
+    # Every other rule.
+    pytest.param(
+        {"intent": "account_facts", "entity_surface": "   "},
+        "chevy?",
+        "no_surface",
+        id="account-blank",
+    ),
+    pytest.param(
+        {"intent": "staff_lookup", "entity_surface": None, "entity_id": "s1"},
+        "who is she?",
+        "no_surface",
+        id="staff-by-id-only",
+    ),
+    pytest.param(
+        {"intent": "staff_lookup", "entity_surface": ""}, "who?", "no_surface", id="staff-empty"
+    ),
+    pytest.param(
+        {"intent": "campaign_facts", "entity_surface": "  ", "entity_id": None},
+        "tell me about it",
+        "no_surface",
+        id="campaign-blank-no-id",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "staff", "office": "London", "complete": True},
+        },
+        "how many people are in London?",
+        "office",
+        id="office",
+    ),
+    pytest.param(
+        {"intent": "count_or_rank", "slots": {"status": "live", "complete": True}},
+        "how many are live?",
+        "no_entity",
+        id="no-entity",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "campaigns", "status": "active", "complete": True},
+        },
+        "how many campaigns are active?",
+        "status_vocab",
+        id="another-entitys-status",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "staff", "industry": "auto", "complete": True},
+        },
+        "how many staff work in auto?",
+        "industry_entity",
+        id="industry-not-on-accounts",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "campaigns", "period": "recently", "complete": True},
+        },
+        "how many campaigns did we win recently?",
+        "period",
+        id="relative-period",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "staff", "account": "chevy", "complete": True},
+        },
+        "how many people work on chevy?",
+        "account_entity",
+        id="account-on-staff",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "campaigns", "group_by": "region", "complete": True},
+        },
+        "how many campaigns per region?",
+        "group_by",
+        id="unmapped-group-by",
+    ),
+    pytest.param(
+        {"intent": "count_or_rank", "slots": {"entity": "campaigns", "limit": 0, "complete": True}},
+        "how many campaigns?",
+        "limit",
+        id="limit-out-of-range",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "campaigns", "metric": "reach", "complete": True},
+        },
+        "which campaign has the highest reach?",
+        "rank_metric",
+        id="unmapped-metric",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "campaigns", "metric": "budget", "complete": True},
+        },
+        "how much budget do the campaigns have?",
+        "count_with_metric",
+        id="count-with-a-metric",
+    ),
+]
+
+
+@pytest.mark.parametrize("over,question,reason", PURE_DECLINES)
+async def test_a_decline_decided_in_code_is_named_before_any_call(
+    all_succeed, gate, over, question, reason
+):
+    decision = _decision(language="en", **over)
+    ctx = await _ctx(decision, question)
+
+    assert await fp.declined_before_lookup(decision, question, fp._ToolShim(ctx)) == reason
+    assert all_succeed.calls == []  # not one request, the account name included
+
+    # …and the fast path itself declines it with every GUB read succeeding.
+    events = [e async for e in fp.fast_path.run_async(ctx)]
+    assert _answers(events) == [] and fp.outcome(INV) == "deep"
+    assert gate.runs == []
+
+
+async def test_a_ranking_without_a_metric_is_declined_without_resolving_the_account(all_succeed):
+    """ "give me top 20 companies of chevy" (2026-09-18): the lookup resolves
+    the account through `/org/search` before it reaches the check that
+    declines the question, so it pays a call to learn what the words already
+    said. The precheck asks the same builder with the name resolved offline."""
+    [param] = [p for p in PURE_DECLINES if p.id == "top-20-without-a-metric"]
+    over, question, _ = param.values
+    decision = _decision(language="en", **over)
+    shim = fp._ToolShim(await _ctx(decision, question))
+
+    assert await fp._LOOKUPS["count_or_rank"](decision, shim, question) is None
+    assert all_succeed.calls == [("GET", "/org/search")]  # the lookup: one call, then None
+    all_succeed.calls.clear()
+    assert await fp.declined_before_lookup(decision, question, shim) == "rank_no_metric"
+    assert all_succeed.calls == []  # the precheck: none
+
+
+NEEDS_A_CALL = [
+    pytest.param({"intent": "campaign_status"}, "статус Silverado 2026 Q3", id="campaign-by-name"),
+    pytest.param(
+        {"intent": "campaign_facts", "entity_surface": None, "entity_id": "c1"},
+        "tell me about it",
+        id="campaign-by-id",
+    ),
+    pytest.param(
+        {"intent": "account_facts", "entity_surface": "Chevy"}, "chevy?", id="account-by-name"
+    ),
+    # A whitespace-only name still reaches `search_staff`, which may match it.
+    pytest.param({"intent": "staff_lookup", "entity_surface": "  "}, "who?", id="staff-blank"),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "campaigns", "status": "live", "complete": True},
+        },
+        "how many campaigns are live?",
+        id="complete-count",
+    ),
+    # Only `/org/search` can say whether "chevy" is one account.
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {
+                "entity": "campaigns",
+                "status": "live",
+                "account": "chevy",
+                "complete": True,
+            },
+        },
+        "how many live campaigns does chevy have?",
+        id="count-needing-the-account",
+    ),
+    pytest.param(
+        {
+            "intent": "count_or_rank",
+            "slots": {"entity": "campaigns", "metric": "budget", "complete": True},
+        },
+        "which campaign has the largest budget?",
+        id="ranking-with-a-metric",
+    ),
+    pytest.param({"intent": "smalltalk"}, "hi", id="not-a-fast-intent"),
+]
+
+
+@pytest.mark.parametrize("over,question", NEEDS_A_CALL)
+async def test_a_decline_only_a_call_can_decide_is_left_to_the_lookup(all_succeed, over, question):
+    decision = _decision(language="en", **over)
+    shim = fp._ToolShim(await _ctx(decision, question))
+    assert await fp.declined_before_lookup(decision, question, shim) is None
+    assert all_succeed.calls == []
+
+
+async def test_the_precheck_speaks_only_for_the_lookups_it_restates(monkeypatch, all_succeed):
+    """Keyed on the function `_LOOKUPS` holds: a lookup it does not restate —
+    here a stand-in that answers — gets no reason, however the decision
+    reads."""
+
+    async def answers(decision, shim, question):
+        return fp.Lookup(payload=not_found_payload("en", None), tool="get_account_overview")
+
+    monkeypatch.setitem(fp._LOOKUPS, "account_facts", answers)
+    decision = _decision(language="en", intent="account_facts", entity_surface=None)
+    shim = fp._ToolShim(await _ctx(decision, "chevy?"))
+    assert await fp.declined_before_lookup(decision, "chevy?", shim) is None
+
+
+def _soundness_table() -> list[tuple[dict, str]]:
+    """Decisions × questions: every surface / id pairing for the entity
+    intents, and the count_or_rank slot space across the question shapes."""
+    cases: list[tuple[dict, str]] = []
+    for intent in ("campaign_status", "campaign_facts", "account_facts", "staff_lookup"):
+        for surface in (None, "", "   ", "Chevy"):
+            for entity_id in (None, "", ACCOUNT_ID):
+                over = {"intent": intent, "entity_surface": surface, "entity_id": entity_id}
+                cases.append((over, GUESS + "how is chevy doing?"))
+    questions = (
+        "how many campaigns are live?",  # count
+        "which campaign has the largest budget?",  # rank
+        "which campaigns are live?",  # enumerate
+        "what is the combined budget?",  # aggregate
+        "chevy campaigns",  # nothing recognisable
+    )
+    space = itertools.product(
+        (None, "campaigns", "accounts", "staff", "pieces"),  # entity
+        (None, "live", "active"),  # status
+        (None, "auto"),  # industry
+        (None, "2026 Q3", "recently"),  # period
+        (None, "chevy"),  # account
+        (None, "status", "region"),  # group_by
+        (None, 0, 20),  # limit
+        (None, "budget", "reach"),  # metric
+    )
+    for n, (entity, status, industry, period, account, group_by, limit, metric) in enumerate(space):
+        slots = {
+            "entity": entity,
+            "status": status,
+            "industry": industry,
+            "period": period,
+            "account": account,
+            "group_by": group_by,
+            "limit": limit,
+            "metric": metric,
+            "complete": n % 7 != 0,  # the router's own "incomplete" on a slice
+            "office": "London" if n % 11 == 0 else None,
+        }
+        for question in questions:
+            cases.append(({"intent": "count_or_rank", "slots": slots}, question))
+    for param in PURE_DECLINES + NEEDS_A_CALL:
+        over, question = param.values[:2]
+        cases.append((over, question))
+    return cases
+
+
+async def test_a_reason_means_the_lookup_declines_whatever_gub_answers(all_succeed):
+    """SOUNDNESS. Whenever the precheck names a reason, the real lookup
+    returns None with every tool succeeding — so no question the fast path
+    would answer is ever sent down the deep path. And the converse on this
+    table: with every tool succeeding, each None the lookup returns is one the
+    precheck named, so the check is the lookup's code-decided part, not a
+    guess at it."""
+    ctx = await _ctx(_decision(), "x")
+    shim = fp._ToolShim(ctx)
+    named = answered = 0
+    for over, question in _soundness_table():
+        decision = _decision(language="en", **over)
+        reason = await fp.declined_before_lookup(decision, question, shim)
+        if decision.intent not in fp._LOOKUPS:  # no lookup: the fast path never runs
+            assert reason is None
+            continue
+        before = len(all_succeed.calls)
+        lookup = await fp._LOOKUPS[decision.intent](decision, shim, question)
+        if reason is not None:
+            named += 1
+            assert lookup is None, (over, question, reason)
+        else:
+            answered += 1
+            assert lookup is not None, (over, question)
+            assert len(all_succeed.calls) > before  # a real lookup was made
+    assert named > 1000 and answered > 100  # the table exercises both sides
+
+
+async def test_the_reason_lines_carry_inv_and_tenant(caplog):
+    """The builder's two reason lines and the non-403/404 line used to carry
+    neither inv nor tenant, so a decline could not be joined to its turn or
+    counted per bot. Appended, never interleaved."""
+    ctx = await invocation_ctx(
+        state={"gub_jwt": "test-jwt", "tenant": "chevy"}, invocation_id=INV, user_text="x"
+    )
+    shim = fp._ToolShim(ctx)
+    incomplete = _decision(intent="count_or_rank", slots={"entity": "campaigns"})
+    office = _decision(
+        intent="count_or_rank", slots={"entity": "staff", "office": "London", "complete": True}
+    )
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        assert await fp.org_query_args(incomplete, shim, "how many?") is None
+        assert await fp.org_query_args(office, shim, "how many?") is None
+        assert fp._shortcut({"error": True, "status": 500}, _decision(), shim) is None
+        fp.log_declined_before_lookup(shim, "slots_incomplete")
+    assert [r.getMessage() for r in caplog.records] == [
+        "fast_path: router says the slots do not cover the question — deep path"
+        f" (inv={INV}) tenant=chevy",
+        f"fast_path: office constraint needs an id lookup — deep path (inv={INV}) tenant=chevy",
+        f"fast_path: 500 from the lookup — deep path (inv={INV}) tenant=chevy",
+        f"fast_path: declined before lookup reason=slots_incomplete (inv={INV}) tenant=chevy",
+    ]

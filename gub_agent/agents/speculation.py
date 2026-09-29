@@ -94,6 +94,18 @@ entries in those stores are cleared before the next branch runs
 (`_Speculation.discard`), which is what the executor's own per-pass reset does
 (`agent.py:_before_agent`).
 
+A fast path that would decline in code (SPECULATIVE_FAST_PRECHECK, off by
+default). Some FAST decisions are declined by the lookup before any call, or
+whatever the call returns: count slots the router itself calls incomplete, a
+ranking with no metric, a blank name (`fast_path.declined_before_lookup`
+lists them). Stopping the speculation for such a lookup throws its lead away
+to start the same deep run again, so with the flag on the root asks first and,
+on a reason, keeps the speculation as on a deep turn: `speculation:
+outcome=kept`, then `dispatcher: fast path declined` (the decline still
+counts) and `fast_path: declined before lookup reason=…`. The fast path does
+not run, so its two progress events are not sent. Never a run that has
+already raised: today's decline replaces that one with a fresh run.
+
 Exceptions. A router that RAISES costs the deep path, not the turn: the
 decision is FALLBACK_DECISION, which is what an unreadable one already costs
 (`dispatcher.py`: "A broken router costs latency only") — and with the deep
@@ -197,10 +209,11 @@ from .. import config
 from ..schemas.router import FALLBACK_DECISION, RouterDecision
 from ..tenant import label_of
 from . import dispatcher as dp
+from . import fast_path as fp
 from .circuit_breaker import reset_tool_budget
 from .evidence_index import reset_evidence_index
 from .round_limiter import reset_rounds
-from .router import ROUTER_STATE_KEY, decision_from
+from .router import ROUTER_STATE_KEY, decision_from, user_text
 from .tool_gate import GATED_INTENT
 
 logger = logging.getLogger(__name__)
@@ -210,6 +223,17 @@ logger = logging.getLogger(__name__)
 # (agent.py:build_root). Read at import — a change needs a redeploy. Read here
 # rather than in config.py so this change stays in one module.
 SPECULATIVE_DEEP: bool = os.environ.get("SPECULATIVE_DEEP", "1").lower() in ("1", "true", "yes")
+
+# Off by default: a FAST decision whose lookup would decline in code
+# (`fast_path.declined_before_lookup`) keeps the speculation instead of
+# stopping it for that lookup (module docstring, "A fast path that would
+# decline in code"). Off is the ROLLBACK, today's stop-then-restart. Read at
+# import, like SPECULATIVE_DEEP.
+SPECULATIVE_FAST_PRECHECK: bool = os.environ.get("SPECULATIVE_FAST_PRECHECK", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Relayed events are stamped at least this far apart (seconds): one
 # microsecond, the resolution a session store's datetime keeps.
@@ -266,6 +290,23 @@ def _stale_reason(decision: RouterDecision) -> str | None:
     if _tool_gate_offers(decision) != _tool_gate_offers(FALLBACK_DECISION):
         return GATED_INTENT
     return None
+
+
+async def _declined_before_lookup(ctx: InvocationContext, shim: fp._ToolShim) -> str | None:
+    """`fast_path.declined_before_lookup` on the inputs the fast path itself
+    would read (`FastPath._run_async_impl`: `decision_from`, `user_text`, the
+    tool shim), so the answer is about the lookup that would run. An exception
+    is no answer: the turn takes today's path, as a lookup that raises costs
+    the deep path and never the turn."""
+    try:
+        return await fp.declined_before_lookup(decision_from(ctx), user_text(ctx), shim)
+    except Exception:  # noqa: BLE001 — a precheck must never cost the turn
+        logger.exception(
+            "fast_path: precheck raised (inv=%s) tenant=%s — lookup as before",
+            ctx.invocation_id,
+            label_of(ctx),
+        )
+        return None
 
 
 def _wrote_decision(ctx: InvocationContext) -> bool:
@@ -617,6 +658,26 @@ class SpeculativeDispatch(BaseAgent):
                 await run.discard(ctx)
                 yield payload
                 return
+
+            # A fast path that would decline in code (module docstring): the
+            # speculation is the deep run a decline gets, so it is kept.
+            if (
+                branch == dp.FAST
+                and SPECULATIVE_FAST_PRECHECK
+                and run.error is None
+                and _stale_reason(decision) is None
+            ):
+                shim = fp._ToolShim(ctx)
+                precheck = await _declined_before_lookup(ctx, shim)
+                if precheck is not None:
+                    dp.log_speculation(ctx, "kept", **at_decision)
+                    logged = True
+                    dp.log_fast_path_declined(ctx)
+                    fp.log_declined_before_lookup(shim, precheck)
+                    async with aclosing(run.relay()) as events:
+                        async for event in events:
+                            yield event
+                    return
 
             # The fast path, as the dispatcher runs it. A run still going is
             # stopped first (module docstring). One that has already finished
