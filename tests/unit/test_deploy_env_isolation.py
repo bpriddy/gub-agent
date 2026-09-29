@@ -182,6 +182,7 @@ async def test_both_deploy_envs_state_the_latency_switches():
         "SPECULATIVE_DEEP",
         "SPECULATIVE_FAST_PRECHECK",
         "EAGER_ADK_IMPORTS",
+        "EVIDENCE_ROWS_EVENT",
     )
     prod, sandbox = _env(_prod_env_file()), _env(_sandbox_env_file())
     for key in switches:

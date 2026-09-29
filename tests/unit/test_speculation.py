@@ -609,6 +609,31 @@ async def test_a_kept_turn_streams_and_stores_what_the_serial_root_does():
     assert stamps == sorted(stamps) and len(set(stamps)) == len(stamps)
 
 
+async def test_a_kept_turn_relays_the_evidence_rows_before_the_payload(monkeypatch):
+    """EVIDENCE_ROWS_EVENT (latency-04 A4): the gate's rows event is one of the
+    speculation's HELD events, relayed in order — ahead of the formatter's —
+    and, being partial, stored nowhere; the stored session is the serial root's."""
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", True)
+    before = await _one_turn(_build(speculative=False, router=[_decision()]))
+    after = await _one_turn(_build(speculative=True, router=[_decision()], router_until=ran_to_end))
+
+    for turn in (before, after):
+        authors = [(e.author, bool(e.partial)) for e in turn.streamed]
+        rows_at = [
+            i
+            for i, e in enumerate(turn.streamed)
+            if e.custom_metadata and "evidence_rows" in e.custom_metadata
+        ]
+        assert len(rows_at) == 1
+        assert authors[rows_at[0]] == ("format_gate", True)
+        assert rows_at[0] < authors.index(("formatter", True))
+        rows = turn.streamed[rows_at[0]].custom_metadata["evidence_rows"]
+        assert "org_query:a1" in [r["evidence_id"] for r in rows]
+    assert _shape(after.events) == _shape(before.events)
+    assert not any(e.custom_metadata for e in after.events)
+    assert after.state == before.state
+
+
 def _is_prose(event: Event) -> bool:
     parts = event.content.parts if event.content and event.content.parts else []
     return event.author == AGENT_NAME and bool(parts) and parts[0].text is not None
