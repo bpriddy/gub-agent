@@ -692,7 +692,10 @@ def _explain_errors(errors: list) -> str:
 # full payload's feedback would ALSO list a field error in the tail — in
 # `citations`, `facts`, `assumptions` (> 2), `follow_ups` (> 3) or
 # `candidates` — or be a JSON error instead, had the tail not parsed. None of
-# the 4 rejections had one (each logged exactly one error, in `blocks`).
+# the 4 rejections had one (each logged exactly one error, in `blocks`). One
+# more, which Gemini's constrained decoding never emits: a payload that
+# repeats `headline` or `blocks` AFTER `blocks` closed would be judged on its
+# first copy, where a JSON parser keeps the last.
 # Everything else is decided conservatively: no abort unless `kind` streamed
 # first with a valid value and nothing but `kind` and `headline` preceded
 # `blocks`, and never on a payload-level error (`_contract` judges a payload
@@ -763,10 +766,16 @@ class _ContractScan:
         if self.done:
             return None
         self.text += chunk
-        while self._i < len(self.text) and not self.done:
-            feedback = self._step(self.text)
-            if feedback:
-                return feedback
+        try:
+            while self._i < len(self.text) and not self.done:
+                feedback = self._step(self.text)
+                if feedback:
+                    return feedback
+        except Exception:  # noqa: BLE001 — a scan must never cost the attempt
+            # Whatever the scan trips on (a value nested past the recursion
+            # limit, say), the attempt runs to its end and the full
+            # validation judges it, as it does today.
+            self.done = True
         return None
 
     def _string_ends(self, char: str) -> bool:

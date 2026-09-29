@@ -1231,3 +1231,14 @@ async def test_early_abort_through_a_real_formatter_closes_the_model_call(monkey
     assert on.stored == off.stored and on.streamed == off.streamed
     assert on.feedback == off.feedback == [REJECTION]
     assert on.partials < off.partials  # the only difference: fewer attempt-1 chunks
+
+
+def test_early_abort_a_scan_that_trips_gives_up_instead_of_raising():
+    """Anything the scan itself trips on (here a `kind` nested past the
+    recursion limit) ends the scan: the attempt runs to its end and the full
+    validation judges it, as today — a scan never costs the attempt."""
+    deep = "[" * 30000 + "]" * 30000
+    scan = _ContractScan()
+    assert scan.feed('{"kind":' + deep + ',"headline":"h","blocks":[]}') is None
+    assert scan.done
+    assert scan.feed(',"citations":[]}') is None
