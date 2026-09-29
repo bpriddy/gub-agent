@@ -53,6 +53,7 @@ from google.adk.events import Event, EventActions
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
+from .. import config
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
 from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
 from ..tenant import label_of
@@ -658,9 +659,48 @@ def _explain_validation(exc: ValidationError) -> str:
     return "invalid payload — " + "; ".join(parts[:6])
 
 
+def evidence_rows(index: dict[str, dict]) -> list[dict]:
+    """The index as the bot's early claim filter reads a cited fact
+    (EVIDENCE_ROWS_EVENT): one row per entry, in index order, keyed by the
+    entry's evidence id — the index KEY, which is what a citation names. NEW
+    dicts, never the entries themselves: a held speculative event is
+    deep-copied only in its content and actions (speculation.py:_as_yielded),
+    and `tool` / `source_file_ids` are left out because the filter reads
+    neither."""
+    return [
+        {
+            "evidence_id": evidence_id,
+            "entity_id": entry.get("entity_id"),
+            "field": entry.get("field"),
+            "value": entry.get("value"),
+        }
+        for evidence_id, entry in index.items()
+    ]
+
+
 class FormatGate(BaseAgent):
     """Runs the formatter, validates in code, retries with feedback, and
     guarantees the turn ends with a payload (see module docstring)."""
+
+    def _evidence_rows_event(self, ctx: InvocationContext, index: dict[str, dict]) -> Event:
+        """EVIDENCE_ROWS_EVENT: the index this run's brief was composed from,
+        as one content-less partial event. Partial, so the Runner streams it
+        and never appends it (no session event, no state, no history); authored
+        by the gate, whose partials a bot that predates it skips."""
+        rows = evidence_rows(index)
+        logger.info(
+            "evidence_rows: n=%d bytes=%d inv=%s tenant=%s",
+            len(rows),
+            len(json.dumps(rows, ensure_ascii=False).encode("utf-8")),
+            ctx.invocation_id,
+            label_of(ctx),
+        )
+        return Event(
+            invocation_id=ctx.invocation_id,
+            author=self.name,
+            partial=True,
+            custom_metadata={"evidence_rows": rows},
+        )
 
     def _payload_event(self, ctx: InvocationContext, payload: AnswerPayload) -> Event:
         """A gate-authored payload event: the JSON as content text (the bot's
@@ -705,6 +745,9 @@ class FormatGate(BaseAgent):
             ctx.invocation_id,
             compose_brief(executor_text, index, "", provenance(ctx.invocation_id)),
         )
+        # One per gate run, before any attempt: the index is final here.
+        if config.EVIDENCE_ROWS_EVENT:
+            yield self._evidence_rows_event(ctx, index)
 
         # With nothing citable, `kind="answer"` CANNOT validate — the contract
         # requires a citation (`schemas/answer.py`) — so a rejected attempt is
