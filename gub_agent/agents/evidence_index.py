@@ -36,9 +36,12 @@ behind for the executor's pass to render instead of its own answer.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import OrderedDict
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # The per-bullet Drive provenance the status-synthesis prompt writes after
 # every bullet of a `statusMarkdown` (blend 08 §5.2). 47/47 campaigns carry
@@ -107,6 +110,39 @@ def reset_evidence_index(callback_context: Any) -> None:
 def evidence_index(invocation_id: str) -> dict[str, dict[str, Any]]:
     """This invocation's index (empty when no tool has returned yet)."""
     return _INDEX.get(invocation_id, {})
+
+
+def evidence_rows(index: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """The index as the bot's early claim filter reads a cited fact
+    (EVIDENCE_ROWS_EVENT, the format gate's rows event): one row per entry, in
+    index order, keyed by the entry's evidence id — the index KEY, which is
+    what a citation names. NEW dicts, never the entries themselves: a held
+    speculative event is deep-copied only in its content and actions
+    (speculation.py:_as_yielded), and `tool` / `source_file_ids` are left out
+    because the filter reads neither."""
+    return [
+        {
+            "evidence_id": evidence_id,
+            "entity_id": entry.get("entity_id"),
+            "field": entry.get("field"),
+            "value": entry.get("value"),
+        }
+        for evidence_id, entry in index.items()
+    ]
+
+
+def log_evidence_rows(invocation_id: str, tenant: str, rows: list[dict[str, Any]]) -> None:
+    """The rows event's one line. Logged HERE, not in format_gate.py: engine
+    lines carry their file name, and `textPayload:"format_gate"` is how the
+    gate's drop and repair rates are read — a line on every gate run would
+    inflate every one of them."""
+    logger.info(
+        "evidence_rows: n=%d bytes=%d inv=%s tenant=%s",
+        len(rows),
+        len(json.dumps(rows, ensure_ascii=False).encode("utf-8")),
+        invocation_id,
+        tenant,
+    )
 
 
 def provenance(invocation_id: str) -> dict[str, list[str]]:

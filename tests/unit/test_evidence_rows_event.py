@@ -30,8 +30,12 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
 
 from gub_agent import config
-from gub_agent.agents import format_gate as fg
-from gub_agent.agents.evidence_index import evidence_index, record_evidence, reset_evidence_index
+from gub_agent.agents.evidence_index import (
+    evidence_index,
+    evidence_rows,
+    record_evidence,
+    reset_evidence_index,
+)
 from gub_agent.agents.format_gate import FormatGate
 from gub_agent.config import AGENT_NAME
 
@@ -130,13 +134,19 @@ async def test_the_log_line(monkeypatch, caplog):
     gate = FormatGate(name="format_gate", sub_agents=[_scripted([_valid_dict()])])
     ctx = await _gate_ctx(TEXT)
     ctx.session.state["tenant"] = "chevy"
-    with caplog.at_level(logging.INFO, logger="gub_agent.agents.format_gate"):
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
         [e async for e in gate.run_async(ctx)]
 
-    rows = fg.evidence_rows(index)
+    rows = evidence_rows(index)
     size = len(json.dumps(rows, ensure_ascii=False).encode("utf-8"))
-    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("evidence_rows:")]
-    assert lines == [f"evidence_rows: n={len(rows)} bytes={size} inv=inv-1 tenant=chevy"]
+    records = [r for r in caplog.records if r.getMessage().startswith("evidence_rows:")]
+    assert [r.getMessage() for r in records] == [
+        f"evidence_rows: n={len(rows)} bytes={size} inv=inv-1 tenant=chevy"
+    ]
+    # Not a format_gate line: `textPayload:"format_gate"` reads the gate's
+    # drop and repair rates, and engine lines carry their file name.
+    [record] = records
+    assert "format_gate" not in record.pathname and "format_gate" not in record.getMessage()
 
 
 # ── on a real Runner: nothing of it is stored ─────────────────────────────────

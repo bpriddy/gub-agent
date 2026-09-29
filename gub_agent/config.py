@@ -328,9 +328,10 @@ EAGER_ADK_IMPORTS: bool = os.environ.get("EAGER_ADK_IMPORTS", "1").lower() in (
 # the bot's claim filter uses to start on the facts the formatter will cite
 # (its B3 part ii). A partial event is streamed but never appended to the
 # session (ADK runners.py), so session events, history, state and billing are
-# unchanged, and a bot that predates it skips it (format_gate partials are
-# ignored). Off is the rollback: no event. Read at import; set explicitly in
-# both deploy env files.
+# unchanged, and a bot that predates it skips it for content (format_gate
+# partials are ignored) — it only counts it: every bot's `gubRawEvents` and the
+# sandbox batch record's `events` go up by one per gate run. Off is the
+# rollback: no event. Read at import; set explicitly in both deploy env files.
 EVIDENCE_ROWS_EVENT: bool = os.environ.get("EVIDENCE_ROWS_EVENT", "0").lower() in (
     "1",
     "true",

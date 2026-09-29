@@ -62,6 +62,8 @@ from .evidence_index import (
     answer_draft,
     entry_source_ids,
     evidence_index,
+    evidence_rows,
+    log_evidence_rows,
     provenance,
     set_format_feedback,
     set_formatter_brief,
@@ -659,25 +661,6 @@ def _explain_validation(exc: ValidationError) -> str:
     return "invalid payload — " + "; ".join(parts[:6])
 
 
-def evidence_rows(index: dict[str, dict]) -> list[dict]:
-    """The index as the bot's early claim filter reads a cited fact
-    (EVIDENCE_ROWS_EVENT): one row per entry, in index order, keyed by the
-    entry's evidence id — the index KEY, which is what a citation names. NEW
-    dicts, never the entries themselves: a held speculative event is
-    deep-copied only in its content and actions (speculation.py:_as_yielded),
-    and `tool` / `source_file_ids` are left out because the filter reads
-    neither."""
-    return [
-        {
-            "evidence_id": evidence_id,
-            "entity_id": entry.get("entity_id"),
-            "field": entry.get("field"),
-            "value": entry.get("value"),
-        }
-        for evidence_id, entry in index.items()
-    ]
-
-
 class FormatGate(BaseAgent):
     """Runs the formatter, validates in code, retries with feedback, and
     guarantees the turn ends with a payload (see module docstring)."""
@@ -688,13 +671,7 @@ class FormatGate(BaseAgent):
         and never appends it (no session event, no state, no history); authored
         by the gate, whose partials a bot that predates it skips."""
         rows = evidence_rows(index)
-        logger.info(
-            "evidence_rows: n=%d bytes=%d inv=%s tenant=%s",
-            len(rows),
-            len(json.dumps(rows, ensure_ascii=False).encode("utf-8")),
-            ctx.invocation_id,
-            label_of(ctx),
-        )
+        log_evidence_rows(ctx.invocation_id, label_of(ctx), rows)
         return Event(
             invocation_id=ctx.invocation_id,
             author=self.name,
