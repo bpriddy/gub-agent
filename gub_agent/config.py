@@ -301,6 +301,23 @@ CRITIC_SKIP_FINAL_PASS: bool = os.environ.get("CRITIC_SKIP_FINAL_PASS", "1").low
     "yes",
 )
 
+# Stop a formatter attempt the answer contract has already rejected
+# (agents/format_gate.py, "Early abort"). The contract's field checks — filler,
+# word budgets, block shape — on the headline and the blocks are decidable the
+# moment the streamed `blocks` array closes, at a median 24% of the payload
+# text; the rest of a rejected attempt (citations, facts, follow-ups) is
+# generated only to be thrown away. `contract` checks those two fields as they
+# stream and, on a field error, closes the model call and takes the retry with
+# the feedback today's full-payload check writes. That class only: a
+# grounding-rejected attempt is yielded and stored before the gate judges it,
+# so aborting one would change the session history.
+#
+# 0 is the code default and the rollback: every formatter event is relayed as
+# before and nothing is scanned. Any value other than `contract` reads as 0.
+# Read at import: a redeploy either way. Stated in both deploy env files —
+# deliberately NOT at the same value (see the comments there).
+FORMAT_GATE_EARLY_ABORT: str = os.environ.get("FORMAT_GATE_EARLY_ABORT", "0").strip().lower()
+
 # Import at package load what ADK would otherwise import on the first model
 # request (gub_agent/eager_imports.py): the anthropic SDK behind ADK's content
 # builder, the genai client's async stack, auth and flow modules — 2,115
