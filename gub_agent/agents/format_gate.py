@@ -46,6 +46,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
+from contextlib import aclosing, nullcontext
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
@@ -54,6 +55,7 @@ from google.genai import types as genai_types
 from pydantic import ValidationError
 
 from .. import config
+from ..config import FORMAT_GATE_EARLY_ABORT
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
 from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
 from ..tenant import label_of
@@ -68,7 +70,7 @@ from .evidence_index import (
     set_format_feedback,
     set_formatter_brief,
 )
-from .formatter import ANSWER_STATE_KEY, formatter_agent
+from .formatter import ANSWER_STATE_KEY, FORMATTER_NAME, formatter_agent
 
 logger = logging.getLogger(__name__)
 
@@ -645,9 +647,16 @@ def _explain_validation(exc: ValidationError) -> str:
     formatter spent its retries reading about block kinds it never tried to
     emit. A branch mismatch is dropped unless nothing else survives.
     """
+    return _explain_errors(exc.errors())
+
+
+def _explain_errors(errors: list) -> str:
+    """`_explain_validation` over a list of pydantic error dicts — shared with
+    the early abort (`_ContractScan`), so an attempt stopped mid-stream is told
+    exactly what the full payload's check would have told it."""
     kept: list[str] = []
     noise: list[str] = []
-    for err in exc.errors():
+    for err in errors:
         loc = ".".join(str(item) for item in err.get("loc", ())) or "payload"
         msg = err.get("msg", "invalid")
         line = f"{loc}: {msg}"
@@ -659,6 +668,227 @@ def _explain_validation(exc: ValidationError) -> str:
         (noise if is_branch_noise else kept).append(line)
     parts = kept or noise
     return "invalid payload — " + "; ".join(parts[:6])
+
+
+# ── early abort (FORMAT_GATE_EARLY_ABORT=contract) ───────────────────────────
+#
+# A contract-rejected attempt is thrown away whole: ADK validates the payload
+# only on the formatter's final event and raises before yielding it, so the
+# session never stores it, and the bot never reads a formatter partial. Yet the
+# rejection is usually decided early. Gemini streams the keys in schema order —
+# `kind, headline, blocks, citations, facts, [assumptions], follow_ups` on 106
+# of 106 stored payloads — and the `blocks` array closes at a median 24% of the
+# text. The 4 contract rejections of 2026-09-17..28 (three bullets over budget,
+# one filler) were each a single field error in `blocks`; everything their
+# attempts generated after `blocks` was thrown away.
+#
+# So the gate scans the formatter's streamed text and, once `headline` and
+# `blocks` are complete, runs the contract's FIELD checks on just those two
+# (`_ContractScan`). A field error there is also a field error of the full
+# payload, formatted by the same `_explain_errors`, so the retry is told what
+# it is told today. The attempt is closed — its `model_call` line says
+# `status=error:closed`, as a contract-rejected call's already does; the vendor
+# stream under VendorRouter is then closed by asyncio's async-generator
+# finalizer a few loop turns later — and the gate takes today's retry path.
+#
+# The residual, and why production keeps this off until it is accepted: the
+# full payload's feedback would ALSO list a field error in the tail — in
+# `citations`, `facts`, `assumptions` (> 2), `follow_ups` (> 3) or
+# `candidates` — or be a JSON error instead, had the tail not parsed. None of
+# the 4 rejections had one (each logged exactly one error, in `blocks`). One
+# more, which Gemini's constrained decoding never emits: a payload that
+# repeats `headline` or `blocks` AFTER `blocks` closed would be judged on its
+# first copy, where a JSON parser keeps the last.
+# Everything else is decided conservatively: no abort unless `kind` streamed
+# first with a valid value and nothing but `kind` and `headline` preceded
+# `blocks`, and never on a payload-level error (`_contract` judges a payload
+# that is not finished yet) or on text that does not open with `{`.
+
+_JSON_WS = " \t\r\n"
+_SCANNED_KEYS = ("kind", "headline", "blocks")
+_KINDS = ("answer", "abstain", "clarify")
+# The scan's structural moves outside strings and nested values: (state, char)
+# -> next state. A pair not listed ends the scan — `}` closing the object
+# before `blocks` did, or JSON the scan does not follow.
+_MOVES = {
+    ("start", "{"): "key_or_end",
+    ("key_or_end", '"'): "key",
+    ("key_next", '"'): "key",
+    ("colon", ":"): "value",
+    ("after", ","): "key_next",
+}
+
+
+def _streamed_text(event: Event) -> str:
+    """A formatter partial's own slice of the payload text, thoughts excluded
+    (ADK's final event carries the concatenation of these); '' for any other
+    event."""
+    if not event.partial or event.author != FORMATTER_NAME or not event.content:
+        return ""
+    return "".join(
+        part.text for part in event.content.parts or [] if part.text and not part.thought
+    )
+
+
+class _ContractScan:
+    """The contract's field checks on `headline` and `blocks` of ONE formatter
+    attempt, run while its JSON streams in.
+
+    `feed` takes each partial's text and returns the retry feedback the moment
+    the attempt is known to be rejected, else None. A small JSON scanner, not a
+    parser: it follows the top-level object's keys and records the RAW text of
+    `kind`, `headline` and `blocks`, tracking strings and escapes across chunk
+    boundaries. When `blocks` closes, `{"kind": "abstain", "headline": <raw>,
+    "blocks": <raw>}` is validated with `model_validate_json` — the call ADK
+    makes on the full text — and only FIELD errors (a non-empty `loc`) count:
+    the payload-level `_contract` trips on any unfinished payload ("needs at
+    least one citation"), and `kind="abstain"` keeps it from asking. Invalid
+    JSON inside the raw values fails as a payload-level error, so it never
+    aborts either.
+
+    The scan decides once and then stops (`done`): at the close of `blocks`, or
+    as soon as the text leaves the shape it can vouch for — not opening with
+    `{` (JSON whitespace aside: a fence or prose never aborts), a key other
+    than `kind`/`headline` before `blocks` closed, a repeated key, `blocks`
+    before `headline` or `kind`, or any JSON it does not follow.
+    """
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.done = False
+        self._i = 0  # next character of `text` to read
+        self._state = "start"
+        self._start = 0  # where the current key or value began
+        self._depth = 0  # inside a nested value
+        self._in_string = False  # inside a string of a nested value
+        self._escaped = False
+        self._key = ""
+        self._raw: dict[str, str] = {}
+
+    def feed(self, chunk: str) -> str | None:
+        if self.done:
+            return None
+        self.text += chunk
+        try:
+            while self._i < len(self.text) and not self.done:
+                feedback = self._step(self.text)
+                if feedback:
+                    return feedback
+        except Exception:  # noqa: BLE001 — a scan must never cost the attempt
+            # Whatever the scan trips on (a value nested past the recursion
+            # limit, say), the attempt runs to its end and the full
+            # validation judges it, as it does today.
+            self.done = True
+        return None
+
+    def _string_ends(self, char: str) -> bool:
+        """One character inside a JSON string; True when it closes it."""
+        if self._escaped:
+            self._escaped = False
+        elif char == "\\":
+            self._escaped = True
+        elif char == '"':
+            return True
+        return False
+
+    def _step(self, text: str) -> str | None:
+        char = text[self._i]
+        state = self._state
+        if state == "literal":  # a number, true, false or null
+            if char not in _JSON_WS and char not in ",}":
+                self._i += 1
+                return None
+            self._state = "after"  # the delimiter is read again, as "after"
+            return self._close(text[self._start : self._i])
+        self._i += 1
+        if state in ("key", "string"):
+            if not self._string_ends(char):
+                return None
+            raw = text[self._start : self._i]
+            if state == "string":
+                self._state = "after"
+                return self._close(raw)
+            try:
+                self._key = json.loads(raw)
+            except ValueError:
+                self.done = True
+                return None
+            self._state = "colon"
+            return None
+        if state == "nested":
+            if self._in_string:
+                self._in_string = not self._string_ends(char)
+            elif char == '"':
+                self._in_string = True
+            elif char in "{[":
+                self._depth += 1
+            elif char in "}]":
+                self._depth -= 1
+                if self._depth == 0:
+                    self._state = "after"
+                    return self._close(text[self._start : self._i])
+            return None
+        if char in _JSON_WS:
+            return None
+        if state == "value":
+            self._start = self._i - 1
+            if char == '"':
+                self._state = "string"
+            elif char in "{[":
+                self._state, self._depth = "nested", 1
+            else:
+                self._state = "literal"
+                self._i -= 1  # read again, as the literal's first character
+            return None
+        move = _MOVES.get((state, char))
+        if move is None:
+            self.done = True
+            return None
+        if move == "key":
+            self._start = self._i - 1
+        self._state = move
+        return None
+
+    def _close(self, raw: str) -> str | None:
+        """A top-level value just closed; `raw` is its JSON text."""
+        key = self._key
+        if key not in _SCANNED_KEYS or key in self._raw:
+            self.done = True  # another field before `blocks`, or a repeated key
+            return None
+        self._raw[key] = raw
+        if key != "blocks":
+            return None
+        self.done = True
+        return self._check()
+
+    def _check(self) -> str | None:
+        if "headline" not in self._raw or "kind" not in self._raw:
+            # `blocks` first: never abort on a field that has not streamed yet
+            # (`headline` is required), nor guess at a `kind` still to come.
+            return None
+        try:
+            kind = json.loads(self._raw["kind"])
+        except ValueError:
+            return None
+        if kind not in _KINDS:
+            return None  # the full payload would report `kind` too
+        doc = (
+            '{"kind":"abstain","headline":'
+            + self._raw["headline"]
+            + ',"blocks":'
+            + self._raw["blocks"]
+            + "}"
+        )
+        try:
+            AnswerPayload.model_validate_json(doc)
+        except ValidationError as exc:
+            errors = [err for err in exc.errors() if err.get("loc")]
+            if not errors or any(
+                err.get("type") == "missing" and len(err["loc"]) == 1 for err in errors
+            ):
+                return None
+            return _explain_errors(errors)
+        return None
 
 
 class FormatGate(BaseAgent):
@@ -738,12 +968,33 @@ class FormatGate(BaseAgent):
         for attempt in range(attempts):
             captured: dict | None = None
             feedback = ""
+            # FORMAT_GATE_EARLY_ABORT=contract: a fresh scan per attempt, and a
+            # run that can be closed mid-stream. Off, the loop is today's.
+            scan = _ContractScan() if FORMAT_GATE_EARLY_ABORT == "contract" else None
+            run = self.sub_agents[0].run_async(ctx)
             try:
-                async for event in self.sub_agents[0].run_async(ctx):
-                    delta = (event.actions.state_delta or {}) if event.actions else {}
-                    if isinstance(delta.get(ANSWER_STATE_KEY), dict):
-                        captured = delta[ANSWER_STATE_KEY]
-                    yield event
+                async with aclosing(run) if scan is not None else nullcontext(run) as events:
+                    async for event in events:
+                        delta = (event.actions.state_delta or {}) if event.actions else {}
+                        if isinstance(delta.get(ANSWER_STATE_KEY), dict):
+                            captured = delta[ANSWER_STATE_KEY]
+                        chunk = _streamed_text(event) if scan is not None and not scan.done else ""
+                        yield event
+                        if chunk:  # scan is not None
+                            feedback = scan.feed(chunk) or ""
+                            if feedback:
+                                # Already rejected: close the run (the model
+                                # call ends `status=error:closed`) and take the
+                                # retry below — today's, feedback included.
+                                logger.info(
+                                    "format_gate: early abort attempt=%d at_chars=%d "
+                                    "class=contract (inv=%s) tenant=%s",
+                                    attempt + 1,
+                                    len(scan.text),
+                                    ctx.invocation_id,
+                                    label_of(ctx),
+                                )
+                                break
             except ValidationError as exc:
                 if exc.title != AnswerPayload.__name__:
                     # Not the contract speaking — some OTHER pydantic model

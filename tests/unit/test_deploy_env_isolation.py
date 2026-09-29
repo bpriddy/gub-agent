@@ -195,6 +195,24 @@ async def test_both_deploy_envs_state_the_latency_switches():
         )
 
 
+async def test_both_deploy_envs_state_the_format_gate_early_abort():
+    """FORMAT_GATE_EARLY_ABORT is a rollback like the switches above, but NOT
+    one of them: its values differ on purpose (the sandbox runs `contract`,
+    production stays 0 until the residual is accepted), and `_flag_on` reads
+    `contract` as off, so the parity assert above would pass vacuously. This
+    pins the declaration in both files and a value config.py understands."""
+    for path in (_prod_env_file(), _sandbox_env_file()):
+        values = _env(path)
+        assert "FORMAT_GATE_EARLY_ABORT" in values, (
+            f"{path.name}: keep FORMAT_GATE_EARLY_ABORT explicit — it is a rollback, "
+            "and an operator should be editing a line that is already there"
+        )
+        assert values["FORMAT_GATE_EARLY_ABORT"] in ("0", "contract"), (
+            f"{path.name}: FORMAT_GATE_EARLY_ABORT={values['FORMAT_GATE_EARLY_ABORT']} "
+            "is neither 0 nor contract — config.py would silently read it as 0"
+        )
+
+
 async def test_production_deploy_verifies_the_env_landed():
     """A deploy that cannot fail on a skipped env file will hide the next one."""
     text = DEPLOY_WORKFLOW.read_text()
