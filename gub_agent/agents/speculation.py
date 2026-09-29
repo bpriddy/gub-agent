@@ -735,7 +735,7 @@ class SpeculativeDispatch(BaseAgent):
                 shim = fp._ToolShim(ctx)
                 precheck = await _declined_before_lookup(ctx, shim)
                 if precheck is not None:
-                    dp.log_speculation(ctx, "kept", **at_decision)
+                    _log_outcome(ctx, "kept", at_decision, hold)
                     logged = True
                     dp.log_fast_path_declined(ctx)
                     fp.log_declined_before_lookup(shim, precheck)

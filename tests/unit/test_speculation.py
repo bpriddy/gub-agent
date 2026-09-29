@@ -1104,6 +1104,8 @@ async def test_a_fast_path_that_declines_in_code_keeps_the_speculation(
     assert _shape(after.streamed) == _shape([e for e in before.streamed if e not in pings])
     [outcome, *_] = _decline_lines(lines)
     assert outcome.startswith("speculation: outcome=kept ") and "finished=0 error=-" in outcome
+    # …with its hold line right after it, as on every speculative turn.
+    assert lines[lines.index(outcome) + 1].startswith("speculation_hold: ")
     assert _decline_lines(lines) == [
         outcome,
         f"dispatcher: fast path declined (inv={after.inv}) — deep path tenant=anomaly",
