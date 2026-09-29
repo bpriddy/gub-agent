@@ -63,7 +63,7 @@ from typing import Any
 import pytest
 from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
-from google.adk.events import Event
+from google.adk.events import Event, EventActions
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
@@ -1612,7 +1612,13 @@ def _kind(line: str) -> str:
 def _root_or_router(line: str) -> bool:
     """Logged by the speculative root itself or by the router, which runs live."""
     return line.startswith(
-        ("dispatcher: ", "speculation: ", "model_call: agent=router ", "turn_window: agent=router ")
+        (
+            "dispatcher: ",
+            "speculation: ",
+            "speculation_hold: ",
+            "model_call: agent=router ",
+            "turn_window: agent=router ",
+        )
     )
 
 
@@ -1689,8 +1695,14 @@ async def test_the_speculations_lines_are_marked_and_the_rule_leaves_the_serial_
         calls = [line for line in lines if line.startswith(f"model_call: agent={AGENT_NAME} ")]
         [cancelled] = [line for line in calls if "status=error:cancelled" in line]
         assert _marked(cancelled)
-    # The rule recovers the serial root's lines, kind for kind.
-    assert sorted(map(_kind, _counted(lines))) == sorted(map(_kind, serial))
+    # The rule recovers the serial root's lines, kind for kind — all but the
+    # speculative root's `speculation_hold:` line, which the serial root never
+    # logs (there is no speculation to hold).
+    [hold] = _lines(caplog, "speculation_hold:")
+    assert f"inv={turn.inv}" in hold and not _marked(hold)
+    assert sorted(map(_kind, _counted([line for line in lines if line != hold]))) == sorted(
+        map(_kind, serial)
+    )
     assert f"inv={turn.inv}" in outcome and not _marked(outcome)
 
 
@@ -1806,6 +1818,123 @@ def test_the_log_lines_keep_their_bytes(caplog):
         # clause as its denominator.
         "dispatcher: fast path declined (inv=e-1) — deep path tenant=chevy",
     ]
+
+
+def test_the_hold_line_has_bytes_of_its_own(caplog):
+    ctx = SimpleNamespace(invocation_id="e-1", session=SimpleNamespace(state={"tenant": "chevy"}))
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
+        dp.log_speculation_hold(ctx)
+        dp.log_speculation_hold(ctx, text_held_ms=20512, payload_held_ms=0, run_held_ms=None)
+    assert [r.getMessage() for r in caplog.records] == [
+        "speculation_hold: text_held_ms=- payload_held_ms=- run_held_ms=- inv=e-1 tenant=chevy",
+        "speculation_hold: text_held_ms=20512 payload_held_ms=0 run_held_ms=- inv=e-1 tenant=chevy",
+    ]
+
+
+def _held(line: str) -> dict[str, int | None]:
+    """A `speculation_hold:` line's three fields; None for `-`."""
+    fields = dict(word.split("=", 1) for word in line.split()[1:4])
+    return {key: None if value == "-" else int(value) for key, value in fields.items()}
+
+
+def _hold_after_outcome(caplog) -> str:
+    """The turn's one `speculation_hold:` line — asserted to be the very next
+    line after its `speculation:` line."""
+    lines = [r.getMessage() for r in caplog.records if r.name.split(".")[0] == "gub_agent"]
+    [at] = [i for i, line in enumerate(lines) if line.startswith("speculation: ")]
+    [hold] = _lines(caplog, "speculation_hold:")
+    assert lines[at + 1] == hold
+    return hold
+
+
+async def test_a_router_slower_than_the_whole_deep_path_logs_what_it_held(caplog):
+    """The router answers only once the speculative run has ended (a stalled
+    router): its text, its payload and its end were all held, the text the
+    longest, and the line says so."""
+    built = _build(speculative=True, router=[_decision()], router_until=ran_to_end)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built)
+
+    assert _lines(caplog, "speculation:")[0].startswith("speculation: outcome=kept ")
+    hold = _hold_after_outcome(caplog)
+    assert hold.endswith(f" inv={after.inv} tenant=anomaly")
+    held = _held(hold)
+    # The router waited ROUTER_DELAY after the run ended.
+    assert held["run_held_ms"] >= ROUTER_DELAY * 1000 * 0.8
+    assert held["text_held_ms"] >= held["payload_held_ms"] >= held["run_held_ms"] > 0
+
+
+async def test_a_no_data_turn_logs_what_a_finished_run_held(caplog):
+    """Thrown away or not, the hold is what the router cost: a greeting
+    decided after the whole deep path had run still logs all three marks."""
+    built = _build(speculative=True, router=[_decision("smalltalk", 0.97)], router_until=ran_to_end)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        await _one_turn(built)
+
+    assert _lines(caplog, "speculation:")[0].startswith("speculation: outcome=cancelled:smalltalk ")
+    held = _held(_hold_after_outcome(caplog))
+    assert held["text_held_ms"] >= held["payload_held_ms"] >= held["run_held_ms"] > 0
+
+
+async def test_a_router_faster_than_the_first_executor_call_held_nothing(caplog):
+    built = _build(speculative=True, router=[_decision()], router_delay=0, exec_delay=0.3)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built)
+
+    assert _payloads(after.streamed)[-1] == ANSWER  # the run went on, kept
+    hold = _hold_after_outcome(caplog)
+    assert hold == (
+        "speculation_hold: text_held_ms=- payload_held_ms=- run_held_ms=- "
+        f"inv={after.inv} tenant=anomaly"
+    )
+
+
+async def test_a_turn_aborted_before_the_decision_holds_nothing(caplog):
+    built = _build(speculative=True, router=[_decision()], router_delay=5.0, exec_delay=0.01)
+    session = await _Session(built.root).open()
+    stream = session.stream("how is chevy doing?")
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        read = asyncio.ensure_future(anext(stream))
+        for _ in range(500):  # the speculative run gets as far as its payload
+            if built.models.formatter.calls:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read
+        await stream.aclose()
+
+    assert built.models.formatter.calls == 1
+    assert _lines(caplog, "speculation:")[0].startswith("speculation: outcome=cancelled:aborted ")
+    hold = _hold_after_outcome(caplog)
+    assert hold.startswith("speculation_hold: text_held_ms=- payload_held_ms=- run_held_ms=- inv=")
+
+
+def _event(author: str, *, partial: bool = False, text: str | None = None, **over) -> Event:
+    parts = [genai_types.Part(text=text, thought=over.pop("thought", None))] if text else None
+    content = genai_types.Content(role="model", parts=parts) if parts else None
+    return Event(author=author, partial=partial, content=content, **over)
+
+
+def test_only_a_complete_payload_and_the_executors_prose_are_marks():
+    delta = EventActions(state_delta={"answer_payload": ANSWER})
+    # The payload: complete, by the formatter or the gate, carrying answer_payload.
+    assert speculation._is_payload(_event("formatter", actions=delta))
+    assert speculation._is_payload(_event("format_gate", actions=delta))
+    # A partial never is — the formatter's deltas, the evidence-rows event.
+    assert not speculation._is_payload(_event("formatter", partial=True, actions=delta))
+    assert not speculation._is_payload(
+        _event("format_gate", partial=True, custom_metadata={"evidence_rows": []})
+    )
+    assert not speculation._is_payload(_event("format_gate", text="{}"))  # no state_delta
+    assert not speculation._is_payload(_event("critic_gate", actions=delta))
+    # Executor text, partial or not; never its thoughts, never another author's.
+    assert speculation._is_executor_text(_event(AGENT_NAME, partial=True, text="The"))
+    assert speculation._is_executor_text(_event(AGENT_NAME, text=DRAFT))
+    assert not speculation._is_executor_text(_event(AGENT_NAME, text="hm", thought=True))
+    assert not speculation._is_executor_text(_event("formatter", partial=True, text="{"))
+    assert not speculation._is_executor_text(_event(AGENT_NAME))
 
 
 async def test_the_serial_root_logs_off(caplog):

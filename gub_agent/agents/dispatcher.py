@@ -188,6 +188,30 @@ def log_speculation(
     )
 
 
+def log_speculation_hold(
+    ctx: InvocationContext,
+    *,
+    text_held_ms: int | None = None,
+    payload_held_ms: int | None = None,
+    run_held_ms: int | None = None,
+) -> None:
+    """The `speculation_hold:` line, right after every speculative turn's
+    `speculation:` line (never after `off`): how long before the router's
+    decision the speculative deep run had queued its first executor text
+    chunk, its first answer payload, and ended (`agents/speculation.py`) —
+    `-` for a mark not reached by then, and for all three on
+    `cancelled:aborted`. A line of its own, so `speculation:` keeps its
+    bytes; `tenant` last."""
+    logger.info(
+        "speculation_hold: text_held_ms=%s payload_held_ms=%s run_held_ms=%s inv=%s tenant=%s",
+        "-" if text_held_ms is None else text_held_ms,
+        "-" if payload_held_ms is None else payload_held_ms,
+        "-" if run_held_ms is None else run_held_ms,
+        ctx.invocation_id,
+        label_of(ctx),
+    )
+
+
 def no_data_payload(ctx: InvocationContext, decision: RouterDecision, branch: str) -> Event | None:
     """The one event of a branch that needs no data — abstain, smalltalk,
     clarify — or None for the two that do (fast, deep)."""
