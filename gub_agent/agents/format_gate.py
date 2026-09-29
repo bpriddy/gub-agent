@@ -54,6 +54,7 @@ from google.adk.events import Event, EventActions
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
+from .. import config
 from ..config import FORMAT_GATE_EARLY_ABORT
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
 from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
@@ -63,6 +64,8 @@ from .evidence_index import (
     answer_draft,
     entry_source_ids,
     evidence_index,
+    evidence_rows,
+    log_evidence_rows,
     provenance,
     set_format_feedback,
     set_formatter_brief,
@@ -892,6 +895,20 @@ class FormatGate(BaseAgent):
     """Runs the formatter, validates in code, retries with feedback, and
     guarantees the turn ends with a payload (see module docstring)."""
 
+    def _evidence_rows_event(self, ctx: InvocationContext, index: dict[str, dict]) -> Event:
+        """EVIDENCE_ROWS_EVENT: the index this run's brief was composed from,
+        as one content-less partial event. Partial, so the Runner streams it
+        and never appends it (no session event, no state, no history); authored
+        by the gate, whose partials a bot that predates it skips."""
+        rows = evidence_rows(index)
+        log_evidence_rows(ctx.invocation_id, label_of(ctx), rows)
+        return Event(
+            invocation_id=ctx.invocation_id,
+            author=self.name,
+            partial=True,
+            custom_metadata={"evidence_rows": rows},
+        )
+
     def _payload_event(self, ctx: InvocationContext, payload: AnswerPayload) -> Event:
         """A gate-authored payload event: the JSON as content text (the bot's
         answer channel parses formatter/format_gate text, last one wins) AND a
@@ -935,6 +952,9 @@ class FormatGate(BaseAgent):
             ctx.invocation_id,
             compose_brief(executor_text, index, "", provenance(ctx.invocation_id)),
         )
+        # One per gate run, before any attempt: the index is final here.
+        if config.EVIDENCE_ROWS_EVENT:
+            yield self._evidence_rows_event(ctx, index)
 
         # With nothing citable, `kind="answer"` CANNOT validate — the contract
         # requires a citation (`schemas/answer.py`) — so a rejected attempt is

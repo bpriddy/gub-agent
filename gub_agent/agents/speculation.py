@@ -94,6 +94,18 @@ entries in those stores are cleared before the next branch runs
 (`_Speculation.discard`), which is what the executor's own per-pass reset does
 (`agent.py:_before_agent`).
 
+A fast path that would decline in code (SPECULATIVE_FAST_PRECHECK, off by
+default). Some FAST decisions are declined by the lookup before any call, or
+whatever the call returns: count slots the router itself calls incomplete, a
+ranking with no metric, a blank name (`fast_path.declined_before_lookup`
+lists them). Stopping the speculation for such a lookup throws its lead away
+to start the same deep run again, so with the flag on the root asks first and,
+on a reason, keeps the speculation as on a deep turn: `speculation:
+outcome=kept`, then `dispatcher: fast path declined` (the decline still
+counts) and `fast_path: declined before lookup reason=…`. The fast path does
+not run, so its two progress events are not sent. Never a run that has
+already raised: today's decline replaces that one with a fresh run.
+
 Exceptions. A router that RAISES costs the deep path, not the turn: the
 decision is FALLBACK_DECISION, which is what an unreadable one already costs
 (`dispatcher.py`: "A broken router costs latency only") — and with the deep
@@ -139,6 +151,17 @@ One line per turn, next to `dispatcher: intent` (`dispatcher.log_speculation`):
 run, when it had already finished), `buffered` how many events it held then.
 `kept` + `lead_ms` is the time saved, bounded by the router's duration;
 `cancelled:*` and `restarted:*` are what the speculation cost.
+
+Right after it, on every speculative turn (`dispatcher.log_speculation_hold`):
+
+    speculation_hold: text_held_ms=<n|-> payload_held_ms=<n|-> run_held_ms=<n|->
+      inv=… tenant=…
+
+how long the router's decision came after the run's first executor text
+chunk, its first answer payload (a complete `formatter` / `format_gate` event
+whose state_delta carries `answer_payload`) and its end — what the router
+held back, not what the turn saved. `-` is a mark the run had not reached
+when the decision landed, and all three on `cancelled:aborted`.
 
 `cancelled:aborted` is a turn that ended before any decision — the caller went
 away while the router ran — and the one outcome with no `dispatcher: intent`
@@ -197,10 +220,12 @@ from .. import config
 from ..schemas.router import FALLBACK_DECISION, RouterDecision
 from ..tenant import label_of
 from . import dispatcher as dp
+from . import fast_path as fp
 from .circuit_breaker import reset_tool_budget
 from .evidence_index import reset_evidence_index
+from .formatter import ANSWER_STATE_KEY
 from .round_limiter import reset_rounds
-from .router import ROUTER_STATE_KEY, decision_from
+from .router import ROUTER_STATE_KEY, decision_from, user_text
 from .tool_gate import GATED_INTENT
 
 logger = logging.getLogger(__name__)
@@ -210,6 +235,17 @@ logger = logging.getLogger(__name__)
 # (agent.py:build_root). Read at import — a change needs a redeploy. Read here
 # rather than in config.py so this change stays in one module.
 SPECULATIVE_DEEP: bool = os.environ.get("SPECULATIVE_DEEP", "1").lower() in ("1", "true", "yes")
+
+# Off by default: a FAST decision whose lookup would decline in code
+# (`fast_path.declined_before_lookup`) keeps the speculation instead of
+# stopping it for that lookup (module docstring, "A fast path that would
+# decline in code"). Off is the ROLLBACK, today's stop-then-restart. Read at
+# import, like SPECULATIVE_DEEP.
+SPECULATIVE_FAST_PRECHECK: bool = os.environ.get("SPECULATIVE_FAST_PRECHECK", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Relayed events are stamped at least this far apart (seconds): one
 # microsecond, the resolution a session store's datetime keeps.
@@ -266,6 +302,23 @@ def _stale_reason(decision: RouterDecision) -> str | None:
     if _tool_gate_offers(decision) != _tool_gate_offers(FALLBACK_DECISION):
         return GATED_INTENT
     return None
+
+
+async def _declined_before_lookup(ctx: InvocationContext, shim: fp._ToolShim) -> str | None:
+    """`fast_path.declined_before_lookup` on the inputs the fast path itself
+    would read (`FastPath._run_async_impl`: `decision_from`, `user_text`, the
+    tool shim), so the answer is about the lookup that would run. An exception
+    is no answer: the turn takes today's path, as a lookup that raises costs
+    the deep path and never the turn."""
+    try:
+        return await fp.declined_before_lookup(decision_from(ctx), user_text(ctx), shim)
+    except Exception:  # noqa: BLE001 — a precheck must never cost the turn
+        logger.exception(
+            "fast_path: precheck raised (inv=%s) tenant=%s — lookup as before",
+            ctx.invocation_id,
+            label_of(ctx),
+        )
+        return None
 
 
 def _wrote_decision(ctx: InvocationContext) -> bool:
@@ -369,6 +422,26 @@ def _for_caller(held: Event, timestamp: float) -> Event:
     return held.model_copy(update={"timestamp": timestamp})
 
 
+# The authors of an answer payload: the formatter, and the gate that re-emits
+# (or stands in for) it. A partial never counts — the evidence-rows event and
+# the formatter's deltas are partials.
+_PAYLOAD_AUTHORS = ("formatter", "format_gate")
+
+
+def _is_executor_text(event: Event) -> bool:
+    """A chunk of the executor's prose: what the bot's live bubble shows."""
+    if event.author != config.AGENT_NAME or event.content is None:
+        return False
+    return any(part.text and not part.thought for part in event.content.parts or [])
+
+
+def _is_payload(event: Event) -> bool:
+    """The deep path's answer payload, as the bot's answer channel reads it."""
+    if event.partial or event.author not in _PAYLOAD_AUTHORS or event.actions is None:
+        return False
+    return ANSWER_STATE_KEY in (event.actions.state_delta or {})
+
+
 _END = object()  # queue marker: the speculative run has ended
 
 
@@ -411,6 +484,9 @@ class _Speculation:
         self._cleared = False
         self.started = time.monotonic()
         self.ended: float | None = None
+        # When the run first queued executor text and an answer payload.
+        self.first_text: float | None = None
+        self.first_payload: float | None = None
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._task = asyncio.create_task(
             self._pump(agent), name=f"speculative-deep {ctx.invocation_id}"
@@ -426,6 +502,10 @@ class _Speculation:
                     # trims the delta in place, and the run's next step may
                     # write into what the event shares.
                     held = _as_yielded(event)
+                    if self.first_text is None and _is_executor_text(held):
+                        self.first_text = time.monotonic()
+                    if self.first_payload is None and _is_payload(held):
+                        self.first_payload = time.monotonic()
                     if not event.partial:
                         await self.ctx.session_service.append_event(self.session, event)
                     self.produced += 1
@@ -444,6 +524,21 @@ class _Speculation:
             "buffered": self.produced,
             "finished": self.ended is not None,
             "error": type(self.error).__name__ if self.error is not None else None,
+        }
+
+    def hold_marks(self, decided: float) -> dict[str, int | None]:
+        """The `speculation_hold:` line's fields: how long before `decided`
+        (a monotonic time) the run queued its first executor text, its first
+        answer payload, and ended — None for a mark not reached by then.
+        Apart from `progress()`, whose keys are `log_speculation`'s."""
+
+        def held(mark: float | None) -> int | None:
+            return None if mark is None or mark > decided else round((decided - mark) * 1000)
+
+        return {
+            "text_held_ms": held(self.first_text),
+            "payload_held_ms": held(self.first_payload),
+            "run_held_ms": held(self.ended),
         }
 
     @property
@@ -497,6 +592,15 @@ class _Speculation:
 
 
 # ── the root ─────────────────────────────────────────────────────────────────
+
+
+def _log_outcome(
+    ctx: InvocationContext, result: str, at_decision: dict[str, Any], hold: dict[str, Any]
+) -> None:
+    """The turn's `speculation:` line, and its `speculation_hold:` line right
+    after it (module docstring)."""
+    dp.log_speculation(ctx, result, **at_decision)
+    dp.log_speculation_hold(ctx, **hold)
 
 
 class SpeculativeDispatch(BaseAgent):
@@ -555,6 +659,7 @@ class SpeculativeDispatch(BaseAgent):
         logged = False
         decided: str | None = None  # the branch, once `dispatcher: intent` is out
         at_decision: dict[str, Any] = {}
+        hold: dict[str, Any] = {}  # `-` for all three until there is a decision
         try:
             # ── the router, live ──
             router_error: Exception | None = None
@@ -587,18 +692,19 @@ class SpeculativeDispatch(BaseAgent):
             dp.log_decision(ctx, decision, branch)
             decided = branch
             at_decision = run.progress()
+            hold = run.hold_marks(time.monotonic())
 
             # ── the deep branch: keep, or restart ──
             if branch == dp.DEEP:
                 reason = _stale_reason(decision)
                 if reason is None:
-                    dp.log_speculation(ctx, "kept", **at_decision)
+                    _log_outcome(ctx, "kept", at_decision, hold)
                     logged = True
                     async with aclosing(run.relay()) as events:
                         async for event in events:
                             yield event
                     return
-                dp.log_speculation(ctx, f"restarted:{reason}", **at_decision)
+                _log_outcome(ctx, f"restarted:{reason}", at_decision, hold)
                 logged = True
                 await run.discard(ctx)
                 run = _Speculation(
@@ -612,11 +718,31 @@ class SpeculativeDispatch(BaseAgent):
             # ── every other branch runs with nothing beside it ──
             payload = dp.no_data_payload(ctx, decision, branch)
             if payload is not None:
-                dp.log_speculation(ctx, f"cancelled:{branch}", **at_decision)
+                _log_outcome(ctx, f"cancelled:{branch}", at_decision, hold)
                 logged = True
                 await run.discard(ctx)
                 yield payload
                 return
+
+            # A fast path that would decline in code (module docstring): the
+            # speculation is the deep run a decline gets, so it is kept.
+            if (
+                branch == dp.FAST
+                and SPECULATIVE_FAST_PRECHECK
+                and run.error is None
+                and _stale_reason(decision) is None
+            ):
+                shim = fp._ToolShim(ctx)
+                precheck = await _declined_before_lookup(ctx, shim)
+                if precheck is not None:
+                    _log_outcome(ctx, "kept", at_decision, hold)
+                    logged = True
+                    dp.log_fast_path_declined(ctx)
+                    fp.log_declined_before_lookup(shim, precheck)
+                    async with aclosing(run.relay()) as events:
+                        async for event in events:
+                            yield event
+                    return
 
             # The fast path, as the dispatcher runs it. A run still going is
             # stopped first (module docstring). One that has already finished
@@ -641,7 +767,7 @@ class SpeculativeDispatch(BaseAgent):
                     result = "kept"
                 else:
                     result = "restarted:fast_declined" if declined else f"cancelled:{dp.FAST}"
-                dp.log_speculation(ctx, result, **at_decision)
+                _log_outcome(ctx, result, at_decision, hold)
                 logged = True
             if not declined:
                 return
@@ -660,9 +786,9 @@ class SpeculativeDispatch(BaseAgent):
             if logged:
                 unlogged = None
             elif decided is None:  # before any decision: no `dispatcher: intent` line
-                unlogged = ("cancelled:aborted", run.progress())
+                unlogged = ("cancelled:aborted", run.progress(), {})
             else:  # after it (only a synchronous error gets here): that branch's line
-                unlogged = (f"cancelled:{decided}", at_decision)
+                unlogged = (f"cancelled:{decided}", at_decision, hold)
             await run.close()
             if unlogged is not None:
-                dp.log_speculation(ctx, unlogged[0], **unlogged[1])
+                _log_outcome(ctx, *unlogged)

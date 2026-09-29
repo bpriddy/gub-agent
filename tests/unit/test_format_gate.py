@@ -30,6 +30,7 @@ from google.adk.utils._schema_utils import validate_schema
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
+from gub_agent import config
 from gub_agent.agents import format_gate as format_gate_module
 from gub_agent.agents.evidence_index import (
     evidence_index,
@@ -54,6 +55,14 @@ from gub_agent.schemas import AnswerPayload
 from gub_agent.schemas.answer import HEADLINE_MAX_WORDS, count_words
 
 INV = "inv-1"
+
+
+@pytest.fixture(autouse=True)
+def _no_evidence_rows_event(monkeypatch):
+    """The gate's event lists below are pinned without the evidence-rows event
+    (EVIDENCE_ROWS_EVENT, tests/unit/test_evidence_rows_event.py), whatever the
+    process env says — the deploy env turns it on."""
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", False)
 
 
 def _seed_index(invocation_id: str = INV) -> dict:

@@ -63,7 +63,7 @@ from typing import Any
 import pytest
 from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
-from google.adk.events import Event
+from google.adk.events import Event, EventActions
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
@@ -609,6 +609,31 @@ async def test_a_kept_turn_streams_and_stores_what_the_serial_root_does():
     assert stamps == sorted(stamps) and len(set(stamps)) == len(stamps)
 
 
+async def test_a_kept_turn_relays_the_evidence_rows_before_the_payload(monkeypatch):
+    """EVIDENCE_ROWS_EVENT (latency-04 A4): the gate's rows event is one of the
+    speculation's HELD events, relayed in order — ahead of the formatter's —
+    and, being partial, stored nowhere; the stored session is the serial root's."""
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", True)
+    before = await _one_turn(_build(speculative=False, router=[_decision()]))
+    after = await _one_turn(_build(speculative=True, router=[_decision()], router_until=ran_to_end))
+
+    for turn in (before, after):
+        authors = [(e.author, bool(e.partial)) for e in turn.streamed]
+        rows_at = [
+            i
+            for i, e in enumerate(turn.streamed)
+            if e.custom_metadata and "evidence_rows" in e.custom_metadata
+        ]
+        assert len(rows_at) == 1
+        assert authors[rows_at[0]] == ("format_gate", True)
+        assert rows_at[0] < authors.index(("formatter", True))
+        rows = turn.streamed[rows_at[0]].custom_metadata["evidence_rows"]
+        assert "org_query:a1" in [r["evidence_id"] for r in rows]
+    assert _shape(after.events) == _shape(before.events)
+    assert not any(e.custom_metadata for e in after.events)
+    assert after.state == before.state
+
+
 def _is_prose(event: Event) -> bool:
     parts = event.content.parts if event.content and event.content.parts else []
     return event.author == AGENT_NAME and bool(parts) and parts[0].text is not None
@@ -618,7 +643,8 @@ async def test_the_deep_path_is_asked_the_same_on_every_path_and_never_sees_this
     monkeypatch,
 ):
     """The executor's and the critic's requests: the same whether the run was
-    kept or restarted (here after a declining fast path), and the
+    kept, restarted (here after a declining fast path) or kept because the
+    fast path would have declined in code, and the
     SPECULATIVE_DEEP=0 requests with exactly one content fewer — ADK's
     rendering of this turn's router event. The previous turn's router event
     stays, as every earlier event does."""
@@ -659,8 +685,24 @@ async def test_the_deep_path_is_asked_the_same_on_every_path_and_never_sees_this
         fast,
     )
 
+    # Kept via the precheck (SPECULATIVE_FAST_PRECHECK): the same race, on a
+    # fast decision the lookup declines in code — the run in flight is kept.
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+    precheck = _build(
+        speculative=True,
+        router=[],
+        exec_delay=0.01,
+        exec_delays=[0.01, 0.01, 0.3],
+        router_until=lambda m: m.router.calls < 2 or m.executor.in_flight > 0,
+    )
+    precheck_exec, precheck_critic = await two_turns(
+        precheck, _decision("count_or_rank", 0.95, slots={"entity": "campaigns"})
+    )
+
     assert len(kept_exec) == 2 and len(kept_critic) == 1
     assert kept_exec == restarted_exec and kept_critic == restarted_critic
+    assert precheck.models.executor.cancelled == 0  # kept, not restarted
+    assert kept_exec == precheck_exec and kept_critic == precheck_critic
     assert kept_exec == _minus_this_turns_router(serial_exec)
     assert kept_critic == _minus_this_turns_router(serial_critic)
     # One content apart: the serial request holds both turns' router events,
@@ -933,6 +975,293 @@ async def test_a_fast_path_answer_after_a_finished_speculation_leaves_nothing_of
     assert [e.author for e in after.events] == ["user", "router", "format_gate"]
     assert "critic_verdict" not in after.state  # …and none of it was kept
     assert after.inv not in round_limiter_module._ROUNDS
+
+
+# ── kept: a fast path that would decline in code (SPECULATIVE_FAST_PRECHECK) ──
+
+ACCOUNT_ID = "fdb3f9ff-8094-4851-8ad4-a62f82761ad9"
+# The bot's prefix when it has a best guess (blend 02), which the router copies
+# into `entity_id` and the fast path reads as part of the question.
+GUESS = (
+    f'Best guess: account {ACCOUNT_ID} "Chevy" — the user did not choose this. Ignore the '
+    "guess if the question is not about it. Original question: "
+)
+# q9 (2026-09-28): the router itself says its slots do not cover the sentence.
+Q9 = _decision(
+    "count_or_rank",
+    0.85,
+    entity_surface="Chevy",
+    entity_id=ACCOUNT_ID,
+    slots={"entity": "campaigns", "account": "Chevy", "complete": False},
+)
+Q9_TEXT = GUESS + "Which Chevy campaigns end in the next two months?"
+
+# Production shapes the lookup declined in code (anomaly, 2026-09-18..28), and
+# how many GUB reads it made first.
+DECLINED_IN_CODE = [
+    pytest.param(Q9, Q9_TEXT, "slots_incomplete", 0, id="q9-slots-incomplete"),
+    pytest.param(
+        _decision("account_facts", 0.9, entity_id=ACCOUNT_ID),
+        GUESS + "Give me an overview of the Chevy account",
+        "no_surface",
+        0,
+        id="q4-account-by-id-only",
+    ),
+    pytest.param(
+        _decision(
+            "count_or_rank",
+            0.85,
+            entity_surface="chevy",
+            slots={"entity": "campaigns", "account": "chevy", "limit": 20, "complete": True},
+        ),
+        "give me top 20 companies of chevy",
+        "rank_no_metric",
+        1,
+        id="top-20-without-a-metric",
+    ),
+    pytest.param(
+        _decision(
+            "count_or_rank",
+            0.9,
+            entity_surface="Chevy",
+            entity_id=ACCOUNT_ID,
+            slots={"entity": "campaigns", "status": "live", "account": "Chevy", "complete": True},
+        ),
+        GUESS + "What campaigns are currently active for Chevy?",
+        "shape_other",
+        1,
+        id="which-campaigns",
+    ),
+]
+
+_FAST_TOOLS = (
+    "find",
+    "org_query",
+    "get_campaign",
+    "get_account_overview",
+    "get_staff_profile",
+    "search_staff",
+)
+
+
+def _gub_tools(monkeypatch, **answers) -> list[str]:
+    """The fast path's own GUB reads, recorded. `find` knows one account,
+    "Chevy"; every other read answers `answers[name]`, else a 500 — a decline,
+    so the module's real format gate (and its model) is never reached."""
+    calls: list[str] = []
+
+    def tool(name: str):
+        async def call(*args, **kwargs):
+            calls.append(name)
+            if name == "find":
+                return [{"type": "account", "id": ACCOUNT_ID, "name": "Chevy", "similarity": 1.0}]
+            return answers.get(name, {"error": True, "status": 500, "message": "stub"})
+
+        return call
+
+    for name in _FAST_TOOLS:
+        monkeypatch.setattr(fp, name, tool(name))
+    return calls
+
+
+def _asked(monkeypatch) -> list:
+    """Record every call to the precheck; it still answers."""
+    asked = []
+    real = fp.declined_before_lookup
+
+    async def recording(decision, question, shim):
+        asked.append(decision.intent)
+        return await real(decision, question, shim)
+
+    monkeypatch.setattr(fp, "declined_before_lookup", recording)
+    return asked
+
+
+def _decline_lines(lines: list[str]) -> list[str]:
+    return [
+        line
+        for line in lines
+        if line.startswith(
+            ("speculation:", "dispatcher: fast path declined", "fast_path: declined before")
+        )
+    ]
+
+
+@pytest.mark.parametrize("decision,question,reason,serial_reads", DECLINED_IN_CODE)
+async def test_a_fast_path_that_declines_in_code_keeps_the_speculation(
+    decision, question, reason, serial_reads, monkeypatch, caplog
+):
+    """The lookup would hand the turn back whatever GUB answers, so stopping
+    the speculation for it only starts the same deep run again. With the flag
+    on, the run in flight at the decision is kept, as on a deep turn: nothing
+    cancelled, nothing run twice, no lookup — and the answer, the session and
+    the state are the serial root's. The stream lacks exactly the fast path's
+    two progress pings; the turn still logs as a decline."""
+    calls = _gub_tools(monkeypatch)
+    runs = []
+    for speculative in (False, True):
+        if speculative:
+            monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+            built = _build(
+                speculative=True, router=[decision], exec_delays=[0.4], router_until=mid_call
+            )
+        else:
+            built = _build(speculative=False, router=[decision])
+        monkeypatch.setattr(dp, "fast_path", built.fast)
+        calls.clear()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="gub_agent"):
+            turn = await _one_turn(built, question)
+        runs.append((built, turn, list(calls), _gub_lines(caplog)))
+
+    (_, before, before_calls, _), (built, after, after_calls, lines) = runs
+    assert len(before_calls) == serial_reads  # what the lookup spent to decline
+    # Kept: the call in flight at the decision ran on (today: 1 cancelled, 3 calls).
+    assert built.models.executor.cancelled == 0
+    assert built.models.executor.calls == 2
+    assert after_calls == []  # no lookup…
+    assert not any(e.author == "fast_path" for e in after.streamed)  # …and no pings
+    assert _shape(after.events) == _shape(before.events)
+    assert after.state == before.state
+    assert _payloads(after.streamed)[-1] == _payloads(before.streamed)[-1] == ANSWER
+    pings = [e for e in before.streamed if e.author == "fast_path"]
+    assert [e.partial for e in pings] == [True, True]
+    assert _shape(after.streamed) == _shape([e for e in before.streamed if e not in pings])
+    [outcome, *_] = _decline_lines(lines)
+    assert outcome.startswith("speculation: outcome=kept ") and "finished=0 error=-" in outcome
+    # …with its hold line right after it, as on every speculative turn.
+    assert lines[lines.index(outcome) + 1].startswith("speculation_hold: ")
+    assert _decline_lines(lines) == [
+        outcome,
+        f"dispatcher: fast path declined (inv={after.inv}) — deep path tenant=anomaly",
+        f"fast_path: declined before lookup reason={reason} (inv={after.inv}) tenant=anomaly",
+    ]
+    assert not any(_marked(line) for line in _decline_lines(lines))
+
+
+async def test_with_the_flag_off_a_fast_path_that_declines_in_code_restarts_as_before(
+    monkeypatch, caplog
+):
+    """The rollback: the precheck is never asked, the speculation is stopped
+    for the lookup, and the decline gets a fresh deep run — the stream, pings
+    included, is the serial root's."""
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", False)
+    asked = _asked(monkeypatch)
+    _gub_tools(monkeypatch)
+    before = _build(speculative=False, router=[Q9])
+    monkeypatch.setattr(dp, "fast_path", before.fast)
+    serial = await _one_turn(before, Q9_TEXT)
+    built = _build(speculative=True, router=[Q9], exec_delays=[5.0], router_until=mid_call)
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built, Q9_TEXT)
+
+    assert asked == []
+    assert built.models.executor.cancelled == 1
+    assert built.models.executor.calls == 3
+    assert _shape(after.streamed) == _shape(serial.streamed)
+    assert _shape(after.events) == _shape(serial.events)
+    assert after.state == serial.state
+    assert _lines(caplog, "speculation:")[-1].startswith(
+        "speculation: outcome=restarted:fast_declined "
+    )
+    assert _lines(caplog, "fast_path: declined before lookup") == []
+
+
+async def test_a_speculation_that_already_raised_is_never_kept_by_the_precheck(monkeypatch, caplog):
+    """Today a decline replaces a run that raised with a fresh one, and the
+    turn answers. Keeping it would relay its exception instead."""
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+    asked = _asked(monkeypatch)
+    calls = _gub_tools(monkeypatch)
+    built = _build(
+        speculative=True,
+        router=[Q9],
+        executor=[RuntimeError("executor model failed"), REACT],
+        router_until=ran_to_end,
+    )
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built, Q9_TEXT)  # does not raise
+
+    assert asked == []
+    assert _payloads(after.streamed)[-1] == ANSWER
+    assert built.models.executor.calls == 3  # the one that raised, then a fresh run's two
+    assert calls == []  # the lookup ran and declined in code, as today
+    assert any(e.author == "fast_path" for e in after.streamed)
+    [line] = _lines(caplog, "speculation:")
+    assert line.startswith("speculation: outcome=restarted:fast_declined ")
+    assert "finished=1 error=RuntimeError" in line
+
+
+async def test_a_precheck_that_raises_leaves_the_turn_on_todays_path(monkeypatch, caplog):
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+
+    async def broken(decision, question, shim):
+        raise RuntimeError("precheck bug")
+
+    monkeypatch.setattr(fp, "declined_before_lookup", broken)
+    _gub_tools(monkeypatch)
+    built = _build(speculative=True, router=[Q9], exec_delays=[5.0], router_until=mid_call)
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built, Q9_TEXT)
+
+    assert _payloads(after.streamed)[-1] == ANSWER
+    assert built.models.executor.cancelled == 1 and built.models.executor.calls == 3
+    assert _lines(caplog, "speculation:")[-1].startswith(
+        "speculation: outcome=restarted:fast_declined "
+    )
+    [raised] = [r for r in caplog.records if r.getMessage().startswith("fast_path: precheck")]
+    assert raised.getMessage() == (
+        f"fast_path: precheck raised (inv={after.inv}) tenant=anomaly — lookup as before"
+    )
+    assert raised.exc_info is not None
+
+
+NEEDS_THE_LOOKUP = [
+    # A complete count: the lookup answers it, so the speculation is stopped.
+    pytest.param(
+        _decision(
+            "count_or_rank",
+            0.95,
+            slots={"entity": "campaigns", "status": "live", "complete": True},
+        ),
+        "how many live campaigns do we have?",
+        {"org_query": {"error": True, "status": 404, "message": "not found"}},
+        "cancelled:fast",
+        ["org_query"],
+        id="complete-count-answers",
+    ),
+    # A name only `/org/search` can settle: it does not resolve, so a restart.
+    pytest.param(
+        _decision("campaign_status", 0.95, entity_surface="Silverado"),
+        "how is Silverado doing?",
+        {},
+        "restarted:fast_declined",
+        ["find"],
+        id="unresolved-name-restarts",
+    ),
+]
+
+
+@pytest.mark.parametrize("decision,question,answers,outcome,reads", NEEDS_THE_LOOKUP)
+async def test_with_the_flag_on_a_decline_only_gub_can_decide_takes_todays_path(
+    decision, question, answers, outcome, reads, monkeypatch, caplog
+):
+    monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+    asked = _asked(monkeypatch)
+    calls = _gub_tools(monkeypatch, **answers)
+    built = _build(speculative=True, router=[decision], exec_delays=[5.0], router_until=mid_call)
+    monkeypatch.setattr(dp, "fast_path", built.fast)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        await _one_turn(built, question)
+
+    assert asked == [json.loads(decision)["intent"]]  # asked, and it had no reason
+    assert calls == reads
+    assert built.models.executor.cancelled == 1
+    assert _lines(caplog, "speculation:")[-1].startswith(f"speculation: outcome={outcome} ")
+    assert _lines(caplog, "fast_path: declined before lookup") == []
 
 
 # ── a broken router ──────────────────────────────────────────────────────────
@@ -1310,7 +1639,13 @@ def _kind(line: str) -> str:
 def _root_or_router(line: str) -> bool:
     """Logged by the speculative root itself or by the router, which runs live."""
     return line.startswith(
-        ("dispatcher: ", "speculation: ", "model_call: agent=router ", "turn_window: agent=router ")
+        (
+            "dispatcher: ",
+            "speculation: ",
+            "speculation_hold: ",
+            "model_call: agent=router ",
+            "turn_window: agent=router ",
+        )
     )
 
 
@@ -1387,8 +1722,14 @@ async def test_the_speculations_lines_are_marked_and_the_rule_leaves_the_serial_
         calls = [line for line in lines if line.startswith(f"model_call: agent={AGENT_NAME} ")]
         [cancelled] = [line for line in calls if "status=error:cancelled" in line]
         assert _marked(cancelled)
-    # The rule recovers the serial root's lines, kind for kind.
-    assert sorted(map(_kind, _counted(lines))) == sorted(map(_kind, serial))
+    # The rule recovers the serial root's lines, kind for kind — all but the
+    # speculative root's `speculation_hold:` line, which the serial root never
+    # logs (there is no speculation to hold).
+    [hold] = _lines(caplog, "speculation_hold:")
+    assert f"inv={turn.inv}" in hold and not _marked(hold)
+    assert sorted(map(_kind, _counted([line for line in lines if line != hold]))) == sorted(
+        map(_kind, serial)
+    )
     assert f"inv={turn.inv}" in outcome and not _marked(outcome)
 
 
@@ -1500,8 +1841,127 @@ def test_the_log_lines_keep_their_bytes(caplog):
         "dispatcher: intent=assessment confidence=0.81 branch=deep (inv=e-1) tenant=chevy",
         "speculation: outcome=off lead_ms=- buffered=0 finished=0 error=- inv=e-1 tenant=chevy",
         "speculation: outcome=kept lead_ms=5812 buffered=7 finished=0 error=- inv=e-1 tenant=chevy",
-        "dispatcher: fast path declined (inv=e-1) — deep path",
+        # `tenant=` appended: the decline rate's numerator carries the same
+        # clause as its denominator.
+        "dispatcher: fast path declined (inv=e-1) — deep path tenant=chevy",
     ]
+
+
+def test_the_hold_line_has_bytes_of_its_own(caplog):
+    ctx = SimpleNamespace(invocation_id="e-1", session=SimpleNamespace(state={"tenant": "chevy"}))
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
+        dp.log_speculation_hold(ctx)
+        dp.log_speculation_hold(ctx, text_held_ms=20512, payload_held_ms=0, run_held_ms=None)
+    assert [r.getMessage() for r in caplog.records] == [
+        "speculation_hold: text_held_ms=- payload_held_ms=- run_held_ms=- inv=e-1 tenant=chevy",
+        "speculation_hold: text_held_ms=20512 payload_held_ms=0 run_held_ms=- inv=e-1 tenant=chevy",
+    ]
+
+
+def _held(line: str) -> dict[str, int | None]:
+    """A `speculation_hold:` line's three fields; None for `-`."""
+    fields = dict(word.split("=", 1) for word in line.split()[1:4])
+    return {key: None if value == "-" else int(value) for key, value in fields.items()}
+
+
+def _hold_after_outcome(caplog) -> str:
+    """The turn's one `speculation_hold:` line — asserted to be the very next
+    line after its `speculation:` line."""
+    lines = [r.getMessage() for r in caplog.records if r.name.split(".")[0] == "gub_agent"]
+    [at] = [i for i, line in enumerate(lines) if line.startswith("speculation: ")]
+    [hold] = _lines(caplog, "speculation_hold:")
+    assert lines[at + 1] == hold
+    return hold
+
+
+async def test_a_router_slower_than_the_whole_deep_path_logs_what_it_held(caplog):
+    """The router answers only once the speculative run has ended (a stalled
+    router): its text, its payload and its end were all held, the text the
+    longest, and the line says so."""
+    built = _build(speculative=True, router=[_decision()], router_until=ran_to_end)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built)
+
+    assert _lines(caplog, "speculation:")[0].startswith("speculation: outcome=kept ")
+    hold = _hold_after_outcome(caplog)
+    assert hold.endswith(f" inv={after.inv} tenant=anomaly")
+    held = _held(hold)
+    # The router waited ROUTER_DELAY after the run ended.
+    assert held["run_held_ms"] >= ROUTER_DELAY * 1000 * 0.8
+    assert held["text_held_ms"] >= held["payload_held_ms"] >= held["run_held_ms"] > 0
+
+
+async def test_a_no_data_turn_logs_what_a_finished_run_held(caplog):
+    """Thrown away or not, the hold is what the router cost: a greeting
+    decided after the whole deep path had run still logs all three marks."""
+    built = _build(speculative=True, router=[_decision("smalltalk", 0.97)], router_until=ran_to_end)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        await _one_turn(built)
+
+    assert _lines(caplog, "speculation:")[0].startswith("speculation: outcome=cancelled:smalltalk ")
+    held = _held(_hold_after_outcome(caplog))
+    assert held["text_held_ms"] >= held["payload_held_ms"] >= held["run_held_ms"] > 0
+
+
+async def test_a_router_faster_than_the_first_executor_call_held_nothing(caplog):
+    built = _build(speculative=True, router=[_decision()], router_delay=0, exec_delay=0.3)
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        after = await _one_turn(built)
+
+    assert _payloads(after.streamed)[-1] == ANSWER  # the run went on, kept
+    hold = _hold_after_outcome(caplog)
+    assert hold == (
+        "speculation_hold: text_held_ms=- payload_held_ms=- run_held_ms=- "
+        f"inv={after.inv} tenant=anomaly"
+    )
+
+
+async def test_a_turn_aborted_before_the_decision_holds_nothing(caplog):
+    built = _build(speculative=True, router=[_decision()], router_delay=5.0, exec_delay=0.01)
+    session = await _Session(built.root).open()
+    stream = session.stream("how is chevy doing?")
+    with caplog.at_level(logging.INFO, logger="gub_agent"):
+        read = asyncio.ensure_future(anext(stream))
+        for _ in range(500):  # the speculative run gets as far as its payload
+            if built.models.formatter.calls:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read
+        await stream.aclose()
+
+    assert built.models.formatter.calls == 1
+    assert _lines(caplog, "speculation:")[0].startswith("speculation: outcome=cancelled:aborted ")
+    hold = _hold_after_outcome(caplog)
+    assert hold.startswith("speculation_hold: text_held_ms=- payload_held_ms=- run_held_ms=- inv=")
+
+
+def _event(author: str, *, partial: bool = False, text: str | None = None, **over) -> Event:
+    parts = [genai_types.Part(text=text, thought=over.pop("thought", None))] if text else None
+    content = genai_types.Content(role="model", parts=parts) if parts else None
+    return Event(author=author, partial=partial, content=content, **over)
+
+
+def test_only_a_complete_payload_and_the_executors_prose_are_marks():
+    delta = EventActions(state_delta={"answer_payload": ANSWER})
+    # The payload: complete, by the formatter or the gate, carrying answer_payload.
+    assert speculation._is_payload(_event("formatter", actions=delta))
+    assert speculation._is_payload(_event("format_gate", actions=delta))
+    # A partial never is — the formatter's deltas, the evidence-rows event.
+    assert not speculation._is_payload(_event("formatter", partial=True, actions=delta))
+    assert not speculation._is_payload(
+        _event("format_gate", partial=True, custom_metadata={"evidence_rows": []})
+    )
+    assert not speculation._is_payload(_event("format_gate", text="{}"))  # no state_delta
+    assert not speculation._is_payload(_event("critic_gate", actions=delta))
+    # Executor text, partial or not; never its thoughts, never another author's.
+    assert speculation._is_executor_text(_event(AGENT_NAME, partial=True, text="The"))
+    assert speculation._is_executor_text(_event(AGENT_NAME, text=DRAFT))
+    assert not speculation._is_executor_text(_event(AGENT_NAME, text="hm", thought=True))
+    assert not speculation._is_executor_text(_event("formatter", partial=True, text="{"))
+    assert not speculation._is_executor_text(_event(AGENT_NAME))
 
 
 async def test_the_serial_root_logs_off(caplog):

@@ -335,6 +335,26 @@ EAGER_ADK_IMPORTS: bool = os.environ.get("EAGER_ADK_IMPORTS", "1").lower() in (
     "yes",
 )
 
+# Stream the evidence index to the caller (latency-04 A4). The index the
+# formatter's brief is composed from is final the moment the format gate reads
+# it — 6.9-24.8 s before the answer payload (n=10) — but it lives in this
+# process only: its ids, its compaction and its 400-entry cap exist nowhere on
+# the wire. With this on, the gate yields ONE partial event per run, authored
+# `format_gate`, with no content and `custom_metadata={"evidence_rows": [...]}`
+# — {evidence_id, entity_id, field, value} per entry, in index order — which
+# the bot's claim filter uses to start on the facts the formatter will cite
+# (its B3 part ii). A partial event is streamed but never appended to the
+# session (ADK runners.py), so session events, history, state and billing are
+# unchanged, and a bot that predates it skips it for content (format_gate
+# partials are ignored) — it only counts it: every bot's `gubRawEvents` and the
+# sandbox batch record's `events` go up by one per gate run. Off is the
+# rollback: no event. Read at import; set explicitly in both deploy env files.
+EVIDENCE_ROWS_EVENT: bool = os.environ.get("EVIDENCE_ROWS_EVENT", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 

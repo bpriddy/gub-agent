@@ -44,7 +44,7 @@ import json
 import logging
 import re
 from collections import OrderedDict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +55,7 @@ from google.adk.events import Event
 from ..config import FAST_TIE_BAND
 from ..schemas import AnswerPayload
 from ..schemas.router import RouterDecision
+from ..tenant import label_of
 from ..tools.accounts import get_account_overview, get_campaign
 from ..tools.discovery import find
 from ..tools.org_query import org_query
@@ -127,6 +128,13 @@ class _ToolShim:
     def __init__(self, ctx: InvocationContext) -> None:
         self.state = ctx.session.state
         self.invocation_id = ctx.invocation_id
+
+
+def _where(shim: Any) -> tuple[Any, str]:
+    """`(inv, tenant)` for a reason line. Read defensively: a log call must
+    never fail the turn, and the pure builders are also driven with bare
+    stand-ins."""
+    return getattr(shim, "invocation_id", None), label_of(getattr(shim, "state", None))
 
 
 # ── entity resolution ─────────────────────────────────────────────────────────
@@ -207,6 +215,10 @@ async def _resolve(surface: str | None, wanted: tuple[str, ...], shim: _ToolShim
     else:
         return Resolution("none")
     return resolve_hits(hits, surface.strip(), wanted)
+
+
+#: How `org_query_args` turns an account name into an id: `_resolve`'s shape.
+Resolver = Callable[[str | None, tuple[str, ...], Any], Awaitable[Resolution]]
 
 
 # ── the org_query builder (count_or_rank) ─────────────────────────────────────
@@ -309,7 +321,12 @@ def period_range(text: str) -> list[str] | None:
 
 
 async def org_query_args(
-    decision: RouterDecision, shim: _ToolShim, question: str
+    decision: RouterDecision,
+    shim: _ToolShim,
+    question: str,
+    *,
+    resolve: Resolver | None = None,
+    why: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """`org_query` kwargs assembled from the router's `slots`, or None → deep
     path.
@@ -325,18 +342,38 @@ async def org_query_args(
     3. every remaining value must map to a field the NAMED entity actually
        has, with an entity-specific status vocabulary (a status from another
        entity silently matches nothing).
+
+    `resolve` and `why` exist for `declined_before_lookup`, which asks this
+    same builder whether it would decline no matter what the account name
+    resolves to: `resolve` stands in for `_resolve` (None → `_resolve`, looked
+    up at call time), and `why` collects the reason for a None. The lookup
+    passes neither, so its call is what it always was.
     """
+    resolve = resolve or _resolve
+
+    def declined(reason: str) -> None:
+        if why is not None:
+            why.append(reason)
+        return None
+
     slots = decision.slots
     if not slots.complete:
-        logger.info("fast_path: router says the slots do not cover the question — deep path")
-        return None
+        logger.info(
+            "fast_path: router says the slots do not cover the question — deep path"
+            " (inv=%s) tenant=%s",
+            *_where(shim),
+        )
+        return declined("slots_incomplete")
     if slots.office:
-        logger.info("fast_path: office constraint needs an id lookup — deep path")
-        return None
+        logger.info(
+            "fast_path: office constraint needs an id lookup — deep path (inv=%s) tenant=%s",
+            *_where(shim),
+        )
+        return declined("office")
 
     entity = slots.entity
     if entity is None:
-        return None
+        return declined("no_entity")
 
     args: dict[str, Any] = {"entity": entity}
     filters: dict[str, dict[str, Any]] = {}
@@ -344,29 +381,29 @@ async def org_query_args(
     if slots.status:
         status = slots.status.strip().lower()
         if status not in _STATUS_VALUES[entity]:
-            return None
+            return declined("status_vocab")
         filters["status"] = {"eq": status}
 
     if slots.industry:
         if entity != "accounts":
-            return None
+            return declined("industry_entity")
         filters["industry"] = {"eq": slots.industry.strip()}
 
     if slots.period:
         field_name = _PERIOD_FIELD.get(entity)
         window = period_range(slots.period)
         if field_name is None or window is None:
-            return None
+            return declined("period")
         filters[field_name] = {"between": window}
 
     if slots.account:
         if entity not in ("campaigns", "accounts"):
-            return None
+            return declined("account_entity")
         # Resolve the name to an id and filter on the id — never `similar_to`,
         # which v1 requires to be a call's SOLE filter.
-        resolution = await _resolve(slots.account, ("account",), shim)
+        resolution = await resolve(slots.account, ("account",), shim)
         if resolution.kind != "one" or resolution.entity_id is None:
-            return None
+            return declined("account_unresolved")
         filters["accountId" if entity == "campaigns" else "id"] = {"eq": resolution.entity_id}
 
     if filters:
@@ -375,12 +412,12 @@ async def org_query_args(
     if slots.group_by:
         field_name = _GROUP_FIELDS[entity].get(slots.group_by.strip().lower())
         if field_name is None:
-            return None
+            return declined("group_by")
         args["group_by"] = [field_name]
 
     if slots.limit is not None:
         if not 1 <= slots.limit <= 100:
-            return None
+            return declined("limit")
         args["limit"] = slots.limit
 
     # What SHAPE of answer the sentence asked for. `slots` cannot tell these
@@ -392,10 +429,10 @@ async def org_query_args(
     shape = _asked_shape(question)
     if shape == "rank":
         if not slots.metric:
-            return None
+            return declined("rank_no_metric")
         field_name = _METRIC_FIELDS.get(entity, {}).get(slots.metric.strip().lower())
         if field_name is None:
-            return None
+            return declined("rank_metric")
         # A ranking: the DB sorts, we take the top rows. NULLs must be excluded
         # or they sort first and the "largest budget" is a row with no budget —
         # which is exactly what `fact-15` returned.
@@ -408,7 +445,7 @@ async def org_query_args(
             # A metric with a counting question is an aggregate ("the total
             # budget"), and this builder cannot express sum/avg — the deep path
             # can. Never serve a ranking in its place.
-            return None
+            return declined("count_with_metric")
         # A count: `total` is the real DB count and the aggregate row makes it
         # citable evidence. Never count rows in Python.
         args["aggregate"] = {"count": {"op": "count"}}
@@ -417,7 +454,7 @@ async def org_query_args(
         # unrecognised is a shape this builder has not been shown to get right.
         # All three cost the deep path, per `schemas/router.py`: "an unset flag
         # must cost the deep path, never a confidently wrong count."
-        return None
+        return declined("shape_other")
 
     return args
 
@@ -440,14 +477,16 @@ def _is_error(response: Any) -> bool:
     return isinstance(response, dict) and bool(response.get("error"))
 
 
-def _shortcut(response: dict, decision: RouterDecision) -> Lookup | None:
+def _shortcut(response: dict, decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
     """A 403/404 answered on the spot; any other error → deep path."""
     status = response.get("status")
     if status == 403:
         return Lookup(payload=no_access_payload(decision.language, decision.entity_surface))
     if status == 404:
         return Lookup(payload=not_found_payload(decision.language, decision.entity_surface))
-    logger.info("fast_path: %s from the lookup — deep path", status)
+    logger.info(
+        "fast_path: %s from the lookup — deep path (inv=%s) tenant=%s", status, *_where(shim)
+    )
     return None
 
 
@@ -462,7 +501,7 @@ async def _campaign(decision: RouterDecision, shim: _ToolShim, question: str) ->
         campaign_id = resolution.entity_id
     response = await get_campaign(campaign_id, shim)
     if _is_error(response):
-        return _shortcut(response, decision)
+        return _shortcut(response, decision, shim)
     if not isinstance(response, dict) or not response.get("id"):
         return None
     return Lookup(evidence=[("get_campaign", response)], tool="get_campaign")
@@ -474,7 +513,7 @@ async def _account(decision: RouterDecision, shim: _ToolShim, question: str) -> 
         return None
     response = await get_account_overview(resolution.entity_id, shim)
     if _is_error(response):
-        return _shortcut(response, decision)
+        return _shortcut(response, decision, shim)
     if not isinstance(response, dict) or not response.get("id"):
         return None
     return Lookup(evidence=[("get_account_overview", response)], tool="get_account_overview")
@@ -487,7 +526,7 @@ async def _staff(decision: RouterDecision, shim: _ToolShim, question: str) -> Lo
     if resolution.kind == "one" and resolution.entity_id:
         response = await get_staff_profile(resolution.entity_id, shim)
         if _is_error(response):
-            return _shortcut(response, decision)
+            return _shortcut(response, decision, shim)
         if not isinstance(response, dict) or not response.get("id"):
             return None
         return Lookup(evidence=[("get_staff_profile", response)], tool="get_staff_profile")
@@ -499,7 +538,7 @@ async def _staff(decision: RouterDecision, shim: _ToolShim, question: str) -> Lo
         return None
     response = await search_staff(decision.entity_surface, tool_context=shim)
     if _is_error(response):
-        return _shortcut(response, decision)
+        return _shortcut(response, decision, shim)
     rows = response.get("staff") if isinstance(response, dict) else None
     if not rows:
         return None
@@ -512,7 +551,7 @@ async def _count_or_rank(decision: RouterDecision, shim: _ToolShim, question: st
         return None
     response = await org_query(**args, tool_context=shim)
     if _is_error(response):
-        return _shortcut(response, decision)
+        return _shortcut(response, decision, shim)
     if not isinstance(response, dict) or not response.get("results"):
         return None
     return Lookup(evidence=[("org_query", response)], tool="org_query")
@@ -539,6 +578,69 @@ _FAST_TOOLS = {
     "staff_lookup": "search_staff",
     "count_or_rank": "org_query",
 }
+
+
+# ── a decline decided in code, before any lookup ──────────────────────────────
+
+
+async def _resolved_offline(surface: str | None, wanted: tuple[str, ...], shim: Any) -> Resolution:
+    """The account name resolves to exactly one id, with no call: the most
+    accepting answer GUB could give, so a builder that still declines would
+    decline on any answer."""
+    return Resolution("one", "precheck", surface)
+
+
+async def declined_before_lookup(
+    decision: RouterDecision, question: str, shim: _ToolShim
+) -> str | None:
+    """Why the lookup for `decision` would decline whatever GUB answers — a
+    reason slug — or None when only a call can tell, or it would answer.
+
+    For the speculative root (SPECULATIVE_FAST_PRECHECK): a fast decision the
+    lookup is certain to decline can keep the deep run already started beside
+    the router, instead of stopping it for a lookup that hands the turn back.
+    So a slug is returned only where it cannot be wrong, each rule one the
+    lookup itself applies before any response, or regardless of it:
+
+    - account_facts: `_account` resolves the surface and nothing else (its
+      `entity_id` is ignored), and `_resolve` answers "none" for a blank
+      surface without a call;
+    - staff_lookup: a FALSY surface only — a whitespace-only one still reaches
+      `search_staff`, whose answer nobody can predict;
+    - campaign_*: no `entity_id` and a blank surface (an id is fetched as is);
+    - count_or_rank: `org_query_args` itself, with the account name resolved
+      offline (`_resolved_offline`). Its other checks read the decision and
+      the question alone, and a name that does not resolve declines as well,
+      so a None here is a None whatever `/org/search` returns.
+
+    Keyed on the lookup `_LOOKUPS` holds, not on the intent's name: it speaks
+    only for the functions it restates. Pure — no call, no state write; the
+    one side effect is the builder's own reason line for incomplete slots or
+    an office, which the lookup would log the same way."""
+    lookup = _LOOKUPS.get(decision.intent)
+    surface = decision.entity_surface
+    blank = not surface or not surface.strip()
+    if lookup is _account:
+        return "no_surface" if blank else None
+    if lookup is _staff:
+        return "no_surface" if not surface else None
+    if lookup is _campaign:
+        return "no_surface" if blank and not decision.entity_id else None
+    if lookup is _count_or_rank:
+        why: list[str] = []
+        args = await org_query_args(decision, shim, question, resolve=_resolved_offline, why=why)
+        if args is not None:
+            return None
+        return why[-1] if why else "query_args"
+    return None
+
+
+def log_declined_before_lookup(shim: _ToolShim, reason: str) -> None:
+    """The line for a fast decision `declined_before_lookup` settled; it
+    follows the turn's `dispatcher: fast path declined` line."""
+    logger.info(
+        "fast_path: declined before lookup reason=%s (inv=%s) tenant=%s", reason, *_where(shim)
+    )
 
 
 # ── the draft the format gate renders ─────────────────────────────────────────
