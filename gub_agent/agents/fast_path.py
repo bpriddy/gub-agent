@@ -480,6 +480,13 @@ def _is_error(response: Any) -> bool:
 def _shortcut(response: dict, decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
     """A 403/404 answered on the spot; any other error → deep path."""
     status = response.get("status")
+    if status in (403, 404):
+        logger.info(
+            "fast_path: shortcut status=%s intent=%s inv=%s tenant=%s",
+            status,
+            decision.intent,
+            *_where(shim),
+        )
     if status == 403:
         return Lookup(payload=no_access_payload(decision.language, decision.entity_surface))
     if status == 404:
@@ -748,7 +755,11 @@ class FastPath(BaseAgent):
         except Exception:
             # Never fail the turn on the fast path — the deep path is always a
             # correct (if slower) answer to the same question.
-            logger.exception("fast_path: lookup raised (inv=%s) — deep path", ctx.invocation_id)
+            logger.exception(
+                "fast_path: lookup raised (inv=%s) — deep path tenant=%s",
+                ctx.invocation_id,
+                label_of(ctx),
+            )
             raised = True
         # Closed even when the lookup raised or declined. The pair is not
         # decoration: the bot counts calls per tool to number repeats, and a
@@ -770,7 +781,11 @@ class FastPath(BaseAgent):
         if not index:
             # Nothing citable came back — a payload would have to be
             # uncited, which is exactly what the contract forbids.
-            logger.info("fast_path: no citable evidence (inv=%s) — deep path", ctx.invocation_id)
+            logger.info(
+                "fast_path: no citable evidence (inv=%s) — deep path tenant=%s",
+                ctx.invocation_id,
+                label_of(ctx),
+            )
             return
 
         set_answer_draft(ctx.invocation_id, compose_draft(question, decision, lookup))

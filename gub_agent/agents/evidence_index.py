@@ -41,6 +41,8 @@ import re
 from collections import OrderedDict
 from typing import Any
 
+from ..schemas.answer import AnswerPayload, BulletBlock, TableBlock, TextBlock, count_words
+
 logger = logging.getLogger(__name__)
 
 # The per-bullet Drive provenance the status-synthesis prompt writes after
@@ -80,6 +82,9 @@ _PROVENANCE: OrderedDict[str, dict[str, list[str]]] = OrderedDict()
 _FEEDBACK: OrderedDict[str, str] = OrderedDict()
 _BRIEF: OrderedDict[str, str] = OrderedDict()
 _DRAFT: OrderedDict[str, str] = OrderedDict()
+# Entries the cap refused, per invocation and tool: what `log_cap` reports. Reset
+# with the index, so it describes the same executor pass the index does.
+_DROPPED: OrderedDict[str, dict[str, int]] = OrderedDict()
 _MAX_TRACKED = 256
 
 
@@ -104,6 +109,7 @@ def reset_evidence_index(callback_context: Any) -> None:
     _FEEDBACK.pop(invocation_id, None)
     _BRIEF.pop(invocation_id, None)
     _DRAFT.pop(invocation_id, None)
+    _DROPPED.pop(invocation_id, None)
     return None
 
 
@@ -140,6 +146,121 @@ def log_evidence_rows(invocation_id: str, tenant: str, rows: list[dict[str, Any]
         "evidence_rows: n=%d bytes=%d inv=%s tenant=%s",
         len(rows),
         len(json.dumps(rows, ensure_ascii=False).encode("utf-8")),
+        invocation_id,
+        tenant,
+    )
+
+
+def dropped_by_tool(invocation_id: str) -> dict[str, int]:
+    """Entries the cap refused this invocation, per tool (empty = none)."""
+    return dict(_DROPPED.get(invocation_id, {}))
+
+
+def log_cap(invocation_id: str, tenant: str, index: dict[str, dict[str, Any]]) -> None:
+    """The cap's one line per gate run: how many entries the index kept and how
+    many MAX_ENTRIES refused, by tool. `dropped_by_tool` is a sorted
+    `tool:count,…` string, `-` when nothing was refused.
+
+    Like `log_evidence_rows`, logged from THIS module: an engine line carries
+    its file name, and `textPayload:"format_gate"` is how the gate's drop and
+    repair rates are read."""
+    dropped = dropped_by_tool(invocation_id)
+    logger.info(
+        "evidence_index: cap kept=%d dropped=%d dropped_by_tool=%s inv=%s tenant=%s",
+        len(index),
+        sum(dropped.values()),
+        ",".join(f"{tool}:{count}" for tool, count in sorted(dropped.items())) or "-",
+        invocation_id,
+        tenant,
+    )
+
+
+# A run of capitalised words — the proper nouns (campaign, model and account
+# names) a rundown is made of. Latin and Cyrillic; digits and hyphens ride
+# along inside a word ("Red Tag", "Q1", "V8").
+# A run starts at a word boundary ("iPhone" is not "Phone") and a run shorter
+# than two characters ("A", "I") is not a name.
+_CAP_RUN_RE = re.compile(
+    r"(?<![\w'’-])[A-ZА-ЯЁ][\w'’-]*(?:[ \t]+[A-ZА-ЯЁ][\w'’-]*)*",
+)
+_MIN_RUN_CHARS = 2
+# What is not prose in an executor answer: source markers and links (a Drive
+# id can open with a capital).
+_NOT_PROSE_RE = re.compile(r"\[src:[^\]]*\]|https?://\S+")
+
+
+def capitalised_runs(text: str) -> list[str]:
+    """The distinct capitalised runs of `text`, in order of first appearance."""
+    seen: dict[str, None] = {}
+    for run in _CAP_RUN_RE.findall(_NOT_PROSE_RE.sub(" ", text)):
+        if len(run) >= _MIN_RUN_CHARS:
+            seen.setdefault(run, None)
+    return list(seen)
+
+
+def _payload_text(payload: AnswerPayload) -> str:
+    """The payload's text blocks, bullets and table cells (not the headline or
+    the column names)."""
+    parts: list[str] = []
+    for block in payload.blocks:
+        if isinstance(block, TextBlock):
+            parts.append(block.text)
+        elif isinstance(block, BulletBlock):
+            parts.extend(block.items)
+        elif isinstance(block, TableBlock):
+            for row in block.rows:
+                parts.extend(row)
+    return "\n".join(parts)
+
+
+def retention(executor_text: str, payload: AnswerPayload) -> str:
+    """The share of the executor's distinct capitalised runs that appear in the
+    payload (2 decimals), or `-` when there is no executor text or no run. A
+    run counts as kept when it occurs in the payload text as a whole word run,
+    case-insensitively ("Red" is not found inside "Reduced")."""
+    runs = capitalised_runs(executor_text or "")
+    if not runs:
+        return "-"
+    haystack = _payload_text(payload).casefold()
+    kept = sum(
+        1 for run in runs if re.search(rf"(?<!\w){re.escape(run.casefold())}(?!\w)", haystack)
+    )
+    return f"{kept / len(runs):.2f}"
+
+
+def log_answer_shape(
+    invocation_id: str, tenant: str, payload: AnswerPayload, executor_text: str
+) -> None:
+    """The shape of the payload the gate shipped (accepted from the formatter,
+    or the template render), next to how much of the executor's answer it kept.
+
+    `words` is the contract's own word count (headline, text, bullets,
+    assumptions, follow-ups; tables are data). Logged from THIS module for the
+    reason `log_cap` is."""
+    words = count_words(payload.headline)
+    text_blocks = bullets = table_rows = 0
+    for block in payload.blocks:
+        if isinstance(block, TextBlock):
+            text_blocks += 1
+            words += count_words(block.text)
+        elif isinstance(block, BulletBlock):
+            bullets += len(block.items)
+            words += sum(count_words(item) for item in block.items)
+        elif isinstance(block, TableBlock):
+            table_rows += len(block.rows)
+    words += sum(count_words(a) for a in payload.assumptions)
+    words += sum(count_words(f) for f in payload.follow_ups)
+    logger.info(
+        "answer_shape: kind=%s words=%d text_blocks=%d bullets=%d table_rows=%d cites=%d "
+        "exec_chars=%d retention=%s inv=%s tenant=%s",
+        payload.kind,
+        words,
+        text_blocks,
+        bullets,
+        table_rows,
+        len(payload.citations),
+        len(executor_text or ""),
+        retention(executor_text, payload),
         invocation_id,
         tenant,
     )
@@ -221,7 +342,7 @@ def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any
     # Provenance BEFORE the index, over every row: it must not depend on
     # whether the row survives MAX_ENTRIES.
     _record_provenance(tool_response, prov)
-    _index_response(tool_name, tool_response, index)
+    _index_response(tool_name, tool_response, index, _bucket(_DROPPED, invocation_id, {}))
     return None
 
 
@@ -320,8 +441,29 @@ def _record_provenance(response: dict[str, Any], prov: dict[str, list[str]]) -> 
                 note(item)
 
 
-def _index_row(tool_name: str, row: dict[str, Any], fallback_id: str, index: dict) -> None:
+def _note_drop(dropped: dict[str, int] | None, tool_name: str, count: int = 1) -> None:
+    """Count refused entries. Callers pass only keys not already in the index (a
+    repeat of an admitted key is not a loss); a key refused twice is counted
+    twice, so `dropped` is refused entries, not distinct keys."""
+    if dropped is not None and count > 0:
+        dropped[tool_name] = dropped.get(tool_name, 0) + count
+
+
+def _index_row(
+    tool_name: str,
+    row: dict[str, Any],
+    fallback_id: str,
+    index: dict,
+    dropped: dict[str, int] | None = None,
+) -> None:
     if len(index) >= MAX_ENTRIES:
+        # The whole row is refused: its entity entry plus one per field it
+        # would have contributed. Counted only, so the cap log line can say
+        # which tool lost how much; admission is unchanged.
+        row_id = row.get("id") if isinstance(row.get("id"), str) else fallback_id
+        keys = [f"{tool_name}:{row_id}"]
+        keys.extend(f"{tool_name}:{row_id}:{key}" for key, _ in _field_items(row))
+        _note_drop(dropped, tool_name, sum(1 for key in keys if key not in index))
         return
     row_id = row.get("id") if isinstance(row.get("id"), str) else fallback_id
     entity_id = row.get("id") if isinstance(row.get("id"), str) else None
@@ -339,11 +481,15 @@ def _index_row(tool_name: str, row: dict[str, Any], fallback_id: str, index: dic
         "value": _compact_row(row),
         "source_file_ids": row_sources,
     }
-    for key, value in row.items():
+    fields = list(_field_items(row))
+    for position, (key, value) in enumerate(fields):
         if len(index) >= MAX_ENTRIES:
+            _note_drop(
+                dropped,
+                tool_name,
+                sum(1 for k, _ in fields[position:] if f"{tool_name}:{row_id}:{k}" not in index),
+            )
             return
-        if key == "id" or key.startswith("_") or not _is_scalar(value):
-            continue
         index[f"{tool_name}:{row_id}:{key}"] = {
             "tool": tool_name,
             "entity_id": entity_id,
@@ -357,7 +503,20 @@ def _index_row(tool_name: str, row: dict[str, Any], fallback_id: str, index: dic
         }
 
 
-def _index_response(tool_name: str, response: dict[str, Any], index: dict) -> None:
+def _field_items(row: dict[str, Any]):
+    """The (key, value) pairs of a row that become field entries."""
+    for key, value in row.items():
+        if key == "id" or key.startswith("_") or not _is_scalar(value):
+            continue
+        yield key, value
+
+
+def _index_response(
+    tool_name: str,
+    response: dict[str, Any],
+    index: dict,
+    dropped: dict[str, int] | None = None,
+) -> None:
     """Break one tool response into rows.
 
     Shapes in the fleet: `org_query` → {results: [...], total, truncated}
@@ -372,7 +531,7 @@ def _index_response(tool_name: str, response: dict[str, Any], index: dict) -> No
         return  # an error body is not evidence
 
     if isinstance(response.get("id"), str):
-        _index_row(tool_name, response, "self", index)
+        _index_row(tool_name, response, "self", index, dropped)
 
     row_counter = 0
     for key, value in response.items():
@@ -381,14 +540,16 @@ def _index_response(tool_name: str, response: dict[str, Any], index: dict) -> No
         if isinstance(value, list):
             for item in value:
                 if isinstance(item, dict):
-                    _index_row(tool_name, item, f"{key}{row_counter}", index)
+                    _index_row(tool_name, item, f"{key}{row_counter}", index, dropped)
                     row_counter += 1
         elif (
             _is_scalar(value)
             and not key.startswith("_")
             and not isinstance(response.get("id"), str)  # already indexed as row fields
         ):
-            if len(index) < MAX_ENTRIES:
+            if len(index) >= MAX_ENTRIES:
+                _note_drop(dropped, tool_name, 0 if f"{tool_name}:{key}" in index else 1)
+            else:
                 index[f"{tool_name}:{key}"] = {
                     "tool": tool_name,
                     "entity_id": None,

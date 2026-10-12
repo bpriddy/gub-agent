@@ -65,6 +65,8 @@ from .evidence_index import (
     entry_source_ids,
     evidence_index,
     evidence_rows,
+    log_answer_shape,
+    log_cap,
     log_evidence_rows,
     provenance,
     set_format_feedback,
@@ -953,6 +955,7 @@ class FormatGate(BaseAgent):
             compose_brief(executor_text, index, "", provenance(ctx.invocation_id)),
         )
         # One per gate run, before any attempt: the index is final here.
+        log_cap(ctx.invocation_id, label_of(ctx), index)
         if config.EVIDENCE_ROWS_EVENT:
             yield self._evidence_rows_event(ctx, index)
 
@@ -1035,16 +1038,22 @@ class FormatGate(BaseAgent):
                         if not problems:
                             if repaired:
                                 logger.info(
-                                    "format_gate: repaired citation(s) (inv=%s) — %s",
+                                    "format_gate: repaired citation(s) (inv=%s) — %s tenant=%s",
                                     ctx.invocation_id,
                                     "; ".join(repaired),
+                                    label_of(ctx),
                                 )
                             if pruned_sources:
                                 logger.info(
-                                    "format_gate: dropped %d unknown source_file_id(s) (inv=%s)",
+                                    "format_gate: dropped %d unknown source_file_id(s)"
+                                    " (inv=%s) tenant=%s",
                                     pruned_sources,
                                     ctx.invocation_id,
+                                    label_of(ctx),
                                 )
+                            log_answer_shape(
+                                ctx.invocation_id, label_of(ctx), payload, executor_text
+                            )
                             # The formatter's own event carries the ORIGINAL
                             # json, so any payload this gate corrected has to
                             # be emitted again — the bot's answer channel takes
@@ -1092,9 +1101,9 @@ class FormatGate(BaseAgent):
             ctx.invocation_id,
             label_of(ctx),
         )
-        yield self._payload_event(
-            ctx, template_payload(executor_text, index, provenance(ctx.invocation_id))
-        )
+        template = template_payload(executor_text, index, provenance(ctx.invocation_id))
+        log_answer_shape(ctx.invocation_id, label_of(ctx), template, executor_text)
+        yield self._payload_event(ctx, template)
 
 
 format_gate = FormatGate(name="format_gate", sub_agents=[formatter_agent])
