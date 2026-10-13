@@ -23,7 +23,14 @@ grounds against the pass's uncapped grounding store (`evidence_index._GROUNDING`
 instead — but only when the executor's own answer holds it too: a number or name
 must appear in the executor answer AND in a tool result. So the store widens what
 the executor may say, never what the formatter may add on its own, and nothing
-the index grounded before is rejected now.
+the index grounded before is rejected now. A name grounds in the store as a
+PHRASE (its words in order, next to each other), not word by word: `York City`
+is in no tool result that holds `New York` and `Mexico City`.
+
+What only the store grounds has no row of its own to cite, so a bullet that
+writes it must end with a row of the record the store holds it under (or of a
+record that has it nested inside): a bullet citing a neighbour's row is rejected,
+because the source files shown under the answer would be the neighbour's.
 
 A citation that is merely mistyped — the tool prefix dropped, or two ids
 spliced — is REPAIRED against the turn's own evidence before check 1 judges
@@ -51,12 +58,13 @@ it does not have is a bug, not a style choice.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing, nullcontext
-from functools import cached_property
+from functools import cached_property, lru_cache
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
@@ -76,11 +84,13 @@ from .evidence_index import (
     entry_source_ids,
     evidence_index,
     evidence_rows,
+    grounding_segments,
     grounding_text,
     log_answer_shape,
     log_cap,
     log_evidence_rows,
     provenance,
+    segment_key,
     set_format_feedback,
     set_formatter_brief,
 )
@@ -220,6 +230,12 @@ def _is_grounded(run: str, blob: str) -> bool:
 
 
 _WORD_RE = re.compile(r"\w+")
+# What ends a name in a text: a line break, a sentence or clause mark, a bracket or
+# a quote. Two names that merely sit side by side in a text are not one name.
+# Every other non-word character (a space, `|`, `-`, `&`, `'`) only separates
+# words, so "F-150", "AT&T" and "Chevrolet | EV Bridge 2025" read as the names
+# they are.
+_PHRASE_BREAK_RE = re.compile(r"[\n\r.,;:!?()\[\]{}\"\u201c\u201d\u00ab\u00bb<>]+")
 
 
 def _norm_number(number: str) -> str:
@@ -233,19 +249,68 @@ def _norm_number(number: str) -> str:
     return (head.lstrip("0") or "0") + dot + tail
 
 
-def _words_in(run: str, words: frozenset[str]) -> bool:
-    """Whether every word of a candidate name is a WHOLE word of `words` (lower-
-    cased `\\w+` tokens), allowing the possessive and plural spellings
-    `_ground_forms` allows. Whole words, not substrings: against a store this
-    size "ford" would otherwise ground in "affordable"."""
-    run_words = run.split()
-    return bool(run_words) and all(
-        any(
-            parts and all(part in words for part in parts)
-            for parts in (_WORD_RE.findall(form) for form in _ground_forms(word))
-        )
-        for word in run_words
+def _phrase_text(text: str) -> str:
+    """`text` lower-cased and cut into phrases at the hard breaks: the whole words
+    of each stretch, one space apart, one phrase per line."""
+    parts = _PHRASE_BREAK_RE.split(text.lower())
+    return "\n".join(p for p in (" ".join(_WORD_RE.findall(part)) for part in parts) if p)
+
+
+@lru_cache(maxsize=1024)
+def _run_spellings(run: str) -> tuple[tuple[tuple[str, ...], ...], ...]:
+    """For each word of a candidate name, the spellings that count as it
+    (`_ground_forms`: possessive and plural), each as its whole words."""
+    out = []
+    for word in run.split():
+        spellings = {tuple(_WORD_RE.findall(form)) for form in _ground_forms(word)}
+        out.append(tuple(sorted((sp for sp in spellings if sp), key=len, reverse=True)))
+    return tuple(out)
+
+
+@lru_cache(maxsize=1024)
+def _run_pattern(run: str) -> re.Pattern[str] | None:
+    """A pattern for a candidate name inside a `_phrase_text`: its words in
+    order and next to each other, each as a whole word."""
+    spellings = _run_spellings(run)
+    if not spellings or not all(spellings):
+        return None
+    words = (
+        "(?:" + "|".join(re.escape(" ".join(sp)) for sp in word_spellings) + ")"
+        for word_spellings in spellings
     )
+    return re.compile(r"(?<!\w)" + " ".join(words) + r"(?!\w)")
+
+
+def _phrase_in(run: str, phrases: str, words: frozenset[str]) -> bool:
+    """Whether a candidate name appears in `phrases` as a PHRASE: its words in
+    order, next to each other, whole words (possessive and plural spellings
+    allowed). Not word by word: against a store this size every word of "York
+    City" turns up somewhere (`New York`, `Mexico City`), and `ford` is in
+    `affordable`. `words` is the words of `phrases`, a cheap refusal first."""
+    pattern = _run_pattern(run)
+    if pattern is None:
+        return False
+    if not all(any(set(sp) <= words for sp in word) for word in _run_spellings(run)):
+        return False
+    return pattern.search(phrases) is not None
+
+
+class _Text:
+    """One text prepared for matching: its phrases, words and numbers."""
+
+    __slots__ = ("memo", "numbers", "phrases", "words")
+
+    def __init__(self, text: str) -> None:
+        self.phrases = _phrase_text(text)
+        self.words = frozenset(_WORD_RE.findall(self.phrases))
+        self.numbers = frozenset(_norm_number(n) for n in _numbers_of(text))
+        self.memo: dict[str, bool] = {}
+
+    def has_phrase(self, run: str) -> bool:
+        found = self.memo.get(run)
+        if found is None:
+            found = self.memo[run] = _phrase_in(run, self.phrases, self.words)
+        return found
 
 
 class Grounding:
@@ -253,40 +318,93 @@ class Grounding:
     grounding store (`evidence_index.grounding_text`) and the executor's answer.
 
     A number or name the capped index does not hold grounds only when BOTH hold
-    it — it appears in the executor answer and in a tool result. Whole numbers
-    and whole words, case-insensitive. An empty `Grounding()` grounds nothing, so
-    `gate_problems` without one is the capped-index gate it always was."""
+    it — it appears in the executor answer and in a tool result. Numbers match by
+    value; a name matches as a PHRASE (its words in order and next to each other,
+    whole words, case-insensitive). An empty `Grounding()` grounds nothing, so
+    `gate_problems` without one is the capped-index gate it always was.
 
-    def __init__(self, store: str = "", executor_text: str = "") -> None:
-        self._store = store.lower()
-        self._answer = _strip_markers(executor_text).lower()
+    `segments` (`evidence_index.grounding_segments`) is the store split by record;
+    given, a bullet must also cite a record that holds what it names
+    (`in_record`, `number_in_record`). Without it that check is off."""
+
+    def __init__(
+        self,
+        store: str = "",
+        executor_text: str = "",
+        segments: Mapping[str, str] | None = None,
+    ) -> None:
+        self._store_raw = store
+        self._answer_raw = _strip_markers(executor_text)
+        self._segments = segments
+        self._records: dict[str, _Text] = {}
+        self._resembling: dict[str, bool] = {}
 
     @cached_property
-    def _store_words(self) -> frozenset[str]:
-        return frozenset(_WORD_RE.findall(self._store))
+    def _store(self) -> _Text:
+        return _Text(self._store_raw)
 
     @cached_property
-    def _answer_words(self) -> frozenset[str]:
-        return frozenset(_WORD_RE.findall(self._answer))
+    def _answer(self) -> _Text:
+        return _Text(self._answer_raw)
 
     @cached_property
-    def _store_numbers(self) -> frozenset[str]:
-        return frozenset(_norm_number(n) for n in _numbers_of(self._store))
+    def _store_by_initial(self) -> dict[str, list[str]]:
+        by_initial: dict[str, list[str]] = {}
+        for word in self._store.words:
+            by_initial.setdefault(word[0], []).append(word)
+        return by_initial
 
-    @cached_property
-    def _answer_numbers(self) -> frozenset[str]:
-        return frozenset(_norm_number(n) for n in _numbers_of(self._answer))
+    @property
+    def binds(self) -> bool:
+        """Whether a bullet's names are checked against the record it cites."""
+        return self._segments is not None
 
     def number(self, number: str) -> bool:
         """The number (as `_numbers_of` spells it) is in the store AND the answer."""
         norm = _norm_number(number)
-        return norm in self._store_numbers and norm in self._answer_numbers
+        return norm in self._store.numbers and norm in self._answer.numbers
 
     def in_store(self, run: str) -> bool:
-        return _words_in(run, self._store_words)
+        return self._store.has_phrase(run)
 
     def in_answer(self, run: str) -> bool:
-        return _words_in(run, self._answer_words)
+        return self._answer.has_phrase(run)
+
+    def _record(self, key: str) -> _Text:
+        record = self._records.get(key)
+        if record is None:
+            record = self._records[key] = _Text((self._segments or {}).get(key, ""))
+        return record
+
+    def in_record(self, key: str, run: str) -> bool:
+        """The name is a phrase of the strings filed under this record."""
+        return self._record(key).has_phrase(run)
+
+    def number_in_record(self, key: str, number: str) -> bool:
+        return _norm_number(number) in self._record(key).numbers
+
+    def resembles(self, run: str) -> bool:
+        """Whether a word of the run is a near-spelling of a word a tool result
+        holds ("Gren" for "Green"), as opposed to a name nothing there resembles.
+        A word the store holds exactly is not a misspelling of anything."""
+        found = self._resembling.get(run)
+        if found is None:
+            found = self._resembling[run] = self._resembles(run)
+        return found
+
+    def _resembles(self, run: str) -> bool:
+        for word in run.lower().split():
+            for part in _WORD_RE.findall(re.sub(r"['’]s$", "", word)):
+                if len(part) < 4 or part in self._store.words:
+                    continue
+                pool = [
+                    w
+                    for w in self._store_by_initial.get(part[0], ())
+                    if abs(len(w) - len(part)) <= 2
+                ]
+                if difflib.get_close_matches(part, pool, n=1, cutoff=0.85):
+                    return True
+        return False
 
 
 _HEX8_RE = re.compile(r"[0-9a-f]{8}", re.I)
@@ -457,7 +575,7 @@ def gate_problems(
             unwritten.add(run)
     parts: list[str] = []
     if in_no_result:
-        parts.append(_ungrounded_entity_problem(sorted(in_no_result), index))
+        parts.append(_ungrounded_entity_problem(sorted(in_no_result), index, grounding))
     if unwritten:
         # The label stays "ungrounded entity": it is the taxonomy the engine
         # logs are read by.
@@ -468,10 +586,97 @@ def gate_problems(
         )
     if parts:
         problems.append("; ".join(parts))
+
+    if grounding.binds:
+        problems.extend(_unbound_problems(payload, index, blob, blob_numbers, grounding))
     return problems
 
 
-def _ungrounded_entity_problem(runs: list[str], index: dict[str, dict]) -> str:
+def _cited_records(item: str, index: dict[str, dict]) -> set[str]:
+    """The grounding segments of the rows a bullet ends with: each `[id]` marker
+    that names a row of this turn's index (a near-miss id is read as
+    `repair_citations` would), as the record the row belongs to."""
+    records: set[str] = set()
+    for marker in _CITE_MARKER_RE.findall(item):
+        for ident in re.split(r"[\s,;]+", marker[1:-1]):
+            if not ident:
+                continue
+            key = (
+                ident
+                if ident in index
+                else (_repair_one(ident, index) if len(ident) >= 8 else None)
+            )
+            if key is not None:
+                entry = index[key]
+                records.add(segment_key(entry.get("tool"), entry.get("entity_id")))
+    return records
+
+
+def _unbound_problems(
+    payload: AnswerPayload,
+    index: dict[str, dict],
+    blob: str,
+    blob_numbers: str,
+    grounding: Grounding,
+) -> list[str]:
+    """A bullet cites a row of the record it is about.
+
+    What the capped index holds is cited by its own id. What only the store
+    holds (a name or number the executor wrote and the index could not admit)
+    has no row of its own to cite, so a bullet could cite a NEIGHBOUR's row,
+    and the source files carried under the answer would then be the
+    neighbour's. So a name or number a bullet writes that only the store
+    grounds must be held by the record behind a row the bullet cites (or by a
+    record nested inside it); otherwise the bullet is rejected, with the labels
+    the gate's logs are read by. A bullet naming something of a record it cannot
+    cite has to drop it. Text blocks, the headline and table cells cite no
+    bullet-level row and are not bound by this."""
+    names: set[str] = set()
+    numbers: set[str] = set()
+    for block in payload.blocks:
+        if not isinstance(block, BulletBlock):
+            continue
+        for item in block.items:
+            text = _strip_markers(item)
+            held = [
+                run
+                for run in _entity_runs(text)
+                if not _is_grounded(run, blob)
+                and grounding.in_store(run)
+                and grounding.in_answer(run)
+            ]
+            figures = [
+                n for n in _numbers_of(text) if n not in blob_numbers and grounding.number(n)
+            ]
+            if not held and not figures:
+                continue
+            cited = _cited_records(item, index)
+            names.update(
+                run for run in held if not any(grounding.in_record(key, run) for key in cited)
+            )
+            numbers.update(
+                n for n in figures if not any(grounding.number_in_record(key, n) for key in cited)
+            )
+    problems: list[str] = []
+    remedy = "End each bullet with the id of the row of the record it is about, or drop it"
+    if names:
+        problems.append(
+            f"ungrounded entity: {', '.join(sorted(names))} — a tool result has these, but "
+            f"not the record the bullet cites; a bullet may only say what its own record holds. "
+            f"{remedy}"
+        )
+    if numbers:
+        problems.append(
+            f"ungrounded number: {', '.join(sorted(numbers))} — a tool result has these, but "
+            f"not the record the bullet cites; a bullet may only say what its own record holds. "
+            f"{remedy}"
+        )
+    return problems
+
+
+def _ungrounded_entity_problem(
+    runs: list[str], index: dict[str, dict], grounding: Grounding | None = None
+) -> str:
     """The feedback for check 3, with remedial advice the model can act on.
 
     "Use the exact name the tool returned" only helps when the run is a
@@ -488,7 +693,13 @@ def _ungrounded_entity_problem(runs: list[str], index: dict[str, dict]) -> str:
     told to go away.
     """
     blob_tokens = set(re.findall(r"[\w'’-]+", _evidence_blob(index)))
-    misspelled = [run for run in runs if _near_miss(run, blob_tokens)]
+    # A name a word away from one a tool result holds is a misspelling, whether
+    # the result is in the capped index or only in the store.
+    misspelled = [
+        run
+        for run in runs
+        if _near_miss(run, blob_tokens) or (grounding is not None and grounding.resembles(run))
+    ]
     invented = [run for run in runs if run not in misspelled]
 
     # The label stays "ungrounded entity" for both — it is the taxonomy the
@@ -544,6 +755,8 @@ _GROUNDING_RULES = """RULES (checked in code — a payload breaking one is rejec
   answer does not say it, do not write it.
 - Do not coin section headings or `Label: claim` bullet prefixes. A bullet
   starts with the claim. A heading you invented is an ungrounded phrase.
+- A bullet cites a row of the entity it is about: end it with that record's id,
+  never a neighbour's.
 - Cite only the ids above, and echo each cited id in `facts`."""
 
 # Appended ONLY when this turn's index actually carries source ids. The brief
@@ -1112,7 +1325,11 @@ class FormatGate(BaseAgent):
         index = evidence_index(ctx.invocation_id)
         # What checks 2-3 may ground in beside the capped index. Final here: no
         # tool runs between the executor and the gate. Never briefed, never emitted.
-        grounding = Grounding(grounding_text(ctx.invocation_id), executor_text)
+        grounding = Grounding(
+            grounding_text(ctx.invocation_id),
+            executor_text,
+            grounding_segments(ctx.invocation_id),
+        )
         # The deep path's brief opens with the question and the intent. The fast
         # path's draft already says both, so it adds nothing. Read once, here:
         # every attempt's brief carries the same two lines.

@@ -24,20 +24,22 @@ prior turns).
 
 The index is capped at MAX_ENTRIES and ADMISSION IS BY PRIORITY. A DETAIL row
 is an entity the executor fetched on purpose — the top-level row of
-`get_account_overview` (the account), `get_campaign`, `get_staff_profile`,
-`get_idea`, and the `piece` / `campaign` rows of `get_piece` — and its status
-text (`statusMarkdown`, or the account's nested `currentState.status_markdown`)
-is what an assessment is written from. A STUB is a row that came back as a list
-member of a search or list (`find`, `org_query`, the list tools) or of an
-overview (its campaign stubs). The members of a detail response's own lists (a
-campaign's pieces, a profile's metadata) are in between: admitted like detail,
-but their field rows stay evictable.
+`get_account_overview` (the account), `get_campaign` and `get_staff_profile`,
+and the `piece` / `campaign` rows of `get_piece` — and its status text
+(`statusMarkdown`, or the account's nested `currentState.status_markdown`) is
+what an assessment is written from. A STUB is a row that came back as a list
+member of a search or list (`find`, `org_query`, the list tools), of an overview
+(its campaign stubs) or of a campaign (its `pieces`: name and dates, no status).
+The one list a detail response carries as content is a profile's `metadata`:
+its members are MEMBER rows, admitted like detail, but their field rows stay
+evictable.
 
-Detail rows are admitted ahead of stubs. When the index is full a detail or
-member entry evicts the oldest stub FIELD row (a stub's whole-entity row
-stays, so the entity is still named) and is refused only when none is left. A
-stub, and a response-level scalar, is first-come as before. So an overview read
-before the detail fetches cannot starve them, whatever the order of the turn.
+Detail rows are admitted ahead of stubs, status text first. When the index is
+full a detail or member entry evicts the oldest stub FIELD row (a stub's
+whole-entity row stays, so the entity is still named), then the oldest member
+field row, and is refused only when none is left. A stub, and a
+response-level scalar, is first-come as before. So an overview read before the
+detail fetches cannot starve them, whatever the order of the turn.
 `_PROVENANCE` is separate and uncapped.
 
 THE GROUNDING STORE (`_GROUNDING`) is a second, uncapped, per-pass store beside
@@ -50,6 +52,13 @@ still means the capped index. Why it exists: the brief carries ~400 entries, the
 executor writes from everything it retrieved, and a rule that grounds the final
 answer in the 400 alone makes whatever the cap did not admit unwritable. Reset
 with the index.
+
+The store also remembers WHICH RECORD each string came from, because a bullet
+must cite a row of the record it names (`grounding_segments`): a string is held
+once for the whole store and once more for every record (a dict with a string
+`id`) it sits inside, so a record's segment is everything under it, including
+the records nested in it. What sits under no record (an `org_query` total, an
+id-less row) is the tool's own segment, `~<tool>`.
 
 The gate's retry feedback travels the same way (`set_format_feedback` /
 `take_format_feedback`): it also goes out as a `state_delta` event for trace
@@ -95,21 +104,26 @@ SRC_MARKER_RE = re.compile(r"\[src:\s*([A-Za-z0-9_-]+)\]")
 # priority (see the module docstring) and not first-come.
 MAX_ENTRIES = 400
 # The tools whose top-level row is a DETAIL row (module docstring).
-DETAIL_TOOLS = frozenset(
-    {"get_account_overview", "get_campaign", "get_piece", "get_staff_profile", "get_idea"}
-)
-# The detail tool whose own list is NOT part of the entity: an account overview
-# lists the account's campaigns, and those are stubs — the rows that crowd the
-# index out (a campaign's `pieces`, by contrast, belong to the campaign).
-_OVERVIEW_TOOLS = frozenset({"get_account_overview"})
+DETAIL_TOOLS = frozenset({"get_account_overview", "get_campaign", "get_piece", "get_staff_profile"})
 # `get_piece` answers `{piece, campaign}`: no top-level `id` and no list, so its
 # rows are the nested dicts. Only this wrapper shape is read that way.
 _WRAPPED_DETAIL_TOOLS = frozenset({"get_piece"})
 
 # What a row may do when the index is full, and what may be done to its fields.
 _STUB = 0  # first-come, whole row or nothing; its fields are evictable
-_MEMBER = 1  # admitted ahead of stubs (evicts one); its fields are evictable
+_MEMBER = 1  # admitted ahead of stubs (evicts one); its fields are evictable, after the stubs'
 _DETAIL = 2  # admitted ahead of stubs (evicts one); its fields are never evicted
+# The lists a detail response carries ABOUT ITSELF, and what each member is. The
+# tool contract calls a campaign's `pieces` STUBS (name, dates, no status), so
+# they never take a slot from a detail row; a profile's `metadata` (skills,
+# interests, certifications) is the person's own content. Every other list of
+# any response is a stub list, counted under the tool's own name; an own list is
+# counted as "<tool>.<list>", so `dropped_by_tool.get_campaign` is only ever
+# DETAIL entries lost.
+_OWN_LISTS: dict[str, dict[str, int]] = {
+    "get_campaign": {"pieces": _STUB},
+    "get_staff_profile": {"metadata": _MEMBER},
+}
 # A whole-entity value is the row's scalars as JSON; cap it so statusMarkdown
 # and friends do not turn one row into a page. Field-level values stay whole —
 # they are what numbers and names are grounded against.
@@ -135,15 +149,50 @@ _DRAFT: OrderedDict[str, str] = OrderedDict()
 # Entries the cap refused, per invocation and tool: what `log_cap` reports. Reset
 # with the index, so it describes the same executor pass the index does.
 _DROPPED: OrderedDict[str, dict[str, int]] = OrderedDict()
-# The index keys of the stub FIELD rows currently admitted, oldest first (a dict
-# used as an ordered set): the rows a detail entry may evict when the index is
-# full. Reset with the index.
-_STUBS: OrderedDict[str, dict[str, None]] = OrderedDict()
-# Every scalar / nested status text of every tool result this invocation's pass
-# retrieved, as an ordered set of the distinct strings (UNCAPPED; see the module
-# docstring). Read only through `grounding_text`. Reset with the index.
-_GROUNDING: OrderedDict[str, dict[str, None]] = OrderedDict()
+
+
+class _GroundingStore:
+    """Every scalar / nested status text of every tool result one pass retrieved,
+    as ordered sets of distinct strings (UNCAPPED; see the module docstring):
+    `all` for the whole pass, `segments` per record (see `segment_key`)."""
+
+    __slots__ = ("all", "segments")
+
+    def __init__(self) -> None:
+        self.all: dict[str, None] = {}
+        self.segments: dict[str, dict[str, None]] = {}
+
+
+# Read only through `grounding_text` / `grounding_segments`. Reset with the index.
+_GROUNDING: OrderedDict[str, _GroundingStore] = OrderedDict()
 _MAX_TRACKED = 256
+
+
+class _EvictionPool:
+    """The index keys a detail entry may evict when the index is full, oldest
+    first, in two ranks: stub FIELD rows, then member field rows. Each key maps
+    to the label its loss is counted under. Per invocation, reset with the
+    index; an entity row is never in it."""
+
+    __slots__ = ("members", "stubs")
+
+    def __init__(self) -> None:
+        self.stubs: dict[str, str] = {}
+        self.members: dict[str, str] = {}
+
+    def forget(self, key: str) -> None:
+        self.stubs.pop(key, None)
+        self.members.pop(key, None)
+
+    def pop_oldest(self) -> tuple[str, str] | None:
+        for rank in (self.stubs, self.members):
+            if rank:
+                key = next(iter(rank))
+                return key, rank.pop(key)
+        return None
+
+
+_EVICTABLE: OrderedDict[str, _EvictionPool] = OrderedDict()
 
 
 def _bucket(store: OrderedDict, invocation_id: str, default: Any) -> Any:
@@ -168,7 +217,7 @@ def reset_evidence_index(callback_context: Any) -> None:
     _BRIEF.pop(invocation_id, None)
     _DRAFT.pop(invocation_id, None)
     _DROPPED.pop(invocation_id, None)
-    _STUBS.pop(invocation_id, None)
+    _EVICTABLE.pop(invocation_id, None)
     _GROUNDING.pop(invocation_id, None)
     return None
 
@@ -213,7 +262,10 @@ def log_evidence_rows(invocation_id: str, tenant: str, rows: list[dict[str, Any]
 
 def dropped_by_tool(invocation_id: str) -> dict[str, int]:
     """Entries the cap refused or evicted this invocation, per tool (empty =
-    none). An evicted stub counts against ITS tool, not the detail row's."""
+    none). An evicted stub counts against ITS tool, not the detail row's, and
+    the members of a detail response's own list count as "<tool>.<list>"
+    (`get_campaign.pieces`), so a `get_campaign` count is only ever a detail
+    entry the index had no room for."""
     return dict(_DROPPED.get(invocation_id, {}))
 
 
@@ -339,7 +391,26 @@ def grounding_text(invocation_id: str) -> str:
     ('' when no tool result has been recorded). For the gate's checks 2-3 and
     nothing else: never put it in a brief, an event or a log line, and never let
     a citation resolve against it — the citable evidence is `evidence_index`."""
-    return "\n".join(_GROUNDING.get(invocation_id, {})).lower()
+    store = _GROUNDING.get(invocation_id)
+    return "\n".join(store.all).lower() if store else ""
+
+
+def segment_key(tool: Any, entity_id: Any) -> str:
+    """The grounding segment an index entry belongs to: its entity's id, or — for
+    an entry with no entity (a response-level scalar, an id-less row) — the
+    tool's own segment, `~<tool>`."""
+    return entity_id if isinstance(entity_id, str) and entity_id else f"~{tool}"
+
+
+def grounding_segments(invocation_id: str) -> dict[str, str]:
+    """The grounding store split by record: segment key -> its strings, lower-cased,
+    one distinct value per line (a record's segment includes the records nested in
+    it). Same rules as `grounding_text`: for the gate's binding check and nothing
+    else; never briefed, emitted or citable."""
+    store = _GROUNDING.get(invocation_id)
+    if not store:
+        return {}
+    return {key: "\n".join(values).lower() for key, values in store.segments.items()}
 
 
 def entry_source_ids(entry: dict[str, Any], prov: dict[str, list[str]]) -> list[str]:
@@ -405,27 +476,33 @@ def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any
     record it in the grounding store. Returns None so the tool response passes
     through unmodified."""
     invocation_id = getattr(tool_context, "invocation_id", "") or "?"
+    tool_name = getattr(tool, "name", None) or str(tool)
     if isinstance(tool_response, (list, tuple)):
         # A bare array (`find`'s hits): the index does not read one, but it is a
         # tool result the executor wrote from, so the grounding store takes it
         # wrapped, as ADK wraps it for the model.
-        _record_grounding({"result": tool_response}, _bucket(_GROUNDING, invocation_id, {}))
+        _record_grounding(
+            {"result": tool_response},
+            tool_name,
+            _bucket(_GROUNDING, invocation_id, _GroundingStore()),
+        )
         return None
     if not isinstance(tool_response, dict):
         return None
     index = _bucket(_INDEX, invocation_id, {})
     prov = _bucket(_PROVENANCE, invocation_id, {})
-    tool_name = getattr(tool, "name", None) or str(tool)
     # Provenance and the grounding store BEFORE the index, over every row: they
     # must not depend on whether the row survives MAX_ENTRIES.
-    _record_provenance(tool_response, prov)
-    _record_grounding(tool_response, _bucket(_GROUNDING, invocation_id, {}))
+    _record_provenance(tool_response, prov, tool_name)
+    _record_grounding(
+        tool_response, tool_name, _bucket(_GROUNDING, invocation_id, _GroundingStore())
+    )
     _index_response(
         tool_name,
         tool_response,
         index,
         _bucket(_DROPPED, invocation_id, {}),
-        _bucket(_STUBS, invocation_id, {}),
+        _bucket(_EVICTABLE, invocation_id, _EvictionPool()),
     )
     return None
 
@@ -495,9 +572,13 @@ def _row_source_ids(row: dict[str, Any]) -> list[str]:
     return out
 
 
-def _record_provenance(response: dict[str, Any], prov: dict[str, list[str]]) -> None:
+def _record_provenance(
+    response: dict[str, Any], prov: dict[str, list[str]], tool_name: str = ""
+) -> None:
     """entity_id → source ids for every id-bearing row in the response, top
-    level and every top-level list. Uncapped; unions across tools, so a
+    level, every top-level list and (for `get_piece`, the one tool whose rows
+    are its nested dicts) the `piece` / `campaign` rows. Uncapped, whatever the
+    index admits; unions across tools, so a
     campaign seen as an overview stub and again as a detail row ends up with
     the detail row's ids on both."""
 
@@ -518,11 +599,14 @@ def _record_provenance(response: dict[str, Any], prov: dict[str, list[str]]) -> 
     if isinstance(response.get("id"), str):
         note(response)
     for key, value in response.items():
-        if key.startswith("_") or not isinstance(value, list):
+        if key.startswith("_"):
             continue
-        for item in value:
-            if isinstance(item, dict):
-                note(item)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    note(item)
+        elif isinstance(value, dict) and tool_name in _WRAPPED_DETAIL_TOOLS:
+            note(value)
 
 
 # A UUID is an opaque handle, not a fact: left in the store it would "ground" any
@@ -533,7 +617,7 @@ _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
 _GROUNDING_MAX_DEPTH = 16
 
 
-def _record_grounding(response: Any, store: dict[str, None]) -> None:
+def _record_grounding(response: Any, tool_name: str, store: _GroundingStore) -> None:
     """Add every scalar of one tool result to this pass's grounding store.
 
     The whole result is walked, however deep: a row's scalars, a campaign's
@@ -543,29 +627,43 @@ def _record_grounding(response: Any, store: dict[str, None]) -> None:
     an error body (not evidence), `_`-prefixed keys (attribution plumbing),
     booleans and nulls; and it strips what is not prose — `[src: <fileId>]`
     markers and UUIDs. Distinct strings only, so a value that repeats across
-    rows is held once."""
+    rows is held once.
+
+    Each string is also filed under every record it sits inside (a dict with a
+    string `id`, at any depth), or under `~<tool>` when it sits inside none:
+    that is what lets a bullet's name be checked against the record the bullet
+    cites."""
     if isinstance(response, dict) and response.get("error"):
         return
+    lump = f"~{tool_name}"
 
-    def walk(value: Any, depth: int) -> None:
+    def file(text: str, records: tuple[str, ...]) -> None:
+        store.all.setdefault(text, None)
+        for key in records or (lump,):
+            store.segments.setdefault(key, {}).setdefault(text, None)
+
+    def walk(value: Any, depth: int, records: tuple[str, ...]) -> None:
         if isinstance(value, str):
             text = SRC_MARKER_RE.sub(" ", value).strip()
             if text and not _UUID_RE.fullmatch(text):
-                store.setdefault(text, None)
+                file(text, records)
         elif isinstance(value, bool) or value is None:
             return
         elif isinstance(value, (int, float)):
-            store.setdefault(str(value), None)
+            file(str(value), records)
         elif depth < _GROUNDING_MAX_DEPTH:
             if isinstance(value, dict):
+                own = value.get("id")
+                if isinstance(own, str) and own and own not in records:
+                    records = (*records, own)
                 for key, item in value.items():
                     if not (isinstance(key, str) and key.startswith("_")):
-                        walk(item, depth + 1)
+                        walk(item, depth + 1, records)
             elif isinstance(value, (list, tuple)):
                 for item in value:
-                    walk(item, depth + 1)
+                    walk(item, depth + 1, records)
 
-    walk(response, 0)
+    walk(response, 0, ())
 
 
 def _note_drop(dropped: dict[str, int] | None, tool_name: str, count: int = 1) -> None:
@@ -576,45 +674,46 @@ def _note_drop(dropped: dict[str, int] | None, tool_name: str, count: int = 1) -
         dropped[tool_name] = dropped.get(tool_name, 0) + count
 
 
-def _evict_stub_field(index: dict, stubs: dict[str, None], dropped: dict[str, int] | None) -> bool:
-    """Free one slot by evicting the OLDEST stub field row, counted as dropped for
-    the tool that wrote it. False when there is none. Oldest first: it is the
+def _evict_one(index: dict, pool: _EvictionPool, dropped: dict[str, int] | None) -> bool:
+    """Free one slot by evicting the OLDEST stub field row (the oldest member
+    field row only when no stub field is left), counted as dropped under the
+    label its writer gave it. False when there is none. Oldest first: it is the
     broadest read of the turn (the executor lists, then narrows), and its
     whole-entity row stays, so the entity is still named in the index."""
-    key = next(iter(stubs), None)
-    if key is None:
+    popped = pool.pop_oldest()
+    if popped is None:
         return False
-    del stubs[key]
-    evicted = index.pop(key, None)
-    if evicted is not None:
-        _note_drop(dropped, str(evicted.get("tool") or "?"))
+    key, label = popped
+    if index.pop(key, None) is not None:
+        _note_drop(dropped, label)
     return True
 
 
 def _admit_ahead(
-    tool_name: str,
+    label: str,
     key: str,
     entry: dict[str, Any],
     index: dict,
-    stubs: dict[str, None],
+    pool: _EvictionPool,
     dropped: dict[str, int] | None,
     evictable: bool,
 ) -> None:
-    """Admit one entry of a detail or member row, evicting stub field rows to
-    make room and refusing (counted) only when none is left. A key already in the
-    index is overwritten in place, which needs no room."""
+    """Admit one entry of a detail or member row, evicting stub field rows (then
+    member field rows) to make room and refusing (counted under `label`) only
+    when none is left. A key already in the index is overwritten in place, which
+    needs no room."""
     if key in index:
         index[key] = entry
         if not evictable:
-            stubs.pop(key, None)  # promoted: a detail row now owns this key
+            pool.forget(key)  # promoted: a detail row now owns this key
         return
     while len(index) >= MAX_ENTRIES:
-        if not _evict_stub_field(index, stubs, dropped):
-            _note_drop(dropped, tool_name)
+        if not _evict_one(index, pool, dropped):
+            _note_drop(dropped, label)
             return
     index[key] = entry
     if evictable:
-        stubs[key] = None
+        pool.members[key] = label
 
 
 def _nested_status_items(row: dict[str, Any]):
@@ -631,20 +730,30 @@ def _nested_status_items(row: dict[str, Any]):
                 yield f"{parent}.{status_key}", text
 
 
+def _is_status_field(key: str) -> bool:
+    """A status text field: `statusMarkdown`, `status_markdown`, or one level down
+    (`currentState.status_markdown`)."""
+    return key.rsplit(".", 1)[-1] in _STATUS_KEYS
+
+
 def _index_row(
     tool_name: str,
     row: dict[str, Any],
     fallback_id: str,
     index: dict,
     dropped: dict[str, int] | None = None,
-    stubs: dict[str, None] | None = None,
+    pool: _EvictionPool | None = None,
     tier: int = _STUB,
+    label: str | None = None,
 ) -> None:
     """Index one row at its tier (the constants above): a stub is first-come,
     whole row or nothing once the index is full; a member or detail row is
-    admitted ahead of the stubs."""
-    if stubs is None:
-        stubs = {}
+    admitted ahead of the stubs, its status text before its other fields.
+    `label` is what a refusal or eviction of this row is counted under (the
+    tool's name unless the row is a member of one of its own lists)."""
+    if pool is None:
+        pool = _EvictionPool()
+    label = label or tool_name
     row_id = row.get("id") if isinstance(row.get("id"), str) else fallback_id
     entity_id = row.get("id") if isinstance(row.get("id"), str) else None
     if tier == _STUB and len(index) >= MAX_ENTRIES:
@@ -653,7 +762,7 @@ def _index_row(
         # which tool lost how much.
         keys = [f"{tool_name}:{row_id}"]
         keys.extend(f"{tool_name}:{row_id}:{key}" for key, _ in _field_items(row))
-        _note_drop(dropped, tool_name, sum(1 for key in keys if key not in index))
+        _note_drop(dropped, label, sum(1 for key in keys if key not in index))
         return
     # Every source id this ROW mentions, whichever field carried it — so a
     # whole-entity citation can be attributed even though its own value was
@@ -671,13 +780,17 @@ def _index_row(
         "source_file_ids": row_sources,
     }
     fields = list(_field_items(row))
-    evictable = tier != _DETAIL
+    field_evictable = tier != _DETAIL
     if tier == _STUB:
         index[entity_key] = entity_entry
     else:
         fields.extend(_nested_status_items(row))
+        # The status text is what the entity is assessed from: when the room runs
+        # out part way through a row it must be the metadata that is refused, not
+        # the narrative (a stable sort — every other field keeps its wire order).
+        fields.sort(key=lambda item: not _is_status_field(item[0]))
         # The entity entry is never evictable: the entity stays named.
-        _admit_ahead(tool_name, entity_key, entity_entry, index, stubs, dropped, False)
+        _admit_ahead(label, entity_key, entity_entry, index, pool, dropped, False)
     for position, (key, value) in enumerate(fields):
         field_key = f"{tool_name}:{row_id}:{key}"
         field_entry = {
@@ -692,17 +805,17 @@ def _index_row(
             "source_file_ids": source_file_ids(value) or row_sources,
         }
         if tier != _STUB:
-            _admit_ahead(tool_name, field_key, field_entry, index, stubs, dropped, evictable)
+            _admit_ahead(label, field_key, field_entry, index, pool, dropped, field_evictable)
             continue
         if len(index) >= MAX_ENTRIES:
             _note_drop(
                 dropped,
-                tool_name,
+                label,
                 sum(1 for k, _ in fields[position:] if f"{tool_name}:{row_id}:{k}" not in index),
             )
             return
         if field_key not in index:
-            stubs[field_key] = None
+            pool.stubs[field_key] = label
         index[field_key] = field_entry
 
 
@@ -719,7 +832,7 @@ def _index_response(
     response: dict[str, Any],
     index: dict,
     dropped: dict[str, int] | None = None,
-    stubs: dict[str, None] | None = None,
+    pool: _EvictionPool | None = None,
 ) -> None:
     """Break one tool response into rows.
 
@@ -730,15 +843,14 @@ def _index_response(
     `pieces`), or `{piece, campaign}` for `get_piece`. Handled generically: the
     top-level dict is a row when it has an `id` (a DETAIL row when the tool is in
     DETAIL_TOOLS); every top-level list of dicts contributes rows (stubs, or
-    members of the detail entity); remaining top-level scalars (org_query's
+    members for a profile's `metadata`); remaining top-level scalars (org_query's
     `total`) index as "<tool>:<key>".
     """
     if response.get("error"):
         return  # an error body is not evidence
-    if stubs is None:
-        stubs = {}
+    if pool is None:
+        pool = _EvictionPool()
 
-    detail_tool = tool_name in DETAIL_TOOLS
     if isinstance(response.get("id"), str):
         _index_row(
             tool_name,
@@ -746,22 +858,31 @@ def _index_response(
             "self",
             index,
             dropped,
-            stubs,
-            _DETAIL if detail_tool else _STUB,
+            pool,
+            _DETAIL if tool_name in DETAIL_TOOLS else _STUB,
         )
-    # What a list member of THIS response is: a stub, unless the entity owns the
-    # list (a campaign's pieces).
-    member_tier = _MEMBER if detail_tool and tool_name not in _OVERVIEW_TOOLS else _STUB
+    own_lists = _OWN_LISTS.get(tool_name, {})
 
     row_counter = 0
     for key, value in response.items():
         if key.startswith("_"):
             continue  # _sources and friends are attribution plumbing, not evidence
         if isinstance(value, list):
+            # What a member of THIS list is: a stub, unless the entity owns the
+            # list as content (a profile's metadata).
+            member_tier = own_lists.get(key, _STUB)
+            label = f"{tool_name}.{key}" if key in own_lists else tool_name
             for item in value:
                 if isinstance(item, dict):
                     _index_row(
-                        tool_name, item, f"{key}{row_counter}", index, dropped, stubs, member_tier
+                        tool_name,
+                        item,
+                        f"{key}{row_counter}",
+                        index,
+                        dropped,
+                        pool,
+                        member_tier,
+                        label,
                     )
                     row_counter += 1
         elif (
@@ -769,7 +890,7 @@ def _index_response(
             and tool_name in _WRAPPED_DETAIL_TOOLS
             and isinstance(value.get("id"), str)
         ):
-            _index_row(tool_name, value, key, index, dropped, stubs, _DETAIL)
+            _index_row(tool_name, value, key, index, dropped, pool, _DETAIL)
         elif (
             _is_scalar(value)
             and not key.startswith("_")
