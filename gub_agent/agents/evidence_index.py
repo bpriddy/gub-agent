@@ -53,6 +53,13 @@ executor writes from everything it retrieved, and a rule that grounds the final
 answer in the 400 alone makes whatever the cap did not admit unwritable. Reset
 with the index.
 
+The store also remembers WHICH RECORD each string came from, because a bullet
+must cite a row of the record it names (`grounding_segments`): a string is held
+once for the whole store and once more for every record (a dict with a string
+`id`) it sits inside, so a record's segment is everything under it, including
+the records nested in it. What sits under no record (an `org_query` total, an
+id-less row) is the tool's own segment, `~<tool>`.
+
 The gate's retry feedback travels the same way (`set_format_feedback` /
 `take_format_feedback`): it also goes out as a `state_delta` event for trace
 visibility, but the formatter's next run reads it from here, deterministically.
@@ -142,10 +149,22 @@ _DRAFT: OrderedDict[str, str] = OrderedDict()
 # Entries the cap refused, per invocation and tool: what `log_cap` reports. Reset
 # with the index, so it describes the same executor pass the index does.
 _DROPPED: OrderedDict[str, dict[str, int]] = OrderedDict()
-# Every scalar / nested status text of every tool result this invocation's pass
-# retrieved, as an ordered set of the distinct strings (UNCAPPED; see the module
-# docstring). Read only through `grounding_text`. Reset with the index.
-_GROUNDING: OrderedDict[str, dict[str, None]] = OrderedDict()
+
+
+class _GroundingStore:
+    """Every scalar / nested status text of every tool result one pass retrieved,
+    as ordered sets of distinct strings (UNCAPPED; see the module docstring):
+    `all` for the whole pass, `segments` per record (see `segment_key`)."""
+
+    __slots__ = ("all", "segments")
+
+    def __init__(self) -> None:
+        self.all: dict[str, None] = {}
+        self.segments: dict[str, dict[str, None]] = {}
+
+
+# Read only through `grounding_text` / `grounding_segments`. Reset with the index.
+_GROUNDING: OrderedDict[str, _GroundingStore] = OrderedDict()
 _MAX_TRACKED = 256
 
 
@@ -372,7 +391,26 @@ def grounding_text(invocation_id: str) -> str:
     ('' when no tool result has been recorded). For the gate's checks 2-3 and
     nothing else: never put it in a brief, an event or a log line, and never let
     a citation resolve against it — the citable evidence is `evidence_index`."""
-    return "\n".join(_GROUNDING.get(invocation_id, {})).lower()
+    store = _GROUNDING.get(invocation_id)
+    return "\n".join(store.all).lower() if store else ""
+
+
+def segment_key(tool: Any, entity_id: Any) -> str:
+    """The grounding segment an index entry belongs to: its entity's id, or — for
+    an entry with no entity (a response-level scalar, an id-less row) — the
+    tool's own segment, `~<tool>`."""
+    return entity_id if isinstance(entity_id, str) and entity_id else f"~{tool}"
+
+
+def grounding_segments(invocation_id: str) -> dict[str, str]:
+    """The grounding store split by record: segment key -> its strings, lower-cased,
+    one distinct value per line (a record's segment includes the records nested in
+    it). Same rules as `grounding_text`: for the gate's binding check and nothing
+    else; never briefed, emitted or citable."""
+    store = _GROUNDING.get(invocation_id)
+    if not store:
+        return {}
+    return {key: "\n".join(values).lower() for key, values in store.segments.items()}
 
 
 def entry_source_ids(entry: dict[str, Any], prov: dict[str, list[str]]) -> list[str]:
@@ -438,21 +476,27 @@ def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any
     record it in the grounding store. Returns None so the tool response passes
     through unmodified."""
     invocation_id = getattr(tool_context, "invocation_id", "") or "?"
+    tool_name = getattr(tool, "name", None) or str(tool)
     if isinstance(tool_response, (list, tuple)):
         # A bare array (`find`'s hits): the index does not read one, but it is a
         # tool result the executor wrote from, so the grounding store takes it
         # wrapped, as ADK wraps it for the model.
-        _record_grounding({"result": tool_response}, _bucket(_GROUNDING, invocation_id, {}))
+        _record_grounding(
+            {"result": tool_response},
+            tool_name,
+            _bucket(_GROUNDING, invocation_id, _GroundingStore()),
+        )
         return None
     if not isinstance(tool_response, dict):
         return None
     index = _bucket(_INDEX, invocation_id, {})
     prov = _bucket(_PROVENANCE, invocation_id, {})
-    tool_name = getattr(tool, "name", None) or str(tool)
     # Provenance and the grounding store BEFORE the index, over every row: they
     # must not depend on whether the row survives MAX_ENTRIES.
     _record_provenance(tool_response, prov, tool_name)
-    _record_grounding(tool_response, _bucket(_GROUNDING, invocation_id, {}))
+    _record_grounding(
+        tool_response, tool_name, _bucket(_GROUNDING, invocation_id, _GroundingStore())
+    )
     _index_response(
         tool_name,
         tool_response,
@@ -573,7 +617,7 @@ _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
 _GROUNDING_MAX_DEPTH = 16
 
 
-def _record_grounding(response: Any, store: dict[str, None]) -> None:
+def _record_grounding(response: Any, tool_name: str, store: _GroundingStore) -> None:
     """Add every scalar of one tool result to this pass's grounding store.
 
     The whole result is walked, however deep: a row's scalars, a campaign's
@@ -583,29 +627,43 @@ def _record_grounding(response: Any, store: dict[str, None]) -> None:
     an error body (not evidence), `_`-prefixed keys (attribution plumbing),
     booleans and nulls; and it strips what is not prose — `[src: <fileId>]`
     markers and UUIDs. Distinct strings only, so a value that repeats across
-    rows is held once."""
+    rows is held once.
+
+    Each string is also filed under every record it sits inside (a dict with a
+    string `id`, at any depth), or under `~<tool>` when it sits inside none:
+    that is what lets a bullet's name be checked against the record the bullet
+    cites."""
     if isinstance(response, dict) and response.get("error"):
         return
+    lump = f"~{tool_name}"
 
-    def walk(value: Any, depth: int) -> None:
+    def file(text: str, records: tuple[str, ...]) -> None:
+        store.all.setdefault(text, None)
+        for key in records or (lump,):
+            store.segments.setdefault(key, {}).setdefault(text, None)
+
+    def walk(value: Any, depth: int, records: tuple[str, ...]) -> None:
         if isinstance(value, str):
             text = SRC_MARKER_RE.sub(" ", value).strip()
             if text and not _UUID_RE.fullmatch(text):
-                store.setdefault(text, None)
+                file(text, records)
         elif isinstance(value, bool) or value is None:
             return
         elif isinstance(value, (int, float)):
-            store.setdefault(str(value), None)
+            file(str(value), records)
         elif depth < _GROUNDING_MAX_DEPTH:
             if isinstance(value, dict):
+                own = value.get("id")
+                if isinstance(own, str) and own and own not in records:
+                    records = (*records, own)
                 for key, item in value.items():
                     if not (isinstance(key, str) and key.startswith("_")):
-                        walk(item, depth + 1)
+                        walk(item, depth + 1, records)
             elif isinstance(value, (list, tuple)):
                 for item in value:
-                    walk(item, depth + 1)
+                    walk(item, depth + 1, records)
 
-    walk(response, 0)
+    walk(response, 0, ())
 
 
 def _note_drop(dropped: dict[str, int] | None, tool_name: str, count: int = 1) -> None:
