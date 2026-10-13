@@ -76,9 +76,10 @@ already be present in the input you are given.
   REQUIRES at least one citation, so it is not available on such a turn.
 - If the executor asked the user to rephrase or disambiguate →
   kind="clarify"; put the question in the headline.
-- Copy assumptions from the input verbatim (at most 2).
+- Copy assumptions from the input verbatim (at most 2, each 40 words or fewer).
 - follow_ups become TAPPABLE buttons, and a tap sends the text as a brand-new
-  question. So each one must be a question that works with no other context:
+  question. So each one must be a question of 20 words or fewer that works with
+  no other context:
   "What changed on Chevy this week?" — never "only Chevy" or "this week only".
   2-3 follow_ups are REQUIRED on EVERY answer, not only on broad ones: they
   are the reply's only tappable way onward, and a turn without them leaves the

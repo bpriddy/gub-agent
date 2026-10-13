@@ -247,6 +247,30 @@ async def test_follow_ups_and_assumptions_do_not_spend_the_total():
     assert payload.follow_ups and payload.assumptions
 
 
+async def test_a_follow_up_is_at_most_twenty_words():
+    """Leaving the total must not leave them unbounded: a follow-up is a
+    button's label."""
+    AnswerPayload.model_validate(_answer(follow_ups=[_words(20)] * 3))
+    with pytest.raises(ValidationError, match="follow-up 1 is 21 words, over the 20-word budget"):
+        AnswerPayload.model_validate(_answer(follow_ups=[_words(5), _words(21)]))
+
+
+async def test_an_assumption_is_at_most_forty_words():
+    AnswerPayload.model_validate(_answer(assumptions=[_words(40)] * 2))
+    with pytest.raises(ValidationError, match="assumption 0 is 41 words, over the 40-word budget"):
+        AnswerPayload.model_validate(_answer(assumptions=[_words(41)]))
+
+
+async def test_follow_ups_and_assumptions_stay_bounded_in_a_rundown_too():
+    """The same bounds under both budget sets: a rundown widens the bullet and
+    the total, not the buttons."""
+    with answer_budgets(rundown=True):
+        with pytest.raises(ValidationError, match="follow-up 0 is 500 words"):
+            AnswerPayload.model_validate(_answer(follow_ups=[_words(500)] * 3))
+        with pytest.raises(ValidationError, match="assumption 1 is 500 words"):
+            AnswerPayload.model_validate(_answer(assumptions=[_words(5), _words(500)]))
+
+
 async def test_the_standard_total_is_250_of_headline_text_and_bullets():
     AnswerPayload.model_validate(_prose(250))
     with pytest.raises(ValidationError, match="251 words total, over the 250 budget"):
@@ -292,11 +316,24 @@ async def test_a_rundown_total_is_450_so_twelve_full_forty_word_bullets_do_not_f
             AnswerPayload.model_validate(_rundown_answer([[40] * 6, [40] * 6], headline=10))
 
 
-async def test_a_rundown_has_at_most_twelve_bullets():
-    with answer_budgets(rundown=True):
-        AnswerPayload.model_validate(_rundown_answer([[10] * 6, [10] * 6]))
-        with pytest.raises(ValidationError, match="13 bullets, over the 12-bullet rundown cap"):
-            AnswerPayload.model_validate(_rundown_answer([[10] * 7, [10] * 6]))
+async def test_every_rundown_budget_is_at_least_the_standard_one():
+    """The rundown only WIDENS: whatever the standard budgets accept, the
+    rundown accepts too. That is what makes a gate that misses the setting too
+    strict rather than too loose, and what keeps a rundown turn from rejecting
+    an answer the same payload would have passed before BE-5. In particular the
+    contract does not police the bullet COUNT or the block count of a rundown —
+    the prompt asks for at most 12 bullets in at most 2 bullet blocks, and the
+    contract's own limits (7 per block, 4 blocks, 450 words) are the bound."""
+    shapes = [
+        _rundown_answer([[15] * 7, [15] * 7]),  # 14 bullets, 225 words
+        _rundown_answer([[18] * 7, [18] * 6]),  # 13 bullets, 249 words
+        _rundown_answer([[10] * 4, [10] * 4, [10] * 4]),  # 12 bullets in THREE blocks
+        _rundown_answer([[8] * 7] * 4),  # 28 bullets, the contract's own ceiling
+    ]
+    for data in shapes:
+        AnswerPayload.model_validate(data)  # valid under the standard budgets…
+        with answer_budgets(rundown=True):
+            AnswerPayload.model_validate(data)  # …so valid as a rundown
 
 
 async def test_a_rundown_keeps_the_other_budgets():
@@ -320,8 +357,6 @@ async def test_every_other_answer_keeps_todays_budgets():
     with answer_budgets(rundown=False):
         with pytest.raises(ValidationError, match="25-word budget"):
             AnswerPayload.model_validate(twelve)
-    # the cap on the bullet count is the rundown's own: 14 short bullets are fine
-    AnswerPayload.model_validate(_rundown_answer([[10] * 7, [10] * 7]))
 
 
 async def test_the_budgets_are_restored_when_the_block_ends_even_on_an_error():

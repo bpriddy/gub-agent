@@ -14,10 +14,11 @@ THE FIX, pinned here:
     more entities with narrative -> one bullet per entity, 40 words, up to 12 in
     at most two blocks, 450 words in all, never tables alone over 1,500 chars of
     narrative;
-  * the rundown's budgets are the contract's, not only the prompt's, and they
-    apply to the turns the router calls exploratory or assessment (the question's
-    own words when there is no intent). Every other turn keeps today's budgets
-    and today's feedback;
+  * the rundown's WORD budgets (bullet 40, total 450) are the contract's, not
+    only the prompt's, and they apply to the turns the router calls exploratory
+    or assessment (the question's own words when there is no intent). Every
+    other turn keeps today's budgets and today's feedback. The bullet COUNT (12)
+    and the block count (2) are the prompt's alone: the contract only widens;
   * they reach ADK's own validation of the formatter's reply, and the early
     abort's scan, and nothing else — no leak into the pipeline around the gate;
   * the executor writes in the shape the synthesizer will (bold opener, a bullet
@@ -35,8 +36,9 @@ import logging
 from types import SimpleNamespace
 
 import pytest
-from google.adk.agents import SequentialAgent
+from google.adk.agents import BaseAgent, SequentialAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.events import Event, EventActions
 from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
 from pydantic import ValidationError
@@ -53,10 +55,12 @@ from gub_agent.agents.format_gate import (
     wants_rundown,
 )
 from gub_agent.agents.formatter import formatter_agent
+from gub_agent.agents.router import ROUTER_NAME, ROUTER_STATE_KEY
 from gub_agent.config import AGENT_NAME, GEMINI_MODEL
 from gub_agent.models import VendorRouter
 from gub_agent.prompts import EXECUTOR_INSTRUCTION, FORMATTER_INSTRUCTION
 from gub_agent.schemas import AnswerPayload
+from gub_agent.schemas.answer import ASSUMPTION_MAX_WORDS, FOLLOW_UP_MAX_WORDS
 from gub_agent.schemas.router import Intent
 
 from .test_brief_question import EXECUTOR, PREFIXED, _ctx, _real
@@ -125,6 +129,17 @@ def test_the_prompt_says_what_the_question_and_intent_lines_are():
     assert "No INTENT line means the classification is unknown" in prompt
 
 
+def test_the_prompt_gives_the_buttons_and_the_caveat_the_bounds_the_contract_enforces():
+    """The contract bounds a follow-up (20 words) and an assumption (40) now that
+    they are outside the total; the prompt the formatter reads says so, or the
+    bound is only ever learned from a rejection."""
+    prompt = _flat(FORMATTER_INSTRUCTION)
+
+    assert f"each {ASSUMPTION_MAX_WORDS} words or fewer" in prompt
+    assert f"a question of {FOLLOW_UP_MAX_WORDS} words or fewer" in prompt
+    assert (FOLLOW_UP_MAX_WORDS, ASSUMPTION_MAX_WORDS) == (20, 40)
+
+
 def test_a_fact_question_keeps_todays_shape_rules():
     """The lines a lookup is shaped by — the table rule, the list rule, the
     assessment rule, the single-fact rule — are the ones that were there, with
@@ -163,6 +178,32 @@ def test_the_executor_writes_in_the_shape_the_synthesizer_will():
     # …and no longer told to write a table the chat bubble shows as raw pipes
     assert "brief tables" not in prompt
     assert "Use bullet points or brief" not in prompt
+
+
+def test_the_executor_does_not_close_with_an_offer_the_synthesizer_forbids():
+    """The synthesizer never closes with a question, an offer or a "next step"
+    line: the reply carries the next questions as buttons. A draft that ended on
+    "want me to go deeper?" would lose that line when the answer settles — the
+    voice flip this prompt exists to prevent."""
+    prompt = _flat(EXECUTOR_INSTRUCTION)
+
+    assert "An offer to go deeper" not in prompt
+    assert "offer to drill in rather than dump" not in prompt
+    assert "No closing offer: the reply carries the next questions as tappable buttons" in prompt
+    assert 'do not end on a question, an offer or a "next step" line' in prompt
+    assert 'Do not close with a question, an offer or a "next step" line' in prompt
+    # the figures are bold in the synthesizer's reply as the names are
+    assert "Bold the names, the figures and the opening sentence" in prompt
+
+
+def test_the_no_tables_rule_leaves_the_verbatim_status_writeup_alone():
+    """ "No markdown headings and no tables" must not contradict the one case the
+    prompt tells the executor to render a status document unchanged."""
+    prompt = _flat(EXECUTOR_INSTRUCTION)
+
+    assert "Rendering `statusMarkdown` verbatim is ONLY for explicit" in prompt
+    format_rule = prompt[prompt.index("No markdown headings and no tables") :]
+    assert "The one exception is `statusMarkdown` rendered verbatim" in format_rule[:400]
 
 
 def test_the_executors_example_is_a_pattern_not_a_real_record():
@@ -340,6 +381,33 @@ async def test_no_intent_the_question_decides_which_budgets():
     assert len(as_lookup.runs) == 3
 
 
+async def test_a_decision_left_by_an_earlier_turn_does_not_pick_the_budgets():
+    """A router that says nothing writes nothing, and the state key keeps the
+    PREVIOUS turn's decision: the brief names no intent for it (BE-4), so the
+    budgets read the question, not that stale label."""
+    stale_open, stale_lookup = _real("exploratory"), _real("campaign_facts")
+
+    # a lookup after an exploratory turn: not a rundown
+    _, lookup = await _run(await _ctx("is the Q3 push live?", stale_open, how="earlier"), [_long()])
+    # an open read after a lookup turn: a rundown, because the question says so
+    _, open_read = await _run(
+        await _ctx("how is chevy doing?", stale_lookup, how="earlier"), [_long()]
+    )
+
+    assert len(lookup.runs) == 3
+    assert len(open_read.runs) == 1
+
+
+async def test_a_kept_forks_real_decision_picks_the_budgets():
+    """A speculative fork stamps its state with the invocation it was cut for
+    and carries the real decision from the keep: that one is this turn's."""
+    _, formatter = await _run(
+        await _ctx("is the Q3 push live?", _real("exploratory"), how="fork"), [_long()]
+    )
+
+    assert len(formatter.runs) == 1  # the router said exploratory: a rundown
+
+
 async def test_the_fast_path_is_never_a_rundown():
     """Its draft is a deterministic lookup, whatever the router labelled it —
     exploratory included (a declined fast decision is formatted on the deep
@@ -405,10 +473,27 @@ async def test_the_gate_leaves_the_pipeline_around_it_on_the_standard_budgets():
 # ── the real formatter: ADK's own validation, and the early abort's scan ────
 
 
+class _Router(BaseAgent):
+    """The router, reduced to what the gate reads: its output_key's event
+    carrying this turn's decision in a state_delta. State seeded BEFORE the run
+    is an earlier turn's decision to the gate, and names no intent."""
+
+    decision: dict
+
+    async def _run_async_impl(self, ctx):
+        yield Event(
+            invocation_id=ctx.invocation_id,
+            author=self.name,
+            actions=EventActions(state_delta={ROUTER_STATE_KEY: self.decision}),
+        )
+
+
 async def _through_adk(monkeypatch, *, decision: dict | None, question: str, replies: list[str]):
     """The real formatter LlmAgent (callbacks, output_schema, ADK's flow) behind
-    the real gate on an InMemoryRunner with SSE, only the model stubbed.
-    Returns (model, the session's `format_feedback` events, the log lines)."""
+    the real gate on an InMemoryRunner with SSE, only the model stubbed. A
+    `decision` is committed by a stand-in router in the same invocation, the way
+    the router's output_key does it. Returns (model, the session's
+    `format_feedback` events, the stored payloads)."""
     model = _StreamingModel(
         model="stub", replies=replies, requests=[], sent=[], finished=[], closed=[]
     )
@@ -418,16 +503,13 @@ async def _through_adk(monkeypatch, *, decision: dict | None, question: str, rep
     root = SequentialAgent(
         name="root",
         sub_agents=[
+            *([_Router(name=ROUTER_NAME, decision=decision)] if decision is not None else []),
             _Executor(name=AGENT_NAME),
             FormatGate(name="format_gate", sub_agents=[formatter]),
         ],
     )
     runner = InMemoryRunner(agent=root, app_name="gub")
-    session = await runner.session_service.create_session(
-        app_name="gub",
-        user_id="u",
-        state={"router_decision": decision} if decision is not None else {},
-    )
+    session = await runner.session_service.create_session(app_name="gub", user_id="u")
     [
         _
         async for _ in runner.run_async(
