@@ -10,14 +10,22 @@ pipeline structure the bot and Agentspace see at the boundary.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
-from google.adk.events import Event
+from google.adk.events import Event, EventActions
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
 from gub_agent import config
-from gub_agent.agents.router import ROUTER_STATE_KEY, decision_from, router_agent, user_text
+from gub_agent.agents.router import (
+    FORK_DECISION_KEY,
+    ROUTER_STATE_KEY,
+    decision_from,
+    decision_is_this_turns,
+    router_agent,
+    user_text,
+)
 from gub_agent.config import AGENT_NAME
 from gub_agent.schemas.router import FALLBACK_DECISION, FAST_INTENTS, RouterDecision
 from tests.helpers import invocation_ctx
@@ -172,6 +180,95 @@ async def test_an_earlier_turns_router_event_is_never_this_turns_decision():
     now = _router_event(json.dumps(_decision_dict(intent="campaign_facts")))
     ctx_now = await invocation_ctx(events=[earlier, now], invocation_id=INV)
     assert decision_from(ctx_now).intent == "campaign_facts"
+
+
+# The three lines `decision_from` writes for a turn it cannot read are ones the
+# logs are counted by (the dispatcher's reader writes them). `log=False` is for
+# a second reader of the same turn (the format gate's brief) and must silence
+# exactly these; the default must keep writing them.
+_UNREADABLE = [
+    pytest.param(None, "router: no decision for inv=inv-router — deep path", id="no-decision"),
+    pytest.param("this is not json {", "router: decision is not JSON — deep path", id="not-json"),
+    pytest.param(
+        {"intent": "vibes", "confidence": 0.9},
+        "router: decision failed validation (1) — deep path",
+        id="failed-validation",
+    ),
+]
+
+
+def _router_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "gub_agent.agents.router"]
+
+
+@pytest.mark.parametrize(("raw", "line"), _UNREADABLE)
+async def test_an_unreadable_decision_logs_its_line_by_default(raw, line, caplog):
+    state = {} if raw is None else {ROUTER_STATE_KEY: raw}
+    ctx = await invocation_ctx(state=state, invocation_id=INV)
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.router"):
+        assert decision_from(ctx) == FALLBACK_DECISION
+
+    assert _router_lines(caplog) == [line]
+
+
+@pytest.mark.parametrize(("raw", "line"), _UNREADABLE)
+async def test_a_second_reader_asks_with_log_false_and_writes_nothing(raw, line, caplog):
+    state = {} if raw is None else {ROUTER_STATE_KEY: raw}
+    ctx = await invocation_ctx(state=state, invocation_id=INV)
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.router"):
+        assert decision_from(ctx, log=False) == FALLBACK_DECISION
+
+    assert _router_lines(caplog) == []
+
+
+async def test_log_false_changes_only_the_logging_not_what_is_read():
+    ctx = await invocation_ctx(state={ROUTER_STATE_KEY: _decision_dict()}, invocation_id=INV)
+    assert decision_from(ctx, log=False) == decision_from(ctx)
+
+
+# ── whose decision is in state ────────────────────────────────────────────────
+
+
+def _committed(invocation_id: str) -> Event:
+    """The router's event as an output_key write leaves it: the decision in its
+    state_delta."""
+    return Event(
+        invocation_id=invocation_id,
+        author="router",
+        actions=EventActions(state_delta={ROUTER_STATE_KEY: _decision_dict()}),
+    )
+
+
+async def test_a_decision_this_invocation_committed_is_this_turns():
+    ctx = await invocation_ctx(events=[_committed(INV)], invocation_id=INV)
+    assert decision_is_this_turns(ctx)
+
+
+async def test_a_decision_an_earlier_invocation_committed_is_not():
+    """The state key outlives the turn: with this turn's router silent, state
+    still holds the previous turn's decision."""
+    ctx = await invocation_ctx(events=[_committed("inv-earlier")], invocation_id=INV)
+    assert ctx.session.state[ROUTER_STATE_KEY] == _decision_dict()
+    assert not decision_is_this_turns(ctx)
+
+
+async def test_a_decision_seeded_in_state_alone_is_not_provably_this_turns():
+    ctx = await invocation_ctx(state={ROUTER_STATE_KEY: _decision_dict()}, invocation_id=INV)
+    assert not decision_is_this_turns(ctx)
+
+
+async def test_a_forks_stamp_makes_its_state_decision_this_turns():
+    stamped = {ROUTER_STATE_KEY: _decision_dict(), FORK_DECISION_KEY: INV}
+    ctx = await invocation_ctx(state=stamped, invocation_id=INV)
+    assert decision_is_this_turns(ctx)
+
+    other = await invocation_ctx(
+        state={ROUTER_STATE_KEY: _decision_dict(), FORK_DECISION_KEY: "inv-other"},
+        invocation_id=INV,
+    )
+    assert not decision_is_this_turns(other)
 
 
 # ── the question ──────────────────────────────────────────────────────────────

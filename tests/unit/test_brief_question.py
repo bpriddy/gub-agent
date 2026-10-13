@@ -28,13 +28,14 @@ The kept-speculation half lives in `test_speculation.py`.
 
 from __future__ import annotations
 
+import json
 import logging
 from types import SimpleNamespace
 
 import pytest
 from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
-from google.adk.events import Event
+from google.adk.events import Event, EventActions
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
 
@@ -45,6 +46,7 @@ from gub_agent.agents.format_gate import (
     FormatGate,
     compose_brief,
 )
+from gub_agent.agents.router import FORK_DECISION_KEY, ROUTER_NAME, ROUTER_STATE_KEY
 from gub_agent.config import AGENT_NAME
 from gub_agent.schemas.router import FALLBACK_DECISION
 
@@ -68,20 +70,37 @@ def _no_evidence_rows_event(monkeypatch):
 
 async def _ctx(
     question: str | None = "how is chevy doing?",
-    decision: dict | None = None,
+    decision: dict | str | None = None,
     *,
     as_event: bool = False,
+    how: str = "committed",
 ) -> InvocationContext:
     """A gate context: the executor's answer is in the session; the question is
     the runner's `user_content` (or, with `as_event`, only a user event — the
-    fallback `user_text` reads for a hand-built context); `decision` is
-    `state["router_decision"]`."""
+    fallback `user_text` reads for a hand-built context). `decision` is
+    `state["router_decision"]`, put there the way `how` says:
+
+      * "committed": this invocation's router event carried it in its
+        state_delta (the router's output_key) — the serial path;
+      * "earlier": an EARLIER invocation's router event did, and this turn's
+        router wrote nothing — state holds the previous turn's decision;
+      * "fork": a speculative fork's own state, stamped with this invocation
+        (`speculation._fork_session`); a fork has no router event of the turn.
+    """
     service = InMemorySessionService()
-    session = await service.create_session(
-        app_name="gub",
-        user_id="u",
-        state={"router_decision": decision} if decision is not None else {},
-    )
+    state = {}
+    if decision is not None and how == "fork":
+        state = {ROUTER_STATE_KEY: decision, FORK_DECISION_KEY: INV}
+    session = await service.create_session(app_name="gub", user_id="u", state=state)
+    if decision is not None and how in ("committed", "earlier"):
+        await service.append_event(
+            session,
+            Event(
+                invocation_id=INV if how == "committed" else "inv-earlier-turn",
+                author=ROUTER_NAME,
+                actions=EventActions(state_delta={ROUTER_STATE_KEY: decision}),
+            ),
+        )
     if question is not None and as_event:
         await service.append_event(
             session,
@@ -284,10 +303,49 @@ async def test_the_fast_path_draft_already_asks_and_the_gate_adds_nothing():
 
 
 async def test_reading_the_decision_for_the_brief_writes_no_router_line(caplog):
-    """`decision_from` logs `router: no decision …` for a turn with none, and the
-    dispatcher already did: one more per deep turn would double that count."""
+    """`decision_from` logs `router: no decision …`, `decision is not JSON` and
+    `decision failed validation` for a turn it cannot read, and the dispatcher
+    already did: one more per deep turn would double those counts."""
     with caplog.at_level(logging.INFO, logger="gub_agent.agents.router"):
         await _briefs(await _ctx("how is chevy doing?", None))
         await _briefs(await _ctx("how is chevy doing?", {"intent": "weather"}))
+        await _briefs(await _ctx("how is chevy doing?", "this is not json {"))
 
     assert [r.getMessage() for r in caplog.records if r.name == "gub_agent.agents.router"] == []
+
+
+# ── the decision is this turn's, or there is no label ────────────────────────
+
+
+async def test_the_router_state_value_as_the_router_writes_it_is_read():
+    """An LlmAgent's output_key stores the model's text: a JSON string."""
+    [brief] = await _briefs(await _ctx("how is chevy doing?", json.dumps(_real("count_or_rank"))))
+
+    assert "INTENT: count_or_rank\n" in brief
+
+
+async def test_an_earlier_turns_decision_is_not_this_turns_label():
+    """A router that said nothing this turn commits nothing, and the state key
+    still holds the last turn's decision. The brief must not label an unrelated
+    question with it; the serial path (no fork) is where this showed."""
+    ctx = await _ctx("what is the capital of france?", _real("assessment"), how="earlier")
+    assert ctx.session.state[ROUTER_STATE_KEY] == _real("assessment")  # the stale value is there
+    [brief] = await _briefs(ctx)
+
+    assert brief.startswith("QUESTION: what is the capital of france?\n\nEXECUTOR ANSWER")
+    assert "INTENT:" not in brief
+
+
+async def test_a_forks_own_decision_is_this_turns():
+    """A speculative fork carries the turn's decision in its own state (the real
+    one from its keep) and has no router event of the turn to show for it."""
+    [brief] = await _briefs(await _ctx("how is chevy doing?", _real("assessment"), how="fork"))
+
+    assert brief.startswith("QUESTION: how is chevy doing?\nINTENT: assessment\n\n")
+
+
+async def test_a_forks_fallback_is_still_no_label():
+    fallback = FALLBACK_DECISION.model_dump(exclude_none=True)
+    [brief] = await _briefs(await _ctx("how is chevy doing?", fallback, how="fork"))
+
+    assert "INTENT:" not in brief

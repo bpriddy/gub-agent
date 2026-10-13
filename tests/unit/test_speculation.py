@@ -987,6 +987,11 @@ async def test_adopt_gives_the_fork_the_real_decision_and_leaves_the_session_alo
         assert router_module.decision_from(run.ctx) == real
         assert router_module.decision_from(run.ctx) != FALLBACK_DECISION
         assert session.state["router_decision"] == previous  # the real session, untouched
+        # The fork's decision, fallback or real, is this turn's — the brief may
+        # name it; the real session holds an earlier turn's, which it may not.
+        assert router_module.decision_is_this_turns(run.ctx)
+        assert not router_module.decision_is_this_turns(ctx)
+        assert router_module.FORK_DECISION_KEY not in session.state
     finally:
         await run.close()
 
@@ -1051,7 +1056,15 @@ async def test_a_restarted_run_is_forked_with_the_decision_and_briefs_it(monkeyp
     """The restart already carried the real decision; it must keep doing so."""
     monkeypatch.setattr(config, "FILE_SEARCH_ENABLED", True)
     seen = _probe_decision_at_the_formatter(monkeypatch)
-    built = _build(speculative=True, router=[_decision("file_lookup", 0.9)])
+    # The router answers once the speculative run has ended, not on a clock: the
+    # run reaches its formatter (and composes its brief) on the fork's fallback
+    # before the decision exists, however slow the machine is.
+    built = _build(
+        speculative=True,
+        router=[_decision("file_lookup", 0.9)],
+        router_delay=0.01,
+        router_until=ran_to_end,
+    )
     with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
         await _one_turn(built, "find the chevy brief")
 

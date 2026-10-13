@@ -95,7 +95,7 @@ from .evidence_index import (
     set_formatter_brief,
 )
 from .formatter import ANSWER_STATE_KEY, FORMATTER_NAME, formatter_agent
-from .router import decision_from, user_text
+from .router import decision_from, decision_is_this_turns, user_text
 
 logger = logging.getLogger(__name__)
 
@@ -796,18 +796,21 @@ def brief_context(ctx: InvocationContext) -> tuple[str, str | None]:
     """What the DEEP path's brief says about the turn beside the executor's
     answer: the reader's question and the router's intent label.
 
-    The intent is None unless the router's decision is a real one. The
-    fallback (`exploratory` at confidence 0) is what an unreadable decision
-    costs, and a speculative fork carries it until its keep
+    The intent is None unless the router's decision is a real one, and this
+    turn's. The fallback (`exploratory` at confidence 0) is what an unreadable
+    decision costs, and a speculative fork carries it until its keep
     (`speculation._Speculation.adopt`): "exploratory" in the brief would then
     be a guess presented as a classification, and a later intent-aware rule
-    would shape a FACT question as an exploration. No label says "unknown";
-    the question text is what such a rule falls back on.
+    would shape a FACT question as an exploration. A decision left in state by
+    an EARLIER turn (a router that said nothing this turn writes nothing, so
+    the key keeps the old value) is no better: an unrelated question would
+    carry the last one's label. No label says "unknown"; the question text is
+    what such a rule falls back on.
 
     Read without logging: the dispatcher already wrote the line for a decision
     it could not read, and a second reader would double that count.
     """
-    decision = decision_from(ctx, log=False)
+    decision = decision_from(ctx, log=False) if decision_is_this_turns(ctx) else FALLBACK_DECISION
     return user_text(ctx), (None if decision == FALLBACK_DECISION else decision.intent)
 
 
