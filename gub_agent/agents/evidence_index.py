@@ -296,9 +296,11 @@ def log_answer_shape(
     """The shape of the payload the gate shipped (accepted from the formatter,
     or the template render), next to how much of the executor's answer it kept.
 
-    `words` is the contract's own word count (headline, text, bullets,
-    assumptions, follow-ups; tables are data). Logged from THIS module for the
-    reason `log_cap` is."""
+    `words` counts every word the reader gets as prose (headline, text,
+    bullets, assumptions, follow-ups; tables are data). That is MORE than the
+    contract's budget total, which leaves assumptions and follow-ups out (BE-5):
+    the key keeps its meaning so a series that spans the change stays
+    comparable. Logged from THIS module for the reason `log_cap` is."""
     words = count_words(payload.headline)
     text_blocks = bullets = table_rows = 0
     for block in payload.blocks:

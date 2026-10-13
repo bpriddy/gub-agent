@@ -10,11 +10,13 @@ constructible exactly under these rules.
 
 from __future__ import annotations
 
+import typing
+
 import pytest
 from pydantic import ValidationError
 
 from gub_agent.schemas import AnswerPayload
-from gub_agent.schemas.answer import count_words
+from gub_agent.schemas.answer import Block, answer_budgets, count_words
 
 
 def _answer(**over) -> dict:
@@ -206,3 +208,149 @@ async def test_count_words_matches_the_eval_definition():
     assert count_words("chevy has 7 live campaigns") == 5
     assert count_words("— · [] ") == 0
     assert count_words("бюджет 1,200,000 ₽") == 2
+
+
+# ── follow-ups and assumptions are not the answer (BE-5) ─────────────────────
+
+
+def _words(n: int) -> str:
+    return " ".join(["word"] * n)
+
+
+def _bullets(*sizes: int) -> dict:
+    return {"kind": "bullets", "items": [_words(n) for n in sizes]}
+
+
+def _prose(total: int, **over) -> dict:
+    """An answer whose headline + text + bullets are exactly `total` words: a
+    20-word headline, a 60-word text block, and bullets of at most 25 for the
+    rest (so the standard per-bullet budget holds)."""
+    rest = total - 20 - 60
+    sizes = [25] * (rest // 25) + ([rest % 25] if rest % 25 else [])
+    blocks = [{"kind": "text", "text": _words(60)}]
+    for i in range(0, len(sizes), 7):  # a bullet block holds at most 7 items
+        blocks.append(_bullets(*sizes[i : i + 7]))
+    return _answer(headline=_words(20), blocks=blocks, **over)
+
+
+async def test_follow_ups_and_assumptions_do_not_spend_the_total():
+    """Two to three follow-ups are REQUIRED on every answer and up to two
+    assumptions are copied in, and they used to be counted against the 250: a
+    full-length answer lost ~25 words of body to its own buttons."""
+    payload = AnswerPayload.model_validate(
+        _prose(
+            250,
+            follow_ups=[_words(10)] * 3,  # 30 words
+            assumptions=[_words(12)] * 2,  # 24 words
+        )
+    )
+    assert payload.follow_ups and payload.assumptions
+
+
+async def test_the_standard_total_is_250_of_headline_text_and_bullets():
+    AnswerPayload.model_validate(_prose(250))
+    with pytest.raises(ValidationError, match="251 words total, over the 250 budget"):
+        AnswerPayload.model_validate(_prose(251))
+
+
+# ── the rundown's budgets (BE-5) ─────────────────────────────────────────────
+
+
+def _rundown_answer(bullets_per_block: list[list[int]], headline: int = 15, **over) -> dict:
+    return _answer(
+        headline=_words(headline),
+        blocks=[_bullets(*sizes) for sizes in bullets_per_block],
+        **over,
+    )
+
+
+async def test_a_rundown_accepts_twelve_bullets_across_two_blocks():
+    """The rundown: up to 12 entity bullets across two blocks, each over the
+    standard 25-word budget. 12 x 35 + a 15-word headline = 435 words."""
+    data = _rundown_answer([[35] * 6, [35] * 6])
+    with answer_budgets(rundown=True):
+        payload = AnswerPayload.model_validate(data)
+    assert sum(len(b.items) for b in payload.blocks) == 12
+    # the same wire as any other bullets answer: no new kind, no new field
+    assert {block["kind"] for block in payload.model_dump()["blocks"]} == {"bullets"}
+
+
+async def test_a_rundown_bullet_may_be_forty_words_not_forty_one():
+    with answer_budgets(rundown=True):
+        AnswerPayload.model_validate(_rundown_answer([[40, 40, 40]]))
+        with pytest.raises(ValidationError, match="bullet 0 is 41 words, over the 40-word budget"):
+            AnswerPayload.model_validate(_rundown_answer([[41, 40, 40]]))
+
+
+async def test_a_rundown_total_is_450_so_twelve_full_forty_word_bullets_do_not_fit():
+    """R1 sets the total at 450 and the bullet at 40; twelve of them are 480, so
+    the total binds before the count does. 11 x 40 + a 10-word headline is
+    exactly 450. (The prompt tells the formatter: ~35 words each at 12.)"""
+    with answer_budgets(rundown=True):
+        AnswerPayload.model_validate(_rundown_answer([[40] * 6, [40] * 5], headline=10))
+        with pytest.raises(ValidationError, match="over the 450 budget"):
+            AnswerPayload.model_validate(_rundown_answer([[40] * 6, [40] * 6], headline=10))
+
+
+async def test_a_rundown_has_at_most_twelve_bullets():
+    with answer_budgets(rundown=True):
+        AnswerPayload.model_validate(_rundown_answer([[10] * 6, [10] * 6]))
+        with pytest.raises(ValidationError, match="13 bullets, over the 12-bullet rundown cap"):
+            AnswerPayload.model_validate(_rundown_answer([[10] * 7, [10] * 6]))
+
+
+async def test_a_rundown_keeps_the_other_budgets():
+    """Only the bullet, the total and the count differ: a headline of 21 words
+    or a text block of 61 is over budget in a rundown as anywhere."""
+    with answer_budgets(rundown=True):
+        with pytest.raises(ValidationError, match="20-word"):
+            AnswerPayload.model_validate(_rundown_answer([[30]], headline=21))
+        with pytest.raises(ValidationError, match="60-word"):
+            AnswerPayload.model_validate(
+                _answer(blocks=[{"kind": "text", "text": _words(61)}, _bullets(30)])
+            )
+
+
+async def test_every_other_answer_keeps_todays_budgets():
+    """A fact, a count, a ranking — and any caller that never heard of
+    rundowns — gets the standard budgets, with today's feedback."""
+    twelve = _rundown_answer([[35] * 6, [35] * 6])
+    with pytest.raises(ValidationError, match="bullet 0 is 35 words, over the 25-word budget"):
+        AnswerPayload.model_validate(twelve)
+    with answer_budgets(rundown=False):
+        with pytest.raises(ValidationError, match="25-word budget"):
+            AnswerPayload.model_validate(twelve)
+    # the cap on the bullet count is the rundown's own: 14 short bullets are fine
+    AnswerPayload.model_validate(_rundown_answer([[10] * 7, [10] * 7]))
+
+
+async def test_the_budgets_are_restored_when_the_block_ends_even_on_an_error():
+    twelve = _rundown_answer([[35] * 6, [35] * 6])
+    with pytest.raises(RuntimeError):
+        with answer_budgets(rundown=True):
+            AnswerPayload.model_validate(twelve)
+            raise RuntimeError("boom")
+    with pytest.raises(ValidationError, match="25-word budget"):
+        AnswerPayload.model_validate(twelve)
+
+
+async def test_the_rundown_adds_no_block_kind_and_no_field():
+    """The bot's zod mirror (`render-answer.ts`) is hash-pinned and parses
+    `blocks` as a discriminated union over exactly these kinds: a new kind
+    would fail that parse and drop the payload to prose. The rundown is a
+    budget, not a shape — the wire is the one the bot already reads."""
+    kinds = {block.model_fields["kind"].default for block in typing.get_args(Block)}
+    assert kinds == {"table", "bullets", "text"}
+    assert set(AnswerPayload.model_fields) == {
+        "kind",
+        "headline",
+        "blocks",
+        "citations",
+        "facts",
+        "assumptions",
+        "follow_ups",
+        "candidates",
+    }
+    schema = AnswerPayload.model_json_schema()
+    assert schema["properties"]["blocks"]["maxItems"] == 4
+    assert schema["$defs"]["BulletBlock"]["properties"]["items"]["maxItems"] == 7

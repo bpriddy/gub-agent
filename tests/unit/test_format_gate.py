@@ -1194,7 +1194,11 @@ async def test_early_abort_through_a_real_formatter_closes_the_model_call(monkey
                 user_id="u",
                 session_id=session.id,
                 new_message=genai_types.Content(
-                    role="user", parts=[genai_types.Part(text="how is chevy?")]
+                    # A lookup, not an open read: "how is chevy?" with no routed
+                    # intent is a rundown (BE-5), whose wider budgets would let
+                    # LONG_BULLET through and leave nothing to abort.
+                    role="user",
+                    parts=[genai_types.Part(text="is the Q3 push live?")],
                 ),
                 run_config=RunConfig(streaming_mode=StreamingMode.SSE),
             )

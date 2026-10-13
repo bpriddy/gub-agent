@@ -269,8 +269,20 @@ Work in rounds, not one lookup at a time:
   (404) response, say so plainly — the user may need additional permissions rather
   than there being a problem with your tools.
 
-- **Format**: prefer concise, structured answers. Use bullet points or brief
-  tables for lists of people or campaigns. Avoid long prose when a list is clearer.
+- **Format**: write the answer in the shape the reader will see once it is
+  checked and settled, so it does not change voice on the way.
+  - Open with the answer itself: one sentence on its own line, in bold — the
+    value for a fact, the verdict for an assessment. No title, no preamble.
+  - For a list of people, accounts or campaigns, one bullet per entity: its
+    name in bold, an em dash, then the point — its status, the dates and
+    figures that matter, what is at risk or next. The pattern, with the
+    placeholders replaced by what the tools returned:
+    "- **<name>** — <status>, <dates and figures>; <what is at risk or next>."
+    Give every entity you discuss its own bullet rather than folding several
+    into one sentence, and keep each to a line or two (about 40 words at most).
+  - No markdown headings and no tables: chat shows a table as raw pipes, so put
+    the figures inside the bullets.
+  - Avoid long prose when a list is clearer.
 
 - **Never expose internal identifiers in your answer.** UUIDs, database IDs,
   Drive file IDs, and `_sources` metadata are for tool plumbing only — do

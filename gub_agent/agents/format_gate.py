@@ -15,7 +15,10 @@ checks:
    "chevy") moved into code.
 4. A payload that fails pydantic validation (filler, budgets, table shape —
    `schemas/answer.py`) surfaces as a ValidationError from the formatter's
-   `output_schema` and is treated the same way: feedback + retry.
+   `output_schema` and is treated the same way: feedback + retry. The word
+   budgets are the question's: an exploratory or assessment turn answers as a
+   RUNDOWN under wider ones (`wants_rundown`, `answer_budgets`), every other turn
+   under the standard set.
 
 Checks 2-3 ground in the capped index first, as always. What the index could not
 hold (it carries ~400 entries; the executor wrote from everything it retrieved)
@@ -54,7 +57,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing, nullcontext
 from functools import cached_property
 
@@ -67,7 +70,7 @@ from pydantic import ValidationError
 from .. import config
 from ..config import FORMAT_GATE_EARLY_ABORT
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
-from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
+from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS, answer_budgets
 from ..schemas.router import FALLBACK_DECISION
 from ..tenant import label_of
 from .critic import _last_executor_text
@@ -598,6 +601,52 @@ def brief_context(ctx: InvocationContext) -> tuple[str, str | None]:
     return user_text(ctx), (None if decision == FALLBACK_DECISION else decision.intent)
 
 
+# The router intents whose answer is an open read of how things stand — the
+# rundown's (BE-5): one bullet per entity, within the wider budgets. Every other
+# intent is a lookup, a count or a ranking and keeps the standard ones.
+RUNDOWN_INTENTS = frozenset({"exploratory", "assessment"})
+
+# With no intent (`brief_context` found none: the router's decision was
+# unreadable) the QUESTION decides, and the doubt goes to the standard budgets: a
+# question must clearly ask for an open read, and must not also ask for one fact
+# (how many, when, who, which). "Status of X" is deliberately not a cue — that is
+# a lookup. A question the router did classify never reaches these patterns.
+_OPEN_READ_RE = re.compile(
+    r"\bhow(?:['’]s|\s+(?:is|are))\b"
+    r"|\bwhat(?:['’]s|\s+is|\s+are)\s+(?:new|going\s+on|happening|up)\b"
+    r"|\bwhat\s+(?:has\s+|have\s+)?changed\b"
+    r"|\bwhere\s+(?:are\s+we|do\s+we\s+stand)\b"
+    r"|\bshould\s+we\s+(?:worry|be\s+worried)\b"
+    r"|\bcatch\s+me\s+up\b|\bbring\s+me\s+up\s+to\s+speed\b"
+    r"|\btell\s+me\s+(?:about|everything)\b|\bwalk\s+me\s+through\b"
+    r"|\b(?:overview|rundown|run-down|recap|snapshot)\b"
+    r"|как\s+(?:дела|обстоят|идут|идёт|идет|поживает)"
+    r"|что\s+(?:нового|происходит|творится)"
+    r"|\bрасскаж\w*|\bобзор\w*|\bсводк\w*"
+    r"|на\s+что\s+обратить\s+внимание",
+    re.IGNORECASE,
+)
+_ONE_FACT_RE = re.compile(
+    r"\bhow\s+(?:many|much|long|often|big|old)\b|\b(?:when|who|whom|whose|which)\b"
+    r"|\b(?:сколько|когда|кто|кому|кого|какой|какая|какие|каком)\b",
+    re.IGNORECASE,
+)
+# What the bot puts between its card-pick prefix (an entity name, a UUID) and the
+# reader's own words — both prefixes end with it (`entity/resolve.ts`).
+_ORIGINAL_QUESTION = "Original question:"
+
+
+def wants_rundown(question: str, intent: str | None) -> bool:
+    """Does this deep turn answer as a rundown (BE-5): the wider budgets, and the
+    formatter's RUNDOWN shape rule? The router's intent when there is one (the
+    brief's `INTENT:` line); the question's own words when there is not."""
+    if intent:
+        return intent in RUNDOWN_INTENTS
+    _, marker, after = question.partition(_ORIGINAL_QUESTION)
+    text = after if marker else question
+    return bool(_OPEN_READ_RE.search(text)) and not _ONE_FACT_RE.search(text)
+
+
 def compose_brief(
     executor_text: str,
     index: dict[str, dict],
@@ -891,6 +940,24 @@ def _streamed_text(event: Event) -> str:
     )
 
 
+async def _budgeted(events: AsyncIterator[Event]) -> AsyncGenerator[Event, None]:
+    """`events`, each step of it run under the rundown's budgets.
+
+    ADK validates the formatter's reply against `output_schema` inside the step
+    that yields its final event, with no way to pass it a context — so the
+    budgets have to be in force for the step itself. `answer_budgets` is set and
+    reset around each `__anext__` and never across a `yield`: the consumer (the
+    pipeline above the gate) runs in its own, untouched context."""
+    iterator = events.__aiter__()
+    while True:
+        with answer_budgets(True):
+            try:
+                event = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
+        yield event
+
+
 class _ContractScan:
     """The contract's field checks on `headline` and `blocks` of ONE formatter
     attempt, run while its JSON streams in.
@@ -1117,6 +1184,10 @@ class FormatGate(BaseAgent):
         # path's draft already says both, so it adds nothing. Read once, here:
         # every attempt's brief carries the same two lines.
         question, intent = ("", None) if draft else brief_context(ctx)
+        # An exploratory or assessment question on the deep path answers as a
+        # rundown (BE-5): same checks, wider word budgets (`answer_budgets`).
+        # Decided once, with the brief's own two inputs; the fast path never is.
+        rundown = not draft and wants_rundown(question, intent)
         set_formatter_brief(
             ctx.invocation_id,
             compose_brief(
@@ -1151,14 +1222,15 @@ class FormatGate(BaseAgent):
             run = self.sub_agents[0].run_async(ctx)
             try:
                 async with aclosing(run) if scan is not None else nullcontext(run) as events:
-                    async for event in events:
+                    async for event in _budgeted(events) if rundown else events:
                         delta = (event.actions.state_delta or {}) if event.actions else {}
                         if isinstance(delta.get(ANSWER_STATE_KEY), dict):
                             captured = delta[ANSWER_STATE_KEY]
                         chunk = _streamed_text(event) if scan is not None and not scan.done else ""
                         yield event
                         if chunk:  # scan is not None
-                            feedback = scan.feed(chunk) or ""
+                            with answer_budgets(rundown):
+                                feedback = scan.feed(chunk) or ""
                             if feedback:
                                 # Already rejected: close the run (the model
                                 # call ends `status=error:closed`) and take the
@@ -1190,7 +1262,8 @@ class FormatGate(BaseAgent):
                     feedback = "no AnswerPayload was produced — emit exactly one JSON payload"
                 else:
                     try:
-                        payload = AnswerPayload.model_validate(captured)
+                        with answer_budgets(rundown):
+                            payload = AnswerPayload.model_validate(captured)
                     except ValidationError as exc:
                         # The formatter's LlmAgent normally validates against
                         # `output_schema` and raises inside its own run, which
