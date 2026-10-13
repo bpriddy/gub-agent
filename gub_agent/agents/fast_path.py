@@ -35,7 +35,12 @@ Four choices worth their comments:
 Failure policy: an empty result, an unassemblable query or an unexpected
 exception falls through to the deep path ONCE (the executor may still find an
 answer); a 403 or a 404 is answered immediately, because paying 30 s of ReAct
-to hear the same 403 helps nobody.
+to hear the same 403 helps nobody. The exception is an id the BOT supplied (its
+"User selected …" / "Best guess: …" prefix): the fast path did not find that
+record, it was handed it, and a refusal about a handed id is no evidence about
+what the reader asked, so there the deep path runs too. And an id is used at
+all only when the prefix says its type is the one the lookup reads
+(`_campaign_id`).
 """
 
 from __future__ import annotations
@@ -82,6 +87,20 @@ logger = logging.getLogger(__name__)
 # the data itself.
 MAX_DRAFT_FIELD_CHARS = 600
 MAX_DRAFT_ROWS = 10
+
+# The bot's word for a campaign in its "User selected …" / "Best guess: …"
+# prefix (`entity/resolve.ts` CLARIFIABLE_TYPES).
+CAMPAIGN_TYPE = "campaign"
+
+# The precheck's two reasons for a campaign intent that carries an id which is
+# not (known to be) a campaign's. Apart on purpose: with the precheck on, the
+# turn never reaches `_campaign`, so its "is not a campaign entity_type=-" line
+# is never written — and the slug is then the only trace of an id the bot's
+# prefix did NOT vouch for (the router invented or mangled it, or the chat
+# client reworded the prefix), which must stay countable apart from the
+# ordinary piece / account / person turns.
+TYPED_ID_REASON = "entity_type"  # the prefix says piece / account / staff / …
+UNVOUCHED_ID_REASON = "entity_type_unknown"  # no prefix vouched for the id
 
 # ── the fast path's outcome, for the dispatcher ───────────────────────────────
 #
@@ -477,9 +496,30 @@ def _is_error(response: Any) -> bool:
     return isinstance(response, dict) and bool(response.get("error"))
 
 
-def _shortcut(response: dict, decision: RouterDecision, shim: _ToolShim) -> Lookup | None:
-    """A 403/404 answered on the spot; any other error → deep path."""
+def _shortcut(
+    response: dict,
+    decision: RouterDecision,
+    shim: _ToolShim,
+    *,
+    bot_supplied: bool = False,
+) -> Lookup | None:
+    """A 403/404 answered on the spot; any other error → deep path.
+
+    `bot_supplied` is an id that came from the bot's prefix rather than from
+    this path's own search: a 403/404 on it goes to the deep path too, with a
+    line of its own. It does NOT write the `shortcut` line, which counts the
+    turns this function answered."""
     status = response.get("status")
+    if bot_supplied and status in (403, 404):
+        logger.info(
+            "fast_path: bot-supplied id refused status=%s entity_type=%s intent=%s — deep path"
+            " (inv=%s) tenant=%s",
+            status,
+            decision.entity_type or "-",
+            decision.intent,
+            *_where(shim),
+        )
+        return None
     if status in (403, 404):
         logger.info(
             "fast_path: shortcut status=%s intent=%s inv=%s tenant=%s",
@@ -497,18 +537,46 @@ def _shortcut(response: dict, decision: RouterDecision, shim: _ToolShim) -> Look
     return None
 
 
+def _campaign_id(decision: RouterDecision) -> str | None:
+    """The campaign id the bot's prefix supplied — or None.
+
+    `entity_id` is the bot's "User selected …" / "Best guess: …" id (blend 02),
+    and it names a record of whatever type the reader or the bot settled on:
+    a piece, an account, a person. Only the prefix's own word for the type
+    says which, and `decision_from` copies that word to `entity_type` (None
+    when it could not vouch for the id). So an id is a campaign id only when
+    the type says campaign; asked of a piece's id, `/org/campaigns/<id>` is a
+    404 for a record that exists, which is how the reader came to be told
+    "not found" about a piece they had just picked (2026-10-08)."""
+    if decision.entity_id and decision.entity_type == CAMPAIGN_TYPE:
+        return decision.entity_id
+    return None
+
+
 async def _campaign(decision: RouterDecision, shim: _ToolShim, question: str) -> Lookup | None:
-    # `entity_id` is the bot's "User selected …" / "Best guess: …" prefix (blend
-    # 02) — a campaign id, so only the campaign intents may use it.
-    campaign_id = decision.entity_id
-    if not campaign_id:
+    campaign_id = _campaign_id(decision)
+    if decision.entity_id and campaign_id is None:
+        # The bot handed over something that is not (known to be) a campaign.
+        # Neither fetching it as one NOR searching the surface instead is
+        # right: the search could settle on a campaign the reader did not pick.
+        # The executor gets the prefix, with its type, and chooses the tool.
+        logger.info(
+            "fast_path: bot-supplied id is not a campaign entity_type=%s intent=%s — deep path"
+            " (inv=%s) tenant=%s",
+            decision.entity_type or "-",
+            decision.intent,
+            *_where(shim),
+        )
+        return None
+    supplied = campaign_id is not None
+    if campaign_id is None:
         resolution = await _resolve(decision.entity_surface, ("campaign",), shim)
         if resolution.kind != "one" or resolution.entity_id is None:
             return None
         campaign_id = resolution.entity_id
     response = await get_campaign(campaign_id, shim)
     if _is_error(response):
-        return _shortcut(response, decision, shim)
+        return _shortcut(response, decision, shim, bot_supplied=supplied)
     if not isinstance(response, dict) or not response.get("id"):
         return None
     return Lookup(evidence=[("get_campaign", response)], tool="get_campaign")
@@ -614,7 +682,10 @@ async def declined_before_lookup(
       surface without a call;
     - staff_lookup: a FALSY surface only — a whitespace-only one still reaches
       `search_staff`, whose answer nobody can predict;
-    - campaign_*: no `entity_id` and a blank surface (an id is fetched as is);
+    - campaign_*: a bot-supplied id whose type is not campaign (`_campaign`
+      hands the turn over before any call) — "entity_type" when the prefix
+      names the type, "entity_type_unknown" when no prefix vouched for the id —
+      or no id and a blank surface (a campaign id is fetched as is);
     - count_or_rank: `org_query_args` itself, with the account name resolved
       offline (`_resolved_offline`). Its other checks read the decision and
       the question alone, and a name that does not resolve declines as well,
@@ -632,7 +703,11 @@ async def declined_before_lookup(
     if lookup is _staff:
         return "no_surface" if not surface else None
     if lookup is _campaign:
-        return "no_surface" if blank and not decision.entity_id else None
+        if decision.entity_id:
+            if _campaign_id(decision):
+                return None
+            return TYPED_ID_REASON if decision.entity_type else UNVOUCHED_ID_REASON
+        return "no_surface" if blank else None
     if lookup is _count_or_rank:
         why: list[str] = []
         args = await org_query_args(decision, shim, question, resolve=_resolved_offline, why=why)

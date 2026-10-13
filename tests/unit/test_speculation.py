@@ -980,6 +980,7 @@ async def test_a_fast_path_answer_after_a_finished_speculation_leaves_nothing_of
 # ── kept: a fast path that would decline in code (SPECULATIVE_FAST_PRECHECK) ──
 
 ACCOUNT_ID = "fdb3f9ff-8094-4851-8ad4-a62f82761ad9"
+PIECE_ID = "5e1c7d2a-9b3f-4c68-8a41-0d2f6b7e9c13"
 # The bot's prefix when it has a best guess (blend 02), which the router copies
 # into `entity_id` and the fast path reads as part of the question.
 GUESS = (
@@ -1031,6 +1032,26 @@ DECLINED_IN_CODE = [
         "shape_other",
         1,
         id="which-campaigns",
+    ),
+    # BE-6, the 2026-10-08 18:32 turn: the reader picked a piece, the router
+    # copied its id and routed a campaign intent. `_campaign` hands this over
+    # before any call, so the precheck says so and the speculation is kept.
+    pytest.param(
+        _decision("campaign_facts", 0.95, entity_surface="Hero Spot 30s", entity_id=PIECE_ID),
+        f'User selected piece {PIECE_ID} "Hero Spot 30s". Original question: статус ролика',
+        "entity_type",
+        0,
+        id="piece-id-on-a-campaign-intent",
+    ),
+    # The same turn once the chat client has reworded the prefix head: nothing
+    # vouches for the id any more. With the precheck on `_campaign` never runs,
+    # so this slug is the only line that tells the drift from a piece turn.
+    pytest.param(
+        _decision("campaign_facts", 0.95, entity_surface="Hero Spot 30s", entity_id=PIECE_ID),
+        f'User picked piece {PIECE_ID} "Hero Spot 30s". Original question: статус ролика',
+        "entity_type_unknown",
+        0,
+        id="piece-id-from-a-reworded-prefix",
     ),
 ]
 

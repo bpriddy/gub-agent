@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+import re
+from typing import Any, NamedTuple
 
 from google.adk.agents import LlmAgent
 from google.adk.agents.invocation_context import InvocationContext
@@ -153,9 +154,90 @@ def _from_events(ctx: InvocationContext) -> Any:
     return None
 
 
+# ── the bot's entity prefixes, read in code ──────────────────────────────────
+#
+# `gub-gchat-bot/src/entity/resolve.ts` writes one of two heads in front of the
+# user's question when it has settled on an entity (blend 02):
+#
+#   User selected <type> <uuid> "<name>"( (<account>))?. Original question: …
+#   Best guess: <type> <uuid> "<name>"( (<account>))? — the user did not choose
+#     this. Ignore the guess if the question is not about it. Original question: …
+#
+# `<type>` is one of the bot's CLARIFIABLE_TYPES: campaign, account, piece,
+# staff. The router prompt documents the same two heads and asks the model to
+# copy the uuid; the TYPE it does not copy, because nothing in the engine may
+# act on a type a model re-typed (2026-10-08: a piece id went to
+# `/org/campaigns/<id>`, came back 404, and the reader was told "not found").
+#
+# Only the stable head is matched — the keyword, the type, the id and the
+# opening quote of the name. The tail (the account in brackets, the guess
+# disclaimer, the wording before "Original question") is prose the bot may
+# reword without changing WHICH record was chosen, and a parse that broke on
+# it would cost every id-bearing turn the fast path without any error.
+# Anchored at the start: the message BEGINS with the head, and a head quoted
+# later in the user's own words is not the bot's.
+_BOT_PREFIX = re.compile(
+    r"\A\s*(?:User selected|Best guess:)\s+(?P<type>[a-z][a-z_]*)\s+(?P<id>[^\s\"]+)\s+\""
+)
+
+
+class BotEntityPrefix(NamedTuple):
+    """The record the bot's prefix names. Both heads give the same two facts;
+    whether the reader picked it ("User selected") or the bot guessed ("Best
+    guess") is the ROUTER's to weigh, through its confidence, and the engine
+    treats the id the same either way."""
+
+    type: str
+    id: str
+
+
+def parse_bot_prefix(text: str) -> BotEntityPrefix | None:
+    """The bot's entity prefix at the start of `text`, or None when the
+    message has none — which is every turn that did not resolve an entity."""
+    match = _BOT_PREFIX.match(text or "")
+    if match is None:
+        return None
+    return BotEntityPrefix(match["type"], match["id"])
+
+
+def with_entity_type(decision: RouterDecision, text: str) -> RouterDecision:
+    """`decision` with `entity_type` set from the bot's prefix in `text`.
+
+    The type is set only when the router's `entity_id` IS the prefix's id.
+    Anything else leaves it None, and a None type beside an id means "an id
+    nobody can vouch for": the router dropped the guess (then there is no id
+    at all), invented an id, or mangled the one it copied. The lookup treats
+    such an id as unusable and hands the turn to the deep path.
+
+    Always overwrites: the field is derived from the message, so a value that
+    arrived any other way (a hand-built decision, a future router schema) is
+    replaced rather than trusted. Never mutates `decision` — it may be the
+    object held in session state.
+    """
+    entity_type: str | None = None
+    if decision.entity_id:
+        prefix = parse_bot_prefix(text)
+        if prefix is not None and prefix.id == decision.entity_id:
+            entity_type = prefix.type
+    if decision.entity_type == entity_type:
+        return decision
+    return decision.model_copy(update={"entity_type": entity_type})
+
+
 def decision_from(ctx: InvocationContext) -> RouterDecision:
-    """This turn's RouterDecision — from `state["router_decision"]`, else the
-    router's event text, else the fallback.
+    """This turn's RouterDecision, with `entity_type` read off the bot's prefix
+    (`with_entity_type`). See `_decision_read` for where the decision itself
+    comes from."""
+    decision = _decision_read(ctx)
+    if not decision.entity_id and decision.entity_type is None:
+        return decision  # the common turn: nothing to type, nothing to parse
+    return with_entity_type(decision, user_text(ctx))
+
+
+def _decision_read(ctx: InvocationContext) -> RouterDecision:
+    """This turn's RouterDecision as the router emitted it — from
+    `state["router_decision"]`, else the router's event text, else the
+    fallback.
 
     A router that emitted nothing usable costs the DEEP PATH, never the turn
     (blend 04's edge table): `FALLBACK_DECISION` is `exploratory` at

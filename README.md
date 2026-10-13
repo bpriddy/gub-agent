@@ -58,7 +58,9 @@ SequentialAgent("gub_root")
 fast_path (gub_agent/agents/fast_path.py)
   one deterministic tool call → the evidence index → format_gate. No executor,
   no critic; an ambiguous entity or an empty result falls through to the deep
-  path once, a 403/404 is answered immediately.
+  path once, a 403/404 on a record it looked up itself is answered immediately.
+  An id the chat client supplied is fetched only when its prefix says the id is
+  a campaign, and a refusal about it goes to the deep path as well.
 
 deep_agent = LoopAgent("gub_pipeline", max_iterations=2)
   ├─ executor    — the tool-using LLM (gub_agent/agent.py)
