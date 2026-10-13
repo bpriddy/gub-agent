@@ -180,11 +180,11 @@ def smalltalk_payload(language: Language = "en") -> AnswerPayload:
 _NO_ACCESS = {
     "ru": (
         "Нет доступа к этой записи в данных компании",
-        "Доступ выдаётся по грантам GUB — попросите владельца записи открыть его.",
+        "У вас пока нет доступа к этой записи — попросите её владельца открыть вам доступ.",
     ),
     "en": (
         "No access to that record in company records",
-        "Access follows your GUB grants — ask the record's owner to widen them.",
+        "You don't have access to this record yet — ask its owner to share it.",
     ),
 }
 
