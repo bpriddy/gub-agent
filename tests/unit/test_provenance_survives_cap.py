@@ -17,6 +17,13 @@ impossible on that turn, with every flag on.
 These pin the fix: provenance is recorded UNCAPPED per entity, the stub row the
 formatter did cite inherits its campaign's ids, the brief offers them once per
 entity, and the gate admits them.
+
+THE PREMISE WAS INVERTED ON PURPOSE (BE-2). The first test used to assert that
+the six detail responses were dropped by the cap, to document why the second
+store exists. Admission is now by priority: a detail row evicts the oldest stub
+field row instead of being refused, so the same replay indexes all six. The
+provenance store is still uncapped and still pinned below — it no longer has to
+rescue the detail rows, but it still serves the stub rows the cap does keep.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from types import SimpleNamespace
 
 from gub_agent.agents.evidence_index import (
     MAX_ENTRIES,
+    dropped_by_tool,
     entry_source_ids,
     evidence_index,
     provenance,
@@ -51,6 +59,16 @@ def _replay(invocation_id: str = "chevy") -> tuple[dict, dict]:
     return evidence_index(invocation_id), provenance(invocation_id)
 
 
+def _detail_campaign_ids() -> list[str]:
+    ids = [
+        r["response"]["id"]
+        for r in json.loads(FIXTURE.read_text(encoding="utf-8"))
+        if r["name"] == "get_campaign"
+    ]
+    assert len(ids) == 6
+    return ids
+
+
 def _detail_cited_ids(campaign_id: str) -> list[str]:
     for r in json.loads(FIXTURE.read_text(encoding="utf-8")):
         if r["name"] == "get_campaign" and r["response"]["id"] == campaign_id:
@@ -58,22 +76,24 @@ def _detail_cited_ids(campaign_id: str) -> list[str]:
     raise AssertionError("campaign not in fixture")
 
 
-async def test_the_recorded_turn_really_does_overflow_the_cap():
-    """The premise, pinned so a future MAX_ENTRIES change is a conscious one."""
+async def test_the_recorded_turn_still_fills_the_cap_but_the_six_details_are_in_it():
+    """The premise, INVERTED. The cap still binds — it is a prompt budget — and
+    the overview still crowds it, but the six `get_campaign` responses now get
+    in by evicting stub field rows instead of being refused."""
     index, _ = _replay()
     assert len(index) == MAX_ENTRIES
-    assert not any(k.startswith("get_campaign:") for k in index), (
-        "the six detail responses were expected to be dropped by the cap; if they now "
-        "fit, this test's premise changed — re-read the module docstring"
-    )
-    assert CITED_STUB in index  # the row the live formatter cited
+    for campaign_id in _detail_campaign_ids():
+        assert f"get_campaign:{campaign_id}" in index, "a detail response was starved by the cap"
+        assert f"get_campaign:{campaign_id}:statusMarkdown" in index
+    assert "get_campaign" not in dropped_by_tool("chevy")
+    assert CITED_STUB in index  # the row the live formatter cited is still there
 
 
 async def test_provenance_is_recorded_for_rows_the_cap_dropped():
     _, prov = _replay()
     # The campaign the formatter cited was seen twice: as a stub (no status)
-    # and as a detail row the index never took. Its provenance is the detail
-    # row's `_cited` — backend-resolved, so every id names a real file.
+    # and as a detail row. Its provenance is the detail row's `_cited` —
+    # backend-resolved, so every id names a real file.
     assert prov[CITED_CAMPAIGN] == _detail_cited_ids(CITED_CAMPAIGN)
     # All six detail campaigns are in the map, not one.
     detail_ids = {

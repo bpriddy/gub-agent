@@ -153,7 +153,7 @@ def _from_events(ctx: InvocationContext) -> Any:
     return None
 
 
-def decision_from(ctx: InvocationContext) -> RouterDecision:
+def decision_from(ctx: InvocationContext, *, log: bool = True) -> RouterDecision:
     """This turn's RouterDecision — from `state["router_decision"]`, else the
     router's event text, else the fallback.
 
@@ -161,6 +161,10 @@ def decision_from(ctx: InvocationContext) -> RouterDecision:
     (blend 04's edge table): `FALLBACK_DECISION` is `exploratory` at
     confidence 0, which every branch in the dispatcher reads as "the executor
     handles this".
+
+    `log=False` is for a second reader of the same turn (the format gate's
+    brief): the dispatcher already wrote the line for an unreadable decision,
+    and one per reader would double a count the logs are read by.
     """
     raw: Any = None
     state = getattr(getattr(ctx, "session", None), "state", None)
@@ -172,7 +176,8 @@ def decision_from(ctx: InvocationContext) -> RouterDecision:
     if raw is None:
         raw = _from_events(ctx)
     if raw is None:
-        logger.info("router: no decision for inv=%s — deep path", ctx.invocation_id)
+        if log:
+            logger.info("router: no decision for inv=%s — deep path", ctx.invocation_id)
         return FALLBACK_DECISION
     if isinstance(raw, RouterDecision):
         return raw
@@ -180,12 +185,14 @@ def decision_from(ctx: InvocationContext) -> RouterDecision:
         try:
             raw = json.loads(raw)
         except ValueError:
-            logger.warning("router: decision is not JSON — deep path")
+            if log:
+                logger.warning("router: decision is not JSON — deep path")
             return FALLBACK_DECISION
     try:
         return RouterDecision.model_validate(raw)
     except ValidationError as exc:
-        logger.warning("router: decision failed validation (%s) — deep path", exc.error_count())
+        if log:
+            logger.warning("router: decision failed validation (%s) — deep path", exc.error_count())
         return FALLBACK_DECISION
 
 
@@ -204,3 +211,42 @@ def user_text(ctx: InvocationContext) -> str:
             if text.strip():
                 return text
     return ""
+
+
+# The key a speculative fork stamps on its own state beside the decision it
+# places there (`speculation._fork_session`): the invocation it was forked for.
+FORK_DECISION_KEY = "router_decision_for"
+
+
+def wrote_decision(ctx: InvocationContext) -> bool:
+    """Did anything in THIS invocation commit a router decision to state?"""
+    for event in ctx.session.events:
+        if event.invocation_id != ctx.invocation_id:
+            continue
+        delta = event.actions.state_delta if event.actions else None
+        if ROUTER_STATE_KEY in (delta or {}):
+            return True
+    return False
+
+
+def decision_is_this_turns(ctx: InvocationContext) -> bool:
+    """Does `state["router_decision"]` belong to THIS turn?
+
+    The key is ordinary session state and outlives the turn: a router that
+    answers with no text writes nothing, and the key still holds the PREVIOUS
+    turn's decision. It is this turn's when this invocation's router committed
+    it (`wrote_decision`), or when it sits in a speculative fork, which stamps
+    its own state with the invocation it was forked for and places the
+    decision itself — the fallback before its keep, the real one from the keep
+    or the restart. A fork's events leave out this turn's router events, so
+    `wrote_decision` is never true there.
+
+    For a reader that must not act on an earlier question's decision and has
+    no better source than "unknown" (the formatter's brief)."""
+    if wrote_decision(ctx):
+        return True
+    state = getattr(getattr(ctx, "session", None), "state", None)
+    try:
+        return state is not None and state.get(FORK_DECISION_KEY) == ctx.invocation_id
+    except AttributeError:
+        return False

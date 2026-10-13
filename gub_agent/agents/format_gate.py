@@ -6,7 +6,8 @@ feedback, and falls back to a template render — the critic's old
 `answer_satisfies` axis (shape, grounding) turned from an LLM judgement into
 checks:
 
-1. `citations ⊆ evidence_index` — "unknown citation".
+1. `citations ⊆ evidence_index` — "unknown citation". The CAPPED index, and
+   nothing else: the grounding store below is never citable.
 2. Every number in the answer (citation markers stripped) appears in some
    evidence value — "ungrounded number".
 3. Every entity-name-shaped token appears in the index — "ungrounded entity";
@@ -14,7 +15,25 @@ checks:
    "chevy") moved into code.
 4. A payload that fails pydantic validation (filler, budgets, table shape —
    `schemas/answer.py`) surfaces as a ValidationError from the formatter's
-   `output_schema` and is treated the same way: feedback + retry.
+   `output_schema` and is treated the same way: feedback + retry. The word
+   budgets are the question's: an exploratory or assessment turn answers as a
+   RUNDOWN under wider ones (`wants_rundown`, `answer_budgets`), every other turn
+   under the standard set.
+
+Checks 2-3 ground in the capped index first, as always. What the index could not
+hold (it carries ~400 entries; the executor wrote from everything it retrieved)
+grounds against the pass's uncapped grounding store (`evidence_index._GROUNDING`)
+instead — but only when the executor's own answer holds it too: a number or name
+must appear in the executor answer AND in a tool result. So the store widens what
+the executor may say, never what the formatter may add on its own, and nothing
+the index grounded before is rejected now. A name grounds in the store as a
+PHRASE (its words in order, next to each other), not word by word: `York City`
+is in no tool result that holds `New York` and `Mexico City`.
+
+What only the store grounds has no row of its own to cite, so a bullet that
+writes it must end with a row of the record the store holds it under (or of a
+record that has it nested inside): a bullet citing a neighbour's row is rejected,
+because the source files shown under the answer would be the neighbour's.
 
 A citation that is merely mistyped — the tool prefix dropped, or two ids
 spliced — is REPAIRED against the turn's own evidence before check 1 judges
@@ -42,11 +61,13 @@ it does not have is a bug, not a style choice.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import aclosing, nullcontext
+from functools import cached_property, lru_cache
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
@@ -57,7 +78,8 @@ from pydantic import ValidationError
 from .. import config
 from ..config import FORMAT_GATE_EARLY_ABORT
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
-from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
+from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS, answer_budgets
+from ..schemas.router import FALLBACK_DECISION
 from ..tenant import label_of
 from .critic import _last_executor_text
 from .evidence_index import (
@@ -65,14 +87,18 @@ from .evidence_index import (
     entry_source_ids,
     evidence_index,
     evidence_rows,
+    grounding_segments,
+    grounding_text,
     log_answer_shape,
     log_cap,
     log_evidence_rows,
     provenance,
+    segment_key,
     set_format_feedback,
     set_formatter_brief,
 )
 from .formatter import ANSWER_STATE_KEY, FORMATTER_NAME, formatter_agent
+from .router import decision_from, decision_is_this_turns, user_text
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +232,184 @@ def _is_grounded(run: str, blob: str) -> bool:
     return bool(base) and base in blob
 
 
+_WORD_RE = re.compile(r"\w+")
+# What ends a name in a text: a line break, a sentence or clause mark, a bracket or
+# a quote. Two names that merely sit side by side in a text are not one name.
+# Every other non-word character (a space, `|`, `-`, `&`, `'`) only separates
+# words, so "F-150", "AT&T" and "Chevrolet | EV Bridge 2025" read as the names
+# they are.
+_PHRASE_BREAK_RE = re.compile(r"[\n\r.,;:!?()\[\]{}\"\u201c\u201d\u00ab\u00bb<>]+")
+
+
+def _norm_number(number: str) -> str:
+    """A number's canonical spelling for matching against the grounding store: no
+    separators, no trailing zeros after a decimal point, no leading zeros
+    ("1,200.50" → "1200.5", "09" → "9", "10.0" → "10")."""
+    n = number.replace(",", "").rstrip(".")
+    if "." in n:
+        n = n.rstrip("0").rstrip(".")
+    head, dot, tail = n.partition(".")
+    return (head.lstrip("0") or "0") + dot + tail
+
+
+def _phrase_text(text: str) -> str:
+    """`text` lower-cased and cut into phrases at the hard breaks: the whole words
+    of each stretch, one space apart, one phrase per line."""
+    parts = _PHRASE_BREAK_RE.split(text.lower())
+    return "\n".join(p for p in (" ".join(_WORD_RE.findall(part)) for part in parts) if p)
+
+
+@lru_cache(maxsize=1024)
+def _run_spellings(run: str) -> tuple[tuple[tuple[str, ...], ...], ...]:
+    """For each word of a candidate name, the spellings that count as it
+    (`_ground_forms`: possessive and plural), each as its whole words."""
+    out = []
+    for word in run.split():
+        spellings = {tuple(_WORD_RE.findall(form)) for form in _ground_forms(word)}
+        out.append(tuple(sorted((sp for sp in spellings if sp), key=len, reverse=True)))
+    return tuple(out)
+
+
+@lru_cache(maxsize=1024)
+def _run_pattern(run: str) -> re.Pattern[str] | None:
+    """A pattern for a candidate name inside a `_phrase_text`: its words in
+    order and next to each other, each as a whole word."""
+    spellings = _run_spellings(run)
+    if not spellings or not all(spellings):
+        return None
+    words = (
+        "(?:" + "|".join(re.escape(" ".join(sp)) for sp in word_spellings) + ")"
+        for word_spellings in spellings
+    )
+    return re.compile(r"(?<!\w)" + " ".join(words) + r"(?!\w)")
+
+
+def _phrase_in(run: str, phrases: str, words: frozenset[str]) -> bool:
+    """Whether a candidate name appears in `phrases` as a PHRASE: its words in
+    order, next to each other, whole words (possessive and plural spellings
+    allowed). Not word by word: against a store this size every word of "York
+    City" turns up somewhere (`New York`, `Mexico City`), and `ford` is in
+    `affordable`. `words` is the words of `phrases`, a cheap refusal first."""
+    pattern = _run_pattern(run)
+    if pattern is None:
+        return False
+    if not all(any(set(sp) <= words for sp in word) for word in _run_spellings(run)):
+        return False
+    return pattern.search(phrases) is not None
+
+
+class _Text:
+    """One text prepared for matching: its phrases, words and numbers."""
+
+    __slots__ = ("memo", "numbers", "phrases", "words")
+
+    def __init__(self, text: str) -> None:
+        self.phrases = _phrase_text(text)
+        self.words = frozenset(_WORD_RE.findall(self.phrases))
+        self.numbers = frozenset(_norm_number(n) for n in _numbers_of(text))
+        self.memo: dict[str, bool] = {}
+
+    def has_phrase(self, run: str) -> bool:
+        found = self.memo.get(run)
+        if found is None:
+            found = self.memo[run] = _phrase_in(run, self.phrases, self.words)
+        return found
+
+
+class Grounding:
+    """What checks 2-3 may ground in BESIDE the capped index: the pass's uncapped
+    grounding store (`evidence_index.grounding_text`) and the executor's answer.
+
+    A number or name the capped index does not hold grounds only when BOTH hold
+    it — it appears in the executor answer and in a tool result. Numbers match by
+    value; a name matches as a PHRASE (its words in order and next to each other,
+    whole words, case-insensitive). An empty `Grounding()` grounds nothing, so
+    `gate_problems` without one is the capped-index gate it always was.
+
+    `segments` (`evidence_index.grounding_segments`) is the store split by record;
+    given, a bullet must also cite a record that holds what it names
+    (`in_record`, `number_in_record`). Without it that check is off."""
+
+    def __init__(
+        self,
+        store: str = "",
+        executor_text: str = "",
+        segments: Mapping[str, str] | None = None,
+    ) -> None:
+        self._store_raw = store
+        self._answer_raw = _strip_markers(executor_text)
+        self._segments = segments
+        self._records: dict[str, _Text] = {}
+        self._resembling: dict[str, bool] = {}
+
+    @cached_property
+    def _store(self) -> _Text:
+        return _Text(self._store_raw)
+
+    @cached_property
+    def _answer(self) -> _Text:
+        return _Text(self._answer_raw)
+
+    @cached_property
+    def _store_by_initial(self) -> dict[str, list[str]]:
+        by_initial: dict[str, list[str]] = {}
+        for word in self._store.words:
+            by_initial.setdefault(word[0], []).append(word)
+        return by_initial
+
+    @property
+    def binds(self) -> bool:
+        """Whether a bullet's names are checked against the record it cites."""
+        return self._segments is not None
+
+    def number(self, number: str) -> bool:
+        """The number (as `_numbers_of` spells it) is in the store AND the answer."""
+        norm = _norm_number(number)
+        return norm in self._store.numbers and norm in self._answer.numbers
+
+    def in_store(self, run: str) -> bool:
+        return self._store.has_phrase(run)
+
+    def in_answer(self, run: str) -> bool:
+        return self._answer.has_phrase(run)
+
+    def _record(self, key: str) -> _Text:
+        record = self._records.get(key)
+        if record is None:
+            record = self._records[key] = _Text((self._segments or {}).get(key, ""))
+        return record
+
+    def in_record(self, key: str, run: str) -> bool:
+        """The name is a phrase of the strings filed under this record."""
+        return self._record(key).has_phrase(run)
+
+    def number_in_record(self, key: str, number: str) -> bool:
+        return _norm_number(number) in self._record(key).numbers
+
+    def resembles(self, run: str) -> bool:
+        """Whether a word of the run is a near-spelling of a word a tool result
+        holds ("Gren" for "Green"), as opposed to a name nothing there resembles.
+        A word the store holds exactly is not a misspelling of anything."""
+        found = self._resembling.get(run)
+        if found is None:
+            found = self._resembling[run] = self._resembles(run)
+        return found
+
+    def _resembles(self, run: str) -> bool:
+        for word in run.lower().split():
+            for part in _WORD_RE.findall(re.sub(r"['’]s$", "", word)):
+                if len(part) < 4 or part in self._store.words:
+                    continue
+                pool = [
+                    w
+                    for w in self._store_by_initial.get(part[0], ())
+                    if abs(len(w) - len(part)) <= 2
+                ]
+                if difflib.get_close_matches(part, pool, n=1, cutoff=0.85):
+                    return True
+        return False
+
+
 _HEX8_RE = re.compile(r"[0-9a-f]{8}", re.I)
 
 
@@ -327,8 +531,14 @@ def prune_source_file_ids(
     return payload.model_copy(update={"facts": facts}), dropped
 
 
-def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
-    """The deterministic checks — empty list means the payload passes."""
+def gate_problems(
+    payload: AnswerPayload, index: dict[str, dict], grounding: Grounding | None = None
+) -> list[str]:
+    """The deterministic checks — empty list means the payload passes.
+
+    Check 1 judges citations against `index`, the capped, citable evidence.
+    Checks 2-3 ground in `index` first and then in `grounding` (see `Grounding`);
+    without one they are the capped-index checks."""
     problems: list[str] = []
 
     unknown = [c for c in payload.citations if c not in index]
@@ -340,28 +550,136 @@ def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
     if payload.kind != "answer":
         return problems  # nothing to ground in an abstention / clarification
 
+    grounding = grounding or Grounding()
     prose, cells = _prose_and_cells(payload, index)
     blob = _evidence_blob(index)
     blob_numbers = blob.replace(",", "")
 
     ungrounded_numbers = sorted(
-        n for n in _numbers_of(prose) | _numbers_of(cells) if n not in blob_numbers
+        n
+        for n in _numbers_of(prose) | _numbers_of(cells)
+        if n not in blob_numbers and not grounding.number(n)
     )
     if ungrounded_numbers:
         problems.append(
             f"ungrounded number: {', '.join(ungrounded_numbers)} — every number must "
-            "appear verbatim in a tool result; copy it, never reformat or recompute"
+            "appear in the executor answer and in a tool result; copy it verbatim, "
+            "never reformat or recompute"
         )
 
-    ungrounded_entities = sorted(
-        {run for run in _entity_runs(prose) + _entity_runs(cells) if not _is_grounded(run, blob)}
-    )
-    if ungrounded_entities:
-        problems.append(_ungrounded_entity_problem(ungrounded_entities, index))
+    in_no_result: set[str] = set()  # in no tool result
+    unwritten: set[str] = set()  # in a tool result, but not in the executor answer
+    for run in _entity_runs(prose) + _entity_runs(cells):
+        if _is_grounded(run, blob):
+            continue
+        if not grounding.in_store(run):
+            in_no_result.add(run)
+        elif not grounding.in_answer(run):
+            unwritten.add(run)
+    parts: list[str] = []
+    if in_no_result:
+        parts.append(_ungrounded_entity_problem(sorted(in_no_result), index, grounding))
+    if unwritten:
+        # The label stays "ungrounded entity": it is the taxonomy the engine
+        # logs are read by.
+        parts.append(
+            f"ungrounded entity: {', '.join(sorted(unwritten))} — a tool result has "
+            "these, but the executor answer does not. Write only what the executor "
+            "answer says; never add a name of your own"
+        )
+    if parts:
+        problems.append("; ".join(parts))
+
+    if grounding.binds:
+        problems.extend(_unbound_problems(payload, index, blob, blob_numbers, grounding))
     return problems
 
 
-def _ungrounded_entity_problem(runs: list[str], index: dict[str, dict]) -> str:
+def _cited_records(item: str, index: dict[str, dict]) -> set[str]:
+    """The grounding segments of the rows a bullet ends with: each `[id]` marker
+    that names a row of this turn's index (a near-miss id is read as
+    `repair_citations` would), as the record the row belongs to."""
+    records: set[str] = set()
+    for marker in _CITE_MARKER_RE.findall(item):
+        for ident in re.split(r"[\s,;]+", marker[1:-1]):
+            if not ident:
+                continue
+            key = (
+                ident
+                if ident in index
+                else (_repair_one(ident, index) if len(ident) >= 8 else None)
+            )
+            if key is not None:
+                entry = index[key]
+                records.add(segment_key(entry.get("tool"), entry.get("entity_id")))
+    return records
+
+
+def _unbound_problems(
+    payload: AnswerPayload,
+    index: dict[str, dict],
+    blob: str,
+    blob_numbers: str,
+    grounding: Grounding,
+) -> list[str]:
+    """A bullet cites a row of the record it is about.
+
+    What the capped index holds is cited by its own id. What only the store
+    holds (a name or number the executor wrote and the index could not admit)
+    has no row of its own to cite, so a bullet could cite a NEIGHBOUR's row,
+    and the source files carried under the answer would then be the
+    neighbour's. So a name or number a bullet writes that only the store
+    grounds must be held by the record behind a row the bullet cites (or by a
+    record nested inside it); otherwise the bullet is rejected, with the labels
+    the gate's logs are read by. A bullet naming something of a record it cannot
+    cite has to drop it. Text blocks, the headline and table cells cite no
+    bullet-level row and are not bound by this."""
+    names: set[str] = set()
+    numbers: set[str] = set()
+    for block in payload.blocks:
+        if not isinstance(block, BulletBlock):
+            continue
+        for item in block.items:
+            text = _strip_markers(item)
+            held = [
+                run
+                for run in _entity_runs(text)
+                if not _is_grounded(run, blob)
+                and grounding.in_store(run)
+                and grounding.in_answer(run)
+            ]
+            figures = [
+                n for n in _numbers_of(text) if n not in blob_numbers and grounding.number(n)
+            ]
+            if not held and not figures:
+                continue
+            cited = _cited_records(item, index)
+            names.update(
+                run for run in held if not any(grounding.in_record(key, run) for key in cited)
+            )
+            numbers.update(
+                n for n in figures if not any(grounding.number_in_record(key, n) for key in cited)
+            )
+    problems: list[str] = []
+    remedy = "End each bullet with the id of the row of the record it is about, or drop it"
+    if names:
+        problems.append(
+            f"ungrounded entity: {', '.join(sorted(names))} — a tool result has these, but "
+            f"not the record the bullet cites; a bullet may only say what its own record holds. "
+            f"{remedy}"
+        )
+    if numbers:
+        problems.append(
+            f"ungrounded number: {', '.join(sorted(numbers))} — a tool result has these, but "
+            f"not the record the bullet cites; a bullet may only say what its own record holds. "
+            f"{remedy}"
+        )
+    return problems
+
+
+def _ungrounded_entity_problem(
+    runs: list[str], index: dict[str, dict], grounding: Grounding | None = None
+) -> str:
     """The feedback for check 3, with remedial advice the model can act on.
 
     "Use the exact name the tool returned" only helps when the run is a
@@ -378,7 +696,13 @@ def _ungrounded_entity_problem(runs: list[str], index: dict[str, dict]) -> str:
     told to go away.
     """
     blob_tokens = set(re.findall(r"[\w'’-]+", _evidence_blob(index)))
-    misspelled = [run for run in runs if _near_miss(run, blob_tokens)]
+    # A name a word away from one a tool result holds is a misspelling, whether
+    # the result is in the capped index or only in the store.
+    misspelled = [
+        run
+        for run in runs
+        if _near_miss(run, blob_tokens) or (grounding is not None and grounding.resembles(run))
+    ]
     invented = [run for run in runs if run not in misspelled]
 
     # The label stays "ungrounded entity" for both — it is the taxonomy the
@@ -426,12 +750,16 @@ def _near_miss(run: str, blob_tokens: set[str]) -> bool:
 # Phrased against what `gate_problems` actually tests — any capitalized run —
 # rather than "entity name", which a model does not read a coined heading as.
 _GROUNDING_RULES = """RULES (checked in code — a payload breaking one is rejected):
-- Every number you write must appear verbatim in a value above. Copy it; never
-  reformat, round or recompute.
-- Every capitalized word or phrase you write must appear in a value above —
-  names, places, products alike. If it is not there, do not write it.
+- Every number you write must appear in the executor answer and in a tool
+  result. Copy it verbatim; never reformat, round or recompute.
+- Every capitalized word or phrase you write must appear in the executor answer
+  and in a tool result — names, places, products alike. The values above are
+  tool results, and so is everything else this turn retrieved. If the executor
+  answer does not say it, do not write it.
 - Do not coin section headings or `Label: claim` bullet prefixes. A bullet
   starts with the claim. A heading you invented is an ungrounded phrase.
+- A bullet cites a row of the entity it is about: end it with that record's id,
+  never a neighbour's.
 - Cite only the ids above, and echo each cited id in `facts`."""
 
 # Appended ONLY when this turn's index actually carries source ids. The brief
@@ -452,14 +780,110 @@ _SOURCE_RULE = """- A `sources:` line sits under an ENTITY row (`<tool>:<id> = {
 # a handful. Over-listing buys nothing a reader can use.
 MAX_BRIEF_SOURCE_IDS = 8
 
+# How much of the reader's question the brief carries. The question is context
+# for the answer's SHAPE, never evidence, and the brief is re-sent on every
+# formatter attempt: a sentence or two is the whole of a normal question, and a
+# pasted document in the message must not triple the brief.
+MAX_BRIEF_QUESTION_CHARS = 600
+
+
+def _question_line(question: str) -> str:
+    """The question on ONE line, capped: the brief is line-structured."""
+    text = " ".join(question.split())
+    if len(text) > MAX_BRIEF_QUESTION_CHARS:
+        text = text[: MAX_BRIEF_QUESTION_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def brief_context(ctx: InvocationContext) -> tuple[str, str | None]:
+    """What the DEEP path's brief says about the turn beside the executor's
+    answer: the reader's question and the router's intent label.
+
+    The intent is None unless the router's decision is a real one, and this
+    turn's. The fallback (`exploratory` at confidence 0) is what an unreadable
+    decision costs, and a speculative fork carries it until its keep
+    (`speculation._Speculation.adopt`): "exploratory" in the brief would then
+    be a guess presented as a classification, and a later intent-aware rule
+    would shape a FACT question as an exploration. A decision left in state by
+    an EARLIER turn (a router that said nothing this turn writes nothing, so
+    the key keeps the old value) is no better: an unrelated question would
+    carry the last one's label. No label says "unknown"; the question text is
+    what such a rule falls back on.
+
+    Read without logging: the dispatcher already wrote the line for a decision
+    it could not read, and a second reader would double that count.
+    """
+    decision = decision_from(ctx, log=False) if decision_is_this_turns(ctx) else FALLBACK_DECISION
+    return user_text(ctx), (None if decision == FALLBACK_DECISION else decision.intent)
+
+
+# The router intents whose answer is an open read of how things stand — the
+# rundown's (BE-5): one bullet per entity, within the wider budgets. Every other
+# intent is a lookup, a count or a ranking and keeps the standard ones.
+RUNDOWN_INTENTS = frozenset({"exploratory", "assessment"})
+
+# With no intent (`brief_context` found none: the router's decision was
+# unreadable) the QUESTION decides, and the doubt goes to the standard budgets: a
+# question must clearly ask for an open read, and must not also ask for one fact
+# (how many, when, who, which). "Status of X" is deliberately not a cue — that is
+# a lookup. A question the router did classify never reaches these patterns.
+_OPEN_READ_RE = re.compile(
+    r"\bhow(?:['’]s|\s+(?:is|are))\b"
+    r"|\bwhat(?:['’]s|\s+is|\s+are)\s+(?:new|going\s+on|happening|up)\b"
+    r"|\bwhat\s+(?:has\s+|have\s+)?changed\b"
+    r"|\bwhere\s+(?:are\s+we|do\s+we\s+stand)\b"
+    r"|\bshould\s+we\s+(?:worry|be\s+worried)\b"
+    r"|\bcatch\s+me\s+up\b|\bbring\s+me\s+up\s+to\s+speed\b"
+    r"|\btell\s+me\s+(?:about|everything)\b|\bwalk\s+me\s+through\b"
+    r"|\b(?:overview|rundown|run-down|recap|snapshot)\b"
+    r"|как\s+(?:дела|обстоят|идут|идёт|идет|поживает)"
+    r"|что\s+(?:нового|происходит|творится)"
+    r"|\bрасскаж\w*|\bобзор\w*|\bсводк\w*"
+    r"|на\s+что\s+обратить\s+внимание",
+    re.IGNORECASE,
+)
+_ONE_FACT_RE = re.compile(
+    r"\bhow\s+(?:many|much|long|often|big|old)\b|\b(?:when|who|whom|whose|which)\b"
+    r"|\b(?:сколько|когда|кто|кому|кого|какой|какая|какие|каком)\b",
+    re.IGNORECASE,
+)
+# What the bot puts between its card-pick prefix (an entity name, a UUID) and the
+# reader's own words — both prefixes end with it (`entity/resolve.ts`).
+_ORIGINAL_QUESTION = "Original question:"
+
+
+def wants_rundown(question: str, intent: str | None) -> bool:
+    """Does this deep turn answer as a rundown (BE-5): the wider budgets, and the
+    formatter's RUNDOWN shape rule? The router's intent when there is one (the
+    brief's `INTENT:` line); the question's own words when there is not."""
+    if intent:
+        return intent in RUNDOWN_INTENTS
+    _, marker, after = question.partition(_ORIGINAL_QUESTION)
+    text = after if marker else question
+    return bool(_OPEN_READ_RE.search(text)) and not _ONE_FACT_RE.search(text)
+
 
 def compose_brief(
     executor_text: str,
     index: dict[str, dict],
     feedback: str,
     prov: dict[str, list[str]] | None = None,
+    *,
+    question: str = "",
+    intent: str | None = None,
 ) -> str:
-    lines = [
+    """The formatter's whole input. `question` and `intent` are the deep
+    path's; the fast path's draft (the `executor_text` it passes) already opens
+    with its own `QUESTION:` and `intent=`, so it passes neither. Without them
+    the brief is byte for byte what it was before they existed."""
+    lines = []
+    if question.strip():
+        lines.append(f"QUESTION: {_question_line(question)}")
+    if intent:
+        lines.append(f"INTENT: {intent}")
+    if lines:
+        lines.append("")
+    lines += [
         "EXECUTOR ANSWER (render this — do not add facts):",
         executor_text.strip(),
         "",
@@ -732,6 +1156,24 @@ def _streamed_text(event: Event) -> str:
     )
 
 
+async def _budgeted(events: AsyncIterator[Event]) -> AsyncGenerator[Event, None]:
+    """`events`, each step of it run under the rundown's budgets.
+
+    ADK validates the formatter's reply against `output_schema` inside the step
+    that yields its final event, with no way to pass it a context — so the
+    budgets have to be in force for the step itself. `answer_budgets` is set and
+    reset around each `__anext__` and never across a `yield`: the consumer (the
+    pipeline above the gate) runs in its own, untouched context."""
+    iterator = events.__aiter__()
+    while True:
+        with answer_budgets(True):
+            try:
+                event = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
+        yield event
+
+
 class _ContractScan:
     """The contract's field checks on `headline` and `blocks` of ONE formatter
     attempt, run while its JSON streams in.
@@ -936,7 +1378,8 @@ class FormatGate(BaseAgent):
         # which is the ONLY way an AnswerPayload leaves that path. On the deep
         # path there is no draft and the executor's last text is read exactly
         # as before.
-        executor_text = answer_draft(ctx.invocation_id) or _last_executor_text(ctx)
+        draft = answer_draft(ctx.invocation_id)
+        executor_text = draft or _last_executor_text(ctx)
         if not executor_text.strip():
             # A run that produced no executor text (died inside the engine) —
             # nothing to format; emit nothing so the trace shows the failure
@@ -950,9 +1393,31 @@ class FormatGate(BaseAgent):
             return
 
         index = evidence_index(ctx.invocation_id)
+        # What checks 2-3 may ground in beside the capped index. Final here: no
+        # tool runs between the executor and the gate. Never briefed, never emitted.
+        grounding = Grounding(
+            grounding_text(ctx.invocation_id),
+            executor_text,
+            grounding_segments(ctx.invocation_id),
+        )
+        # The deep path's brief opens with the question and the intent. The fast
+        # path's draft already says both, so it adds nothing. Read once, here:
+        # every attempt's brief carries the same two lines.
+        question, intent = ("", None) if draft else brief_context(ctx)
+        # An exploratory or assessment question on the deep path answers as a
+        # rundown (BE-5): same checks, wider word budgets (`answer_budgets`).
+        # Decided once, with the brief's own two inputs; the fast path never is.
+        rundown = not draft and wants_rundown(question, intent)
         set_formatter_brief(
             ctx.invocation_id,
-            compose_brief(executor_text, index, "", provenance(ctx.invocation_id)),
+            compose_brief(
+                executor_text,
+                index,
+                "",
+                provenance(ctx.invocation_id),
+                question=question,
+                intent=intent,
+            ),
         )
         # One per gate run, before any attempt: the index is final here.
         log_cap(ctx.invocation_id, label_of(ctx), index)
@@ -977,14 +1442,15 @@ class FormatGate(BaseAgent):
             run = self.sub_agents[0].run_async(ctx)
             try:
                 async with aclosing(run) if scan is not None else nullcontext(run) as events:
-                    async for event in events:
+                    async for event in _budgeted(events) if rundown else events:
                         delta = (event.actions.state_delta or {}) if event.actions else {}
                         if isinstance(delta.get(ANSWER_STATE_KEY), dict):
                             captured = delta[ANSWER_STATE_KEY]
                         chunk = _streamed_text(event) if scan is not None and not scan.done else ""
                         yield event
                         if chunk:  # scan is not None
-                            feedback = scan.feed(chunk) or ""
+                            with answer_budgets(rundown):
+                                feedback = scan.feed(chunk) or ""
                             if feedback:
                                 # Already rejected: close the run (the model
                                 # call ends `status=error:closed`) and take the
@@ -1016,7 +1482,8 @@ class FormatGate(BaseAgent):
                     feedback = "no AnswerPayload was produced — emit exactly one JSON payload"
                 else:
                     try:
-                        payload = AnswerPayload.model_validate(captured)
+                        with answer_budgets(rundown):
+                            payload = AnswerPayload.model_validate(captured)
                     except ValidationError as exc:
                         # The formatter's LlmAgent normally validates against
                         # `output_schema` and raises inside its own run, which
@@ -1034,7 +1501,7 @@ class FormatGate(BaseAgent):
                         payload, pruned_sources = prune_source_file_ids(
                             payload, index, provenance(ctx.invocation_id)
                         )
-                        problems = gate_problems(payload, index)
+                        problems = gate_problems(payload, index, grounding)
                         if not problems:
                             if repaired:
                                 logger.info(
@@ -1084,7 +1551,14 @@ class FormatGate(BaseAgent):
             set_format_feedback(ctx.invocation_id, feedback)
             set_formatter_brief(
                 ctx.invocation_id,
-                compose_brief(executor_text, index, feedback, provenance(ctx.invocation_id)),
+                compose_brief(
+                    executor_text,
+                    index,
+                    feedback,
+                    provenance(ctx.invocation_id),
+                    question=question,
+                    intent=intent,
+                ),
             )
             yield Event(
                 invocation_id=ctx.invocation_id,

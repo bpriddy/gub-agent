@@ -13,8 +13,20 @@ What the validators enforce (and why here, not in the gate):
 - FILLER — no preamble words (EN + RU) in headline / text / bullets. A filler
   opener survives any downstream check because it is "correct", just useless;
   rejecting it at parse time makes the retry feedback exact.
-- Budgets — headline ≤ 20 words, text block ≤ 60, bullet ≤ 25, ≤ 250 total.
-  Nothing used to bound length at all (#5).
+- Budgets — headline ≤ 20 words, text block ≤ 60, bullet ≤ 25, ≤ 250 total of
+  headline + text + bullets. Follow-ups and assumptions are not in that total
+  (they are the buttons and the caveat, not the answer) but each has a bound of
+  its own, so leaving the total did not leave them unbounded: a follow-up ≤ 20
+  words, an assumption ≤ 40, for every answer. A RUNDOWN — an exploratory or
+  assessment question answered entity by entity — has its own, wider set:
+  bullet ≤ 40, ≤ 450 total (`RUNDOWN_BUDGETS`). Every number in it is at least
+  the standard one, so a payload valid under the standard budgets is valid as a
+  rundown. Which set applies is the format gate's call, not the payload's (see
+  `answer_budgets`). Nothing used to bound length at all (#5).
+- What a rundown does NOT enforce: how many bullets, in how many blocks. The
+  formatter prompt asks for at most 12 bullets in at most 2 bullet blocks, but
+  the contract's own limits (7 per block, 4 blocks, 450 words) are the bound —
+  a thirteenth bullet is not worth three rejected attempts and the template.
 - Table shape — every row exactly as wide as the header. Google Chat renders
   no Markdown tables, so tables only exist as structured blocks the bot can
   turn into cards.
@@ -39,7 +51,10 @@ appear" rather than as a schema error.
 from __future__ import annotations
 
 import re
-from typing import Literal
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -55,7 +70,57 @@ FILLER_RE = re.compile(
 HEADLINE_MAX_WORDS = 20
 TEXT_BLOCK_MAX_WORDS = 60
 BULLET_MAX_WORDS = 25
+# headline + text blocks + bullets. Follow-ups and assumptions are outside it.
 TOTAL_MAX_WORDS = 250
+
+# One follow-up is a button's label and one assumption a one-line caveat: both
+# left the 250 total in BE-5, and this is what keeps them from being unbounded.
+FOLLOW_UP_MAX_WORDS = 20
+ASSUMPTION_MAX_WORDS = 40
+
+# The rundown's (BE-5): one bullet per entity for an exploratory or assessment
+# question. Twelve bullets of 40 words would be 480, so the total binds first:
+# at 12 bullets a bullet averages ~35 words, and the formatter prompt says so.
+# The bullet COUNT is the prompt's to ask for (12) and not policed here.
+RUNDOWN_BULLET_MAX_WORDS = 40
+RUNDOWN_TOTAL_MAX_WORDS = 450
+
+
+class AnswerBudgets(NamedTuple):
+    """The two budgets that differ between a rundown and any other answer.
+    The headline (20), the text block (60), a follow-up and an assumption are
+    the same in both."""
+
+    bullet_words: int
+    total_words: int
+
+
+STANDARD_BUDGETS = AnswerBudgets(BULLET_MAX_WORDS, TOTAL_MAX_WORDS)
+RUNDOWN_BUDGETS = AnswerBudgets(RUNDOWN_BULLET_MAX_WORDS, RUNDOWN_TOTAL_MAX_WORDS)
+
+# The budgets the validators below apply. The payload cannot say which set it
+# is under — it is the QUESTION that decides, and the question is known to the
+# format gate, not to pydantic — and the formatter's `output_schema` is
+# validated by ADK with no context argument. So the gate sets this for exactly
+# the steps that validate (`answer_budgets`), and everything else, including
+# every caller that never heard of rundowns, gets the standard set unchanged.
+# Every rundown budget is at least the standard one, so a validation that misses
+# the setting is too strict, never too loose: a rundown-shaped payload is
+# rejected with the standard budgets' feedback and the formatter retries inside
+# them — today's shape.
+_BUDGETS: ContextVar[AnswerBudgets] = ContextVar("answer_budgets", default=STANDARD_BUDGETS)
+
+
+@contextmanager
+def answer_budgets(rundown: bool) -> Iterator[None]:
+    """Validate under the rundown's budgets (or the standard ones) for the
+    duration of the block. Synchronous and never held across a `yield`: the
+    caller's own context is back before anything else runs."""
+    token = _BUDGETS.set(RUNDOWN_BUDGETS if rundown else STANDARD_BUDGETS)
+    try:
+        yield
+    finally:
+        _BUDGETS.reset(token)
 
 
 def count_words(text: str) -> int:
@@ -114,7 +179,7 @@ class BulletBlock(BaseModel):
     def _items_clean(cls, items: list[str]) -> list[str]:
         for i, item in enumerate(items):
             _reject_filler(item, f"bullet {i}")
-            _reject_over_budget(item, BULLET_MAX_WORDS, f"bullet {i}")
+            _reject_over_budget(item, _BUDGETS.get().bullet_words, f"bullet {i}")
         return items
 
 
@@ -200,6 +265,20 @@ class AnswerPayload(BaseModel):
         _reject_filler(text, "headline")
         return _reject_over_budget(text, HEADLINE_MAX_WORDS, "headline")
 
+    @field_validator("assumptions")
+    @classmethod
+    def _assumptions_bounded(cls, items: list[str]) -> list[str]:
+        for i, item in enumerate(items):
+            _reject_over_budget(item, ASSUMPTION_MAX_WORDS, f"assumption {i}")
+        return items
+
+    @field_validator("follow_ups")
+    @classmethod
+    def _follow_ups_bounded(cls, items: list[str]) -> list[str]:
+        for i, item in enumerate(items):
+            _reject_over_budget(item, FOLLOW_UP_MAX_WORDS, f"follow-up {i}")
+        return items
+
     @model_validator(mode="after")
     def _contract(self) -> AnswerPayload:
         if self.kind == "answer":
@@ -226,6 +305,7 @@ class AnswerPayload(BaseModel):
         if self.candidates and self.kind != "clarify":
             raise ValueError('candidates are for kind="clarify" only')
 
+        budgets = _BUDGETS.get()
         total = count_words(self.headline)
         for block in self.blocks:
             if isinstance(block, TextBlock):
@@ -238,8 +318,13 @@ class AnswerPayload(BaseModel):
             # shrank instead (live 2026-09-16). The budget governs how much
             # the answer SAYS; how many rows it can show is the renderer's
             # limit (Chat: 100 widgets per card), enforced visibly there.
-        total += sum(count_words(a) for a in self.assumptions)
-        total += sum(count_words(f) for f in self.follow_ups)
-        if total > TOTAL_MAX_WORDS:
-            raise ValueError(f"answer is {total} words total, over the {TOTAL_MAX_WORDS} budget")
+        # Follow-ups (2-3 are required) and assumptions (up to 2) are not in
+        # the total either: they are tappable buttons and a caveat, and
+        # counting them took ~20-30 words from every answer's body for text the
+        # reader does not read as the answer. They are bounded one by one
+        # instead (`_follow_ups_bounded`, `_assumptions_bounded`).
+        if total > budgets.total_words:
+            raise ValueError(
+                f"answer is {total} words total, over the {budgets.total_words} budget"
+            )
         return self

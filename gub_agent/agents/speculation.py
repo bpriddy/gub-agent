@@ -63,6 +63,20 @@ state keeps across turns — so the speculative executor is offered exactly what
 a turn with an unreadable decision is offered. When the real decision would
 offer the tool, the speculation is not the run the dispatcher would have made.
 
+Once the speculation is KEPT the fork's state is given the real decision
+(`_Speculation.adopt`): the format gate reads the router's intent for its
+brief, and a kept fork that went on carrying the fallback would brief the
+formatter as if the router had said nothing. That is every kept turn, and with
+SPECULATIVE_FAST_PRECHECK on it includes the fast decisions kept for a
+lookup that would decline. It is the keep rule's own equivalence: a kept run
+is one the real decision would have made, so nothing it has already done
+changes; only what reads the decision from now on sees the real one. A run
+that has already finished composed its brief before the router answered, and
+keeps that one. A fork also stamps its state with the invocation it was cut for
+(`router.FORK_DECISION_KEY`): the decision in a fork is always this turn's,
+fallback or real, and that stamp is how the brief tells it from the previous
+turn's decision a root with no fork still finds in session state.
+
 The executor's request is the same in every path of this root, and it differs
 from SPECULATIVE_DEEP=0 in one content. A fork taken before the router has
 answered cannot hold the router's event, so the speculative executor never
@@ -225,7 +239,13 @@ from .circuit_breaker import reset_tool_budget
 from .evidence_index import reset_evidence_index
 from .formatter import ANSWER_STATE_KEY
 from .round_limiter import reset_rounds
-from .router import ROUTER_STATE_KEY, decision_from, user_text
+from .router import (
+    FORK_DECISION_KEY,
+    ROUTER_STATE_KEY,
+    decision_from,
+    user_text,
+    wrote_decision,
+)
 from .tool_gate import GATED_INTENT
 
 logger = logging.getLogger(__name__)
@@ -321,17 +341,6 @@ async def _declined_before_lookup(ctx: InvocationContext, shim: fp._ToolShim) ->
         return None
 
 
-def _wrote_decision(ctx: InvocationContext) -> bool:
-    """Did anything in THIS invocation commit a router decision to state?"""
-    for event in ctx.session.events:
-        if event.invocation_id != ctx.invocation_id:
-            continue
-        delta = event.actions.state_delta if event.actions else None
-        if ROUTER_STATE_KEY in (delta or {}):
-            return True
-    return False
-
-
 def _decision_of_this_turn(ctx: InvocationContext) -> RouterDecision:
     """`decision_from(ctx)`, unless this turn's router committed nothing.
 
@@ -344,7 +353,7 @@ def _decision_of_this_turn(ctx: InvocationContext) -> RouterDecision:
     `_from_events`), so it is asked alone, and a turn with nothing readable
     gets FALLBACK_DECISION — the deep path — as blend 04's edge table wants.
     """
-    if _wrote_decision(ctx):
+    if wrote_decision(ctx):
         return decision_from(ctx)
     this_turn_only = SimpleNamespace(
         invocation_id=ctx.invocation_id,
@@ -392,6 +401,10 @@ def _fork_session(ctx: InvocationContext, *, decision: RouterDecision, router_na
     snapshots (`_as_yielded`)."""
     state = copy.deepcopy(dict(ctx.session.state))
     state[ROUTER_STATE_KEY] = decision.model_dump(exclude_none=True)
+    # The decision above is this turn's own, fallback or real: a reader of the
+    # fork's state (the format gate's brief) cannot take it for an earlier
+    # turn's (router.decision_is_this_turns).
+    state[FORK_DECISION_KEY] = ctx.invocation_id
     events = [
         event
         for event in ctx.session.events
@@ -540,6 +553,16 @@ class _Speculation:
             "payload_held_ms": held(self.first_payload),
             "run_held_ms": held(self.ended),
         }
+
+    def adopt(self, decision: RouterDecision) -> None:
+        """Keep time: the fork's `state["router_decision"]` becomes the real
+        decision (module docstring). The fork's state is its own dict, so this
+        never reaches the real session, whose router event already committed
+        the same decision through the router's output_key.
+
+        Called for a run that is kept, never for one thrown away; a restarted
+        run is forked with the decision already in place."""
+        self.session.state[ROUTER_STATE_KEY] = decision.model_dump(exclude_none=True)
 
     @property
     def done(self) -> bool:
@@ -698,6 +721,7 @@ class SpeculativeDispatch(BaseAgent):
             if branch == dp.DEEP:
                 reason = _stale_reason(decision)
                 if reason is None:
+                    run.adopt(decision)
                     _log_outcome(ctx, "kept", at_decision, hold)
                     logged = True
                     async with aclosing(run.relay()) as events:
@@ -735,6 +759,7 @@ class SpeculativeDispatch(BaseAgent):
                 shim = fp._ToolShim(ctx)
                 precheck = await _declined_before_lookup(ctx, shim)
                 if precheck is not None:
+                    run.adopt(decision)
                     _log_outcome(ctx, "kept", at_decision, hold)
                     logged = True
                     dp.log_fast_path_declined(ctx)
@@ -764,6 +789,7 @@ class SpeculativeDispatch(BaseAgent):
             finally:
                 reuse = declined and run.reusable and _stale_reason(decision) is None
                 if reuse:
+                    run.adopt(decision)
                     result = "kept"
                 else:
                     result = "restarted:fast_declined" if declined else f"cancelled:{dp.FAST}"

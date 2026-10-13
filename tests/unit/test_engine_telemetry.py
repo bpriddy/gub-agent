@@ -124,11 +124,16 @@ def test_cap_line_counts_what_the_cap_refused_by_tool_sorted(monkeypatch, caplog
     # loses both fields (2); row 4 loses entity + both fields (3); the
     # response-level `total` loses 1  =>  org_query 6.
     record_evidence(_tool("org_query"), {}, ctx, {"results": rows, "total": 5})
-    # Full: a detail row (entity + 3 fields) loses 4; an overview row loses 2.
+    # Full: a stub row (entity + 3 fields) loses 4; another loses 2. Stubs only —
+    # a DETAIL row would evict stub field rows instead of being refused (BE-2;
+    # tests/unit/test_evidence_priority.py counts that).
     record_evidence(
-        _tool("get_campaign"), {}, ctx, {"id": "c", "name": "x", "status": "y", "budget": 1}
+        _tool("list_accounts"),
+        {},
+        ctx,
+        {"accounts": [{"id": "c", "name": "x", "status": "y", "budget": 1}]},
     )
-    record_evidence(_tool("get_account_overview"), {}, ctx, {"id": "a", "name": "z"})
+    record_evidence(_tool("list_ideas"), {}, ctx, {"ideas": [{"id": "a", "name": "z"}]})
 
     with caplog.at_level(logging.INFO, logger=EVIDENCE_LOGGER):
         log_cap("inv-cap", "chevy", evidence_index("inv-cap"))
@@ -136,7 +141,7 @@ def test_cap_line_counts_what_the_cap_refused_by_tool_sorted(monkeypatch, caplog
     [line] = _lines(caplog, "evidence_index: cap")
     assert line.getMessage() == (
         "evidence_index: cap kept=10 dropped=12"
-        " dropped_by_tool=get_account_overview:2,get_campaign:4,org_query:6"
+        " dropped_by_tool=list_accounts:4,list_ideas:2,org_query:6"
         " inv=inv-cap tenant=chevy"
     )
 

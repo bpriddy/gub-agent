@@ -8,7 +8,8 @@ renders. It never retrieves and never adds facts.
 Two wiring choices worth their comments:
 
 - `include_contents="none"` + a before_model_callback that REPLACES the
-  request contents with one user message (the "brief": executor answer,
+  request contents with one user message (the "brief": the reader's question
+  and the router's intent on the deep path, the executor answer,
   ALLOWED_EVIDENCE ids and values, any retry feedback — composed by the format
   gate, carried in `evidence_index.py`'s per-invocation store). The formatter
   therefore sees exactly its inputs, never the whole transcript — cheaper, and
