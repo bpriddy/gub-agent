@@ -139,9 +139,8 @@ def strip_source_metadata(callback_context: Any, llm_request: Any) -> None:
     `_cited` and `_sourcesTotal` — the bot's source chips, its [n] list and the
     blend-08 names — wherever an event is serialised after the next round
     starts (a kept SPECULATIVE_DEEP run's held events; InMemorySessionService,
-    which stores the object itself). The deploy's requirements.txt does not
-    pin google-adk, so this writes to nothing it does not own, whatever the
-    installed ADK copies."""
+    which stores the object itself). This writes to nothing it does not own,
+    whatever the installed ADK copies."""
     contents = llm_request.contents or []
     masked: list[Any] = []
     changed = False
@@ -201,12 +200,13 @@ def strip_prior_turn_tool_parts(callback_context: Any, llm_request: Any) -> None
 #          did, quoted between <<<BEGIN_QUOTED_AGENT_CONTENT>>> and ..." and
 #          runs on for several sentences.
 #
-# `google-adk` is UNPINNED (pyproject: >=1.0.0), so CI and the deploy install
-# whatever is newest at build time — this repo has already been burned by that
-# once, when a rebuild flipped stream_query to camelCase and the bot's readers
-# went blind. An exact-equality check against 2.6.1's wording matched NOTHING
-# on 2.9.2, which would have shipped a window counting 40 boundaries where
-# there are 8 real turns.
+# `google-adk` is now pinned exactly (pyproject.toml and requirements.txt,
+# kept equal by tests/unit/test_adk_pin.py), but it used to float, so CI and
+# the deploy installed whatever was newest at build time — this repo was burned
+# by that once, when a rebuild flipped stream_query to camelCase and the bot's
+# readers went blind. An exact-equality check against 2.6.1's wording matched
+# NOTHING on 2.9.2, which would have shipped a window counting 40 boundaries
+# where there are 8 real turns.
 #
 # Prefix-matching also fails in the SAFE direction if it ever over-matches. A
 # false positive (a reader genuinely opening a message with "For context:")

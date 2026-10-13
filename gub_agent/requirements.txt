@@ -1,4 +1,10 @@
-google-adk>=1.0.0
+# google-adk is pinned EXACTLY, and the pin must equal pyproject.toml's (a unit
+# test asserts it). `adk deploy agent_engine` appends
+# `google-adk[a2a]==<its own version>` to this file when it stages the build,
+# and that CLI is installed from pyproject, so any other pin here makes the two
+# requirements unsatisfiable. 2.9.2 is also what the production engine's most
+# recent build installed.
+google-adk==2.9.2
 # Anthropic on Vertex — the sandbox's Claude arms (gub_agent/models.py). ADK imports it lazily.
 anthropic[vertex]>=0.43.0
 httpx[http2]>=0.27.0
