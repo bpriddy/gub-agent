@@ -68,6 +68,7 @@ from .. import config
 from ..config import FORMAT_GATE_EARLY_ABORT
 from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
 from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS
+from ..schemas.router import FALLBACK_DECISION
 from ..tenant import label_of
 from .critic import _last_executor_text
 from .evidence_index import (
@@ -84,6 +85,7 @@ from .evidence_index import (
     set_formatter_brief,
 )
 from .formatter import ANSWER_STATE_KEY, FORMATTER_NAME, formatter_agent
+from .router import decision_from, user_text
 
 logger = logging.getLogger(__name__)
 
@@ -562,14 +564,61 @@ _SOURCE_RULE = """- A `sources:` line sits under an ENTITY row (`<tool>:<id> = {
 # a handful. Over-listing buys nothing a reader can use.
 MAX_BRIEF_SOURCE_IDS = 8
 
+# How much of the reader's question the brief carries. The question is context
+# for the answer's SHAPE, never evidence, and the brief is re-sent on every
+# formatter attempt: a sentence or two is the whole of a normal question, and a
+# pasted document in the message must not triple the brief.
+MAX_BRIEF_QUESTION_CHARS = 600
+
+
+def _question_line(question: str) -> str:
+    """The question on ONE line, capped: the brief is line-structured."""
+    text = " ".join(question.split())
+    if len(text) > MAX_BRIEF_QUESTION_CHARS:
+        text = text[: MAX_BRIEF_QUESTION_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def brief_context(ctx: InvocationContext) -> tuple[str, str | None]:
+    """What the DEEP path's brief says about the turn beside the executor's
+    answer: the reader's question and the router's intent label.
+
+    The intent is None unless the router's decision is a real one. The
+    fallback (`exploratory` at confidence 0) is what an unreadable decision
+    costs, and a speculative fork carries it until its keep
+    (`speculation._Speculation.adopt`): "exploratory" in the brief would then
+    be a guess presented as a classification, and a later intent-aware rule
+    would shape a FACT question as an exploration. No label says "unknown";
+    the question text is what such a rule falls back on.
+
+    Read without logging: the dispatcher already wrote the line for a decision
+    it could not read, and a second reader would double that count.
+    """
+    decision = decision_from(ctx, log=False)
+    return user_text(ctx), (None if decision == FALLBACK_DECISION else decision.intent)
+
 
 def compose_brief(
     executor_text: str,
     index: dict[str, dict],
     feedback: str,
     prov: dict[str, list[str]] | None = None,
+    *,
+    question: str = "",
+    intent: str | None = None,
 ) -> str:
-    lines = [
+    """The formatter's whole input. `question` and `intent` are the deep
+    path's; the fast path's draft (the `executor_text` it passes) already opens
+    with its own `QUESTION:` and `intent=`, so it passes neither. Without them
+    the brief is byte for byte what it was before they existed."""
+    lines = []
+    if question.strip():
+        lines.append(f"QUESTION: {_question_line(question)}")
+    if intent:
+        lines.append(f"INTENT: {intent}")
+    if lines:
+        lines.append("")
+    lines += [
         "EXECUTOR ANSWER (render this — do not add facts):",
         executor_text.strip(),
         "",
@@ -1046,7 +1095,8 @@ class FormatGate(BaseAgent):
         # which is the ONLY way an AnswerPayload leaves that path. On the deep
         # path there is no draft and the executor's last text is read exactly
         # as before.
-        executor_text = answer_draft(ctx.invocation_id) or _last_executor_text(ctx)
+        draft = answer_draft(ctx.invocation_id)
+        executor_text = draft or _last_executor_text(ctx)
         if not executor_text.strip():
             # A run that produced no executor text (died inside the engine) —
             # nothing to format; emit nothing so the trace shows the failure
@@ -1063,9 +1113,20 @@ class FormatGate(BaseAgent):
         # What checks 2-3 may ground in beside the capped index. Final here: no
         # tool runs between the executor and the gate. Never briefed, never emitted.
         grounding = Grounding(grounding_text(ctx.invocation_id), executor_text)
+        # The deep path's brief opens with the question and the intent. The fast
+        # path's draft already says both, so it adds nothing. Read once, here:
+        # every attempt's brief carries the same two lines.
+        question, intent = ("", None) if draft else brief_context(ctx)
         set_formatter_brief(
             ctx.invocation_id,
-            compose_brief(executor_text, index, "", provenance(ctx.invocation_id)),
+            compose_brief(
+                executor_text,
+                index,
+                "",
+                provenance(ctx.invocation_id),
+                question=question,
+                intent=intent,
+            ),
         )
         # One per gate run, before any attempt: the index is final here.
         log_cap(ctx.invocation_id, label_of(ctx), index)
@@ -1197,7 +1258,14 @@ class FormatGate(BaseAgent):
             set_format_feedback(ctx.invocation_id, feedback)
             set_formatter_brief(
                 ctx.invocation_id,
-                compose_brief(executor_text, index, feedback, provenance(ctx.invocation_id)),
+                compose_brief(
+                    executor_text,
+                    index,
+                    feedback,
+                    provenance(ctx.invocation_id),
+                    question=question,
+                    intent=intent,
+                ),
             )
             yield Event(
                 invocation_id=ctx.invocation_id,

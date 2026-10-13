@@ -153,7 +153,7 @@ def _from_events(ctx: InvocationContext) -> Any:
     return None
 
 
-def decision_from(ctx: InvocationContext) -> RouterDecision:
+def decision_from(ctx: InvocationContext, *, log: bool = True) -> RouterDecision:
     """This turn's RouterDecision — from `state["router_decision"]`, else the
     router's event text, else the fallback.
 
@@ -161,6 +161,10 @@ def decision_from(ctx: InvocationContext) -> RouterDecision:
     (blend 04's edge table): `FALLBACK_DECISION` is `exploratory` at
     confidence 0, which every branch in the dispatcher reads as "the executor
     handles this".
+
+    `log=False` is for a second reader of the same turn (the format gate's
+    brief): the dispatcher already wrote the line for an unreadable decision,
+    and one per reader would double a count the logs are read by.
     """
     raw: Any = None
     state = getattr(getattr(ctx, "session", None), "state", None)
@@ -172,7 +176,8 @@ def decision_from(ctx: InvocationContext) -> RouterDecision:
     if raw is None:
         raw = _from_events(ctx)
     if raw is None:
-        logger.info("router: no decision for inv=%s — deep path", ctx.invocation_id)
+        if log:
+            logger.info("router: no decision for inv=%s — deep path", ctx.invocation_id)
         return FALLBACK_DECISION
     if isinstance(raw, RouterDecision):
         return raw
@@ -180,12 +185,14 @@ def decision_from(ctx: InvocationContext) -> RouterDecision:
         try:
             raw = json.loads(raw)
         except ValueError:
-            logger.warning("router: decision is not JSON — deep path")
+            if log:
+                logger.warning("router: decision is not JSON — deep path")
             return FALLBACK_DECISION
     try:
         return RouterDecision.model_validate(raw)
     except ValidationError as exc:
-        logger.warning("router: decision failed validation (%s) — deep path", exc.error_count())
+        if log:
+            logger.warning("router: decision failed validation (%s) — deep path", exc.error_count())
         return FALLBACK_DECISION
 
 
