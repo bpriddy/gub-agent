@@ -8,11 +8,17 @@ stubs), then four to six `get_campaign` calls in the last round — so the broad
 read filled the index and the detail rows, which carry `statusMarkdown`, were
 refused. Pinned here:
 
-  * a DETAIL entry (the top-level row of a detail tool, a campaign's pieces, the
-    rows of `get_piece`, nested status text) evicts the OLDEST stub FIELD row
-    when the index is full, and is refused only when none is left;
+  * a DETAIL entry (the top-level row of a detail tool, the rows of `get_piece`,
+    nested status text) evicts the OLDEST stub FIELD row when the index is full,
+    and is refused only when none is left; a MEMBER entry (a profile's metadata)
+    does the same, and its field rows go only after every stub field row;
+  * a campaign's `pieces` are STUBS (the tool contract: no status), so a
+    piece-heavy campaign cannot starve a later detail row, and their loss is
+    counted as `get_campaign.pieces`, never as `get_campaign`;
   * a stub row is still first-come, never evicts, and its whole-entity row is
     never evicted;
+  * when the room runs out part way through a detail row, the status text is
+    what is kept;
   * the BE-1 cap line stays true: an evicted stub is dropped for ITS tool, and
     `kept` is the post-eviction size;
   * the rows event is the post-eviction index, in index order, in its old shape;
@@ -197,39 +203,282 @@ def test_the_overview_lists_stubs_but_its_account_row_is_detail(monkeypatch):
     assert dropped_by_tool("inv-p") == {"get_account_overview": 4}
 
 
-def test_a_campaigns_pieces_are_admitted_with_it_but_stay_evictable(monkeypatch):
+def test_a_campaigns_pieces_are_stubs_that_never_take_a_slot_from_a_detail_row(monkeypatch):
     ctx = _start(monkeypatch, 12)
     record_evidence(_tool("org_query"), {}, ctx, {"results": _stub_rows(4)})  # 12: full
 
-    # A campaign and one piece stub: 4 entries. A refusal here would show up as a
-    # `get_campaign` loss on every turn whose campaign has pieces.
     record_evidence(
         _tool("get_campaign"),
         {},
         ctx,
-        {"id": "c1", "name": "C1", "pieces": [{"id": "p1", "name": "Spot"}]},
+        {"id": "c1", "name": "C1", "status": "live", "pieces": [{"id": "p1", "name": "Spot"}]},
     )
+
     index = evidence_index("inv-p")
-    assert all(f"get_campaign:{k}" in index for k in ("c1", "c1:name", "p1", "p1:name"))
+    # The campaign got in by evicting three stub fields; its piece is a stub at a
+    # full index, so it is refused whole — and counted under its own label.
+    assert all(f"get_campaign:c1{k}" in index for k in ("", ":name", ":status"))
+    assert not any(k.startswith("get_campaign:p1") for k in index)
+    assert dropped_by_tool("inv-p") == {"get_campaign.pieces": 2, "org_query": 3}
     assert "get_campaign" not in dropped_by_tool("inv-p")
 
-    # The next detail row takes the older org_query stub fields first…
-    record_evidence(_tool("get_campaign"), {}, ctx, {"id": "c2", "a": "1", "b": "2", "c": "3"})
-    index = evidence_index("inv-p")
-    assert not any(k.startswith("org_query:r") and k.count(":") == 2 for k in index)
-    assert "get_campaign:p1:name" in index
-    assert "get_campaign:c2:c" in index
 
-    # …and only when none is left does it take the piece's field row. The piece's
-    # entity row and the campaign's own fields stay (the last field is refused).
-    record_evidence(_tool("get_campaign"), {}, ctx, {"id": "c3", "x": "1"})
+def test_an_evicted_piece_field_row_is_counted_as_a_piece_loss_not_a_campaign_loss(monkeypatch):
+    ctx = _start(monkeypatch, 10)
+    record_evidence(
+        _tool("get_campaign"),
+        {},
+        ctx,
+        {
+            "id": "c1",
+            "name": "C1",
+            "status": "live",
+            "pieces": [{"id": "p1", "name": "A"}, {"id": "p2", "name": "B"}],
+        },
+    )  # 3 + 2 + 2 = 7
+    record_evidence(_tool("org_query"), {}, ctx, {"results": [{"id": "s", "x": "1"}], "total": 1})
+    assert len(evidence_index("inv-p")) == 10
+
+    record_evidence(_tool("get_campaign"), {}, ctx, {"id": "c2", "a": "1", "b": "2"})
+
     index = evidence_index("inv-p")
-    assert "get_campaign:p1:name" not in index
-    assert "get_campaign:p1" in index
-    assert "get_campaign:c1:name" in index
-    assert "get_campaign:c3" in index
-    assert "get_campaign:c3:x" not in index
-    assert dropped_by_tool("inv-p") == {"get_campaign": 2, "org_query": 8}
+    # Oldest stub field rows first: the two pieces' names, then the org_query one.
+    assert "get_campaign:p1" in index and "get_campaign:p1:name" not in index
+    assert "get_campaign:p2:name" not in index and "org_query:s:x" not in index
+    assert all(f"get_campaign:c2{k}" in index for k in ("", ":a", ":b"))
+    assert dropped_by_tool("inv-p") == {"get_campaign.pieces": 2, "org_query": 1}
+
+
+def _overview(n_campaigns: int = 47) -> dict:
+    return {
+        "id": "acct",
+        "name": "Chevy",
+        "status": "active",
+        "campaigns": [
+            {
+                "id": f"ov{i}",
+                "accountId": "acct",
+                "name": f"Campaign {i}",
+                "status": "live",
+                "budget": 1000 + i,
+                "startsAt": "2026-01-01",
+                "endsAt": "2026-12-31",
+                "createdAt": "2025-01-01",
+                "updatedAt": "2026-09-01",
+            }
+            for i in range(n_campaigns)
+        ],
+    }
+
+
+def _campaign(n: int, pieces: int) -> dict:
+    return {
+        "id": f"cmp{n}",
+        "accountId": "acct",
+        "name": f"Detail {n}",
+        "status": "live",
+        "budget": 5000 + n,
+        "startsAt": "2026-01-01",
+        "endsAt": "2026-12-31",
+        "createdAt": "2025-01-01",
+        "updatedAt": "2026-09-01",
+        "statusMarkdown": f"Narrative {n}. [src: 1File{n}]",
+        "pieces": [
+            {
+                "id": f"cmp{n}-p{i}",
+                "name": f"Spot {i}",
+                "jobNumber": f"J{i}",
+                "startsAt": "2026-02-01",
+                "endsAt": "2026-03-01",
+            }
+            for i in range(pieces)
+        ],
+    }
+
+
+def _assert_every_detail_row_is_in(index: dict, dropped: dict, campaigns: int, pieces: int) -> None:
+    for n in range(campaigns):
+        key = f"get_campaign:cmp{n}"
+        assert index[f"{key}:statusMarkdown"]["value"] == f"Narrative {n}. [src: 1File{n}]", key
+        assert index[f"{key}:budget"]["value"] == str(5000 + n), key
+    for n in range(5):
+        assert index[f"get_piece:pc{n}:statusMarkdown"]["value"] == f"Piece {n} shipped."
+        assert f"get_piece:parent{n}:name" in index
+    assert "get_campaign" not in dropped and "get_piece" not in dropped, dropped
+    assert len(index) <= MAX_ENTRIES
+
+
+@pytest.mark.parametrize("pieces", [0, 40, 70])
+def test_piece_heavy_campaigns_after_a_big_overview_never_starve_a_later_detail_row(pieces):
+    """The turn shape that motivated BE-2, with every campaign listing its
+    pieces: an overview of 47 campaign stubs, six campaign details, five
+    `get_piece` calls. Every status text and every piece row must be indexed."""
+    ctx = SimpleNamespace(invocation_id=f"inv-heavy-{pieces}")
+    reset_evidence_index(ctx)
+    record_evidence(_tool("get_account_overview"), {}, ctx, _overview())
+    for n in range(6):
+        record_evidence(_tool("get_campaign"), {}, ctx, _campaign(n, pieces))
+    for n in range(5):
+        record_evidence(
+            _tool("get_piece"),
+            {},
+            ctx,
+            {
+                "piece": {
+                    "id": f"pc{n}",
+                    "name": f"Piece {n}",
+                    "statusMarkdown": f"Piece {n} shipped.",
+                },
+                "campaign": {"id": f"parent{n}", "name": f"Parent {n}"},
+            },
+        )
+    _assert_every_detail_row_is_in(
+        evidence_index(ctx.invocation_id), dropped_by_tool(ctx.invocation_id), 6, pieces
+    )
+
+
+def test_piece_heavy_campaigns_from_an_empty_index_keep_every_status_text():
+    """The index is not full when the first campaign arrives, so its 70 pieces ARE
+    admitted (stubs are first-come). The later campaigns' details must still get
+    in: a piece's whole-entity row is the only thing that stays."""
+    ctx = SimpleNamespace(invocation_id="inv-heavy-empty")
+    reset_evidence_index(ctx)
+    for n in range(6):
+        record_evidence(_tool("get_campaign"), {}, ctx, _campaign(n, 70))
+    index = evidence_index("inv-heavy-empty")
+    for n in range(6):
+        assert index[f"get_campaign:cmp{n}:statusMarkdown"]["source_file_ids"] == [f"1File{n}"]
+    assert "get_campaign" not in dropped_by_tool("inv-heavy-empty")
+    assert len(index) == MAX_ENTRIES
+
+
+# ── members: a profile's metadata ────────────────────────────────────────────
+
+
+def _profile(metadata: list[dict]) -> dict:
+    return {"id": "s1", "name": "Ada", "title": "Director", "metadata": metadata}
+
+
+def test_a_staff_profile_is_a_detail_row_and_its_metadata_are_admitted_with_it(monkeypatch):
+    ctx = _start(monkeypatch, 12)
+    record_evidence(_tool("org_query"), {}, ctx, {"results": _stub_rows(4)})  # 12: full
+
+    record_evidence(
+        _tool("get_staff_profile"),
+        {},
+        ctx,
+        _profile([{"id": "m1", "label": "Brand Strategy", "type": "skill"}]),
+    )
+
+    index = evidence_index("inv-p")
+    for key in (
+        "get_staff_profile:s1",
+        "get_staff_profile:s1:name",
+        "get_staff_profile:s1:title",
+        "get_staff_profile:m1",
+        "get_staff_profile:m1:label",
+        "get_staff_profile:m1:type",
+    ):
+        assert key in index, key
+    assert index["get_staff_profile:m1:label"]["value"] == "Brand Strategy"
+    assert len(index) == 12
+    # Six oldest stub fields made room; the profile and its metadata lost nothing.
+    assert dropped_by_tool("inv-p") == {"org_query": 6}
+
+
+def test_member_field_rows_are_evicted_only_after_every_stub_field_row(monkeypatch):
+    """The member is OLDER than the stubs below it. A single FIFO would evict the
+    member's fields first; the contract is stubs first, whatever their age."""
+    ctx = _start(monkeypatch, 12)
+    record_evidence(
+        _tool("get_staff_profile"),
+        {},
+        ctx,
+        _profile([{"id": "m1", "label": "Brand Strategy", "type": "skill"}]),
+    )  # 3 + 3 = 6
+    record_evidence(_tool("org_query"), {}, ctx, {"results": _stub_rows(2)})  # +6 = 12: full
+
+    record_evidence(
+        _tool("get_campaign"), {}, ctx, {"id": "c", "name": "C", "status": "live", "budget": 1}
+    )  # entity + 3 fields = 4 entries
+
+    index = evidence_index("inv-p")
+    assert "get_staff_profile:m1:label" in index and "get_staff_profile:m1:type" in index
+    assert not any(k.startswith("org_query:r") and k.count(":") == 2 for k in index)
+    assert dropped_by_tool("inv-p") == {"org_query": 4}
+
+    # Only when no stub field is left does the next detail row take a member field.
+    record_evidence(_tool("get_campaign"), {}, ctx, {"id": "d", "a": "1", "b": "2"})
+
+    index = evidence_index("inv-p")
+    assert "get_staff_profile:m1" in index  # the member's entity row never goes
+    assert "get_staff_profile:m1:label" not in index
+    assert "get_staff_profile:m1:type" not in index
+    assert "get_campaign:d:a" in index and "get_campaign:d:b" not in index
+    # A member loss is the profile's own list, never the profile or a campaign…
+    assert dropped_by_tool("inv-p") == {
+        "get_campaign": 1,
+        "get_staff_profile.metadata": 2,
+        "org_query": 4,
+    }
+
+
+def test_get_idea_is_a_stub_tool_not_a_detail_tool(monkeypatch):
+    ctx = _start(monkeypatch, 4)
+    record_evidence(_tool("org_query"), {}, ctx, {"results": _stub_rows(1), "total": 1})  # 4: full
+    before = list(evidence_index("inv-p"))
+
+    record_evidence(_tool("get_idea"), {}, ctx, {"id": "i", "name": "Big idea"})
+
+    assert list(evidence_index("inv-p")) == before
+    assert dropped_by_tool("inv-p") == {"get_idea": 2}
+
+
+# ── status text before metadata ──────────────────────────────────────────────
+
+
+def test_when_the_room_runs_out_mid_row_the_status_text_is_kept_and_the_metadata_refused(
+    monkeypatch,
+):
+    ctx = _start(monkeypatch, 12)
+    # Nine entity-only stubs: nothing in the index is evictable, three slots free.
+    record_evidence(_tool("org_query"), {}, ctx, {"results": [{"id": f"e{i}"} for i in range(9)]})
+    assert len(evidence_index("inv-p")) == 9
+
+    record_evidence(_tool("get_campaign"), {}, ctx, _campaign(0, 0))
+
+    index = evidence_index("inv-p")
+    assert "get_campaign:cmp0" in index
+    assert index["get_campaign:cmp0:statusMarkdown"]["source_file_ids"] == ["1File0"]
+    # The first wire-order scalar fills the last slot; the rest is refused.
+    assert "get_campaign:cmp0:accountId" in index
+    assert "get_campaign:cmp0:createdAt" not in index
+    assert "get_campaign:cmp0:updatedAt" not in index
+    assert dropped_by_tool("inv-p") == {"get_campaign": 7}
+
+
+def test_the_accounts_nested_status_is_admitted_before_its_scalars(monkeypatch):
+    ctx = _start(monkeypatch, 6)
+    record_evidence(_tool("org_query"), {}, ctx, {"results": [{"id": f"e{i}"} for i in range(4)]})
+
+    record_evidence(
+        _tool("get_account_overview"),
+        {},
+        ctx,
+        {
+            "id": "acct",
+            "name": "Chevy",
+            "status": "active",
+            "currentState": {"status_markdown": "Leads. [src: 1Doc]"},
+        },
+    )
+
+    index = evidence_index("inv-p")
+    assert index["get_account_overview:acct:currentState.status_markdown"]["value"] == (
+        "Leads. [src: 1Doc]"
+    )
+    assert "get_account_overview:acct:name" not in index
+    assert dropped_by_tool("inv-p") == {"get_account_overview": 2}
 
 
 # ── what counts as a detail row ───────────────────────────────────────────────
@@ -321,6 +570,28 @@ def test_eviction_does_not_touch_provenance(monkeypatch):
     index = evidence_index("inv-p")
     assert "org_query:s:statusMarkdown" not in index
     assert provenance("inv-p")["s"] == ["1StubFile"]
+
+
+def test_provenance_records_get_piece_rows_even_when_the_cap_refuses_them(monkeypatch):
+    ctx = _start(monkeypatch, 3)
+    # Three entity-only stubs: the index is full and nothing in it is evictable.
+    record_evidence(_tool("org_query"), {}, ctx, {"results": [{"id": c} for c in "abc"]})
+
+    record_evidence(
+        _tool("get_piece"),
+        {},
+        ctx,
+        {
+            "piece": {"id": "p1", "statusMarkdown": "Shipped. [src: 1PieceDoc]"},
+            "campaign": {"id": "c1", "statusMarkdown": "Live. [src: 1CampaignDoc]"},
+        },
+    )
+
+    assert not any(k.startswith("get_piece") for k in evidence_index("inv-p"))
+    assert dropped_by_tool("inv-p") == {"get_piece": 4}
+    # The index lost the rows; the sources did not go with them.
+    assert provenance("inv-p")["p1"] == ["1PieceDoc"]
+    assert provenance("inv-p")["c1"] == ["1CampaignDoc"]
 
 
 # ── the cap line and the rows event ──────────────────────────────────────────
