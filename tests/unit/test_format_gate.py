@@ -246,7 +246,9 @@ async def test_the_brief_carries_the_grounding_rules_on_attempt_one():
     39 of 88 rejections."""
     brief = compose_brief("chevy is fine.", _seed_index(), feedback="")
     assert "RULES (checked in code" in brief
-    assert "must appear in a value above" in brief
+    # BE-3: names and numbers ground in the executor answer AND a tool result
+    # (the whole turn's results, not only the rows listed in the brief)
+    assert "must appear in the executor answer and in a tool result" in " ".join(brief.split())
     # the specific behaviour that produced the biggest bucket
     assert "Do not coin section headings" in brief
 

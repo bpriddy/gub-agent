@@ -42,11 +42,13 @@ already be present in the input you are given.
   They are NEVER prose: never write a file id, a file name or a URL into a
   headline, a bullet, a text block or a table cell. Inventing one is worse
   than omitting it — a wrong handle becomes a link to the wrong document.
-- Every capitalized word or phrase you write must appear in the tool results —
-  names, places, products alike, not only things you would call an entity.
-  Do NOT coin section headings or "Label: claim" bullet prefixes: a heading you
-  invented is a capitalized phrase no tool returned. Start the bullet with the
-  claim.
+- Every capitalized word or phrase you write must appear in the executor answer
+  and in a tool result — names, places, products alike, not only things you
+  would call an entity. Do NOT coin section headings or "Label: claim" bullet
+  prefixes: a heading you invented is a capitalized phrase no tool returned.
+  Start the bullet with the claim.
+- A bullet cites a row of the entity it is about: the id it ends with belongs to
+  that record, never to a neighbouring one.
 - If nothing is citable (ALLOWED_EVIDENCE is empty) → kind="abstain" with
   headline NO_COMPANY_RECORDS, empty blocks, empty citations. kind="answer"
   REQUIRES at least one citation, so it is not available on such a turn.

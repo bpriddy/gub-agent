@@ -9,8 +9,9 @@ Every tool result the executor receives is broken into addressable rows:
 
 The formatter may cite ONLY these ids; the format gate verifies
 `citations ⊆ index` and grounds every number and entity name in the answer
-against the indexed values (`agents/format_gate.py`). This is "GROUND EVERY
-ENTITY" moved from prompt prose into code.
+against the indexed values (`agents/format_gate.py`) and, for what the cap left
+out, the grounding store below. This is "GROUND EVERY ENTITY" moved from prompt
+prose into code.
 
 State lives in an in-process dict keyed on invocation_id — flat
 `callback_context.state` writes do not survive between calls (see the
@@ -38,6 +39,17 @@ stays, so the entity is still named) and is refused only when none is left. A
 stub, and a response-level scalar, is first-come as before. So an overview read
 before the detail fetches cannot starve them, whatever the order of the turn.
 `_PROVENANCE` is separate and uncapped.
+
+THE GROUNDING STORE (`_GROUNDING`) is a second, uncapped, per-pass store beside
+the capped index: every scalar and every nested status text of every tool
+result of the pass, whatever the cap did to it (a refused row, a nested
+`currentState` text, a bare `find` list the index never reads). It exists for
+the gate's checks 2-3 (numbers, capitalised runs) and for nothing else: it is
+never put in the brief, never emitted, and never citable, so `citations ⊆ index`
+still means the capped index. Why it exists: the brief carries ~400 entries, the
+executor writes from everything it retrieved, and a rule that grounds the final
+answer in the 400 alone makes whatever the cap did not admit unwritable. Reset
+with the index.
 
 The gate's retry feedback travels the same way (`set_format_feedback` /
 `take_format_feedback`): it also goes out as a `state_delta` event for trace
@@ -127,6 +139,10 @@ _DROPPED: OrderedDict[str, dict[str, int]] = OrderedDict()
 # used as an ordered set): the rows a detail entry may evict when the index is
 # full. Reset with the index.
 _STUBS: OrderedDict[str, dict[str, None]] = OrderedDict()
+# Every scalar / nested status text of every tool result this invocation's pass
+# retrieved, as an ordered set of the distinct strings (UNCAPPED; see the module
+# docstring). Read only through `grounding_text`. Reset with the index.
+_GROUNDING: OrderedDict[str, dict[str, None]] = OrderedDict()
 _MAX_TRACKED = 256
 
 
@@ -153,6 +169,7 @@ def reset_evidence_index(callback_context: Any) -> None:
     _DRAFT.pop(invocation_id, None)
     _DROPPED.pop(invocation_id, None)
     _STUBS.pop(invocation_id, None)
+    _GROUNDING.pop(invocation_id, None)
     return None
 
 
@@ -317,6 +334,14 @@ def provenance(invocation_id: str) -> dict[str, list[str]]:
     return _PROVENANCE.get(invocation_id, {})
 
 
+def grounding_text(invocation_id: str) -> str:
+    """The grounding store as ONE lower-cased text, one distinct value per line
+    ('' when no tool result has been recorded). For the gate's checks 2-3 and
+    nothing else: never put it in a brief, an event or a log line, and never let
+    a citation resolve against it — the citable evidence is `evidence_index`."""
+    return "\n".join(_GROUNDING.get(invocation_id, {})).lower()
+
+
 def entry_source_ids(entry: dict[str, Any], prov: dict[str, list[str]]) -> list[str]:
     """The file ids a fact citing this entry may carry: the entry's own, then
     its entity's (any tool, any row, cap or no cap). Deduped, order kept."""
@@ -376,17 +401,25 @@ def answer_draft(invocation_id: str) -> str:
 
 
 def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any) -> None:
-    """ADK after_tool_callback on the executor: index this result's rows.
-    Returns None so the tool response passes through unmodified."""
+    """ADK after_tool_callback on the executor: index this result's rows and
+    record it in the grounding store. Returns None so the tool response passes
+    through unmodified."""
     invocation_id = getattr(tool_context, "invocation_id", "") or "?"
+    if isinstance(tool_response, (list, tuple)):
+        # A bare array (`find`'s hits): the index does not read one, but it is a
+        # tool result the executor wrote from, so the grounding store takes it
+        # wrapped, as ADK wraps it for the model.
+        _record_grounding({"result": tool_response}, _bucket(_GROUNDING, invocation_id, {}))
+        return None
     if not isinstance(tool_response, dict):
         return None
     index = _bucket(_INDEX, invocation_id, {})
     prov = _bucket(_PROVENANCE, invocation_id, {})
     tool_name = getattr(tool, "name", None) or str(tool)
-    # Provenance BEFORE the index, over every row: it must not depend on
-    # whether the row survives MAX_ENTRIES.
+    # Provenance and the grounding store BEFORE the index, over every row: they
+    # must not depend on whether the row survives MAX_ENTRIES.
     _record_provenance(tool_response, prov)
+    _record_grounding(tool_response, _bucket(_GROUNDING, invocation_id, {}))
     _index_response(
         tool_name,
         tool_response,
@@ -490,6 +523,49 @@ def _record_provenance(response: dict[str, Any], prov: dict[str, list[str]]) -> 
         for item in value:
             if isinstance(item, dict):
                 note(item)
+
+
+# A UUID is an opaque handle, not a fact: left in the store it would "ground" any
+# digit run an answer happens to share with one.
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+# Deeper than any tool result nests; the bound only keeps a pathological payload
+# from recursing.
+_GROUNDING_MAX_DEPTH = 16
+
+
+def _record_grounding(response: Any, store: dict[str, None]) -> None:
+    """Add every scalar of one tool result to this pass's grounding store.
+
+    The whole result is walked, however deep: a row's scalars, a campaign's
+    pieces, the account's nested `currentState.status_markdown`, the members of
+    a wrapped list — whatever the capped index refused, never reads (nested
+    dicts, a bare list) or truncated. What it does NOT take, as in the index:
+    an error body (not evidence), `_`-prefixed keys (attribution plumbing),
+    booleans and nulls; and it strips what is not prose — `[src: <fileId>]`
+    markers and UUIDs. Distinct strings only, so a value that repeats across
+    rows is held once."""
+    if isinstance(response, dict) and response.get("error"):
+        return
+
+    def walk(value: Any, depth: int) -> None:
+        if isinstance(value, str):
+            text = SRC_MARKER_RE.sub(" ", value).strip()
+            if text and not _UUID_RE.fullmatch(text):
+                store.setdefault(text, None)
+        elif isinstance(value, bool) or value is None:
+            return
+        elif isinstance(value, (int, float)):
+            store.setdefault(str(value), None)
+        elif depth < _GROUNDING_MAX_DEPTH:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if not (isinstance(key, str) and key.startswith("_")):
+                        walk(item, depth + 1)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item, depth + 1)
+
+    walk(response, 0)
 
 
 def _note_drop(dropped: dict[str, int] | None, tool_name: str, count: int = 1) -> None:

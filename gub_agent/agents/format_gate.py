@@ -6,7 +6,8 @@ feedback, and falls back to a template render — the critic's old
 `answer_satisfies` axis (shape, grounding) turned from an LLM judgement into
 checks:
 
-1. `citations ⊆ evidence_index` — "unknown citation".
+1. `citations ⊆ evidence_index` — "unknown citation". The CAPPED index, and
+   nothing else: the grounding store below is never citable.
 2. Every number in the answer (citation markers stripped) appears in some
    evidence value — "ungrounded number".
 3. Every entity-name-shaped token appears in the index — "ungrounded entity";
@@ -15,6 +16,14 @@ checks:
 4. A payload that fails pydantic validation (filler, budgets, table shape —
    `schemas/answer.py`) surfaces as a ValidationError from the formatter's
    `output_schema` and is treated the same way: feedback + retry.
+
+Checks 2-3 ground in the capped index first, as always. What the index could not
+hold (it carries ~400 entries; the executor wrote from everything it retrieved)
+grounds against the pass's uncapped grounding store (`evidence_index._GROUNDING`)
+instead — but only when the executor's own answer holds it too: a number or name
+must appear in the executor answer AND in a tool result. So the store widens what
+the executor may say, never what the formatter may add on its own, and nothing
+the index grounded before is rejected now.
 
 A citation that is merely mistyped — the tool prefix dropped, or two ids
 spliced — is REPAIRED against the turn's own evidence before check 1 judges
@@ -47,6 +56,7 @@ import logging
 import re
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, nullcontext
+from functools import cached_property
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
@@ -65,6 +75,7 @@ from .evidence_index import (
     entry_source_ids,
     evidence_index,
     evidence_rows,
+    grounding_text,
     log_answer_shape,
     log_cap,
     log_evidence_rows,
@@ -206,6 +217,76 @@ def _is_grounded(run: str, blob: str) -> bool:
     return bool(base) and base in blob
 
 
+_WORD_RE = re.compile(r"\w+")
+
+
+def _norm_number(number: str) -> str:
+    """A number's canonical spelling for matching against the grounding store: no
+    separators, no trailing zeros after a decimal point, no leading zeros
+    ("1,200.50" → "1200.5", "09" → "9", "10.0" → "10")."""
+    n = number.replace(",", "").rstrip(".")
+    if "." in n:
+        n = n.rstrip("0").rstrip(".")
+    head, dot, tail = n.partition(".")
+    return (head.lstrip("0") or "0") + dot + tail
+
+
+def _words_in(run: str, words: frozenset[str]) -> bool:
+    """Whether every word of a candidate name is a WHOLE word of `words` (lower-
+    cased `\\w+` tokens), allowing the possessive and plural spellings
+    `_ground_forms` allows. Whole words, not substrings: against a store this
+    size "ford" would otherwise ground in "affordable"."""
+    run_words = run.split()
+    return bool(run_words) and all(
+        any(
+            parts and all(part in words for part in parts)
+            for parts in (_WORD_RE.findall(form) for form in _ground_forms(word))
+        )
+        for word in run_words
+    )
+
+
+class Grounding:
+    """What checks 2-3 may ground in BESIDE the capped index: the pass's uncapped
+    grounding store (`evidence_index.grounding_text`) and the executor's answer.
+
+    A number or name the capped index does not hold grounds only when BOTH hold
+    it — it appears in the executor answer and in a tool result. Whole numbers
+    and whole words, case-insensitive. An empty `Grounding()` grounds nothing, so
+    `gate_problems` without one is the capped-index gate it always was."""
+
+    def __init__(self, store: str = "", executor_text: str = "") -> None:
+        self._store = store.lower()
+        self._answer = _strip_markers(executor_text).lower()
+
+    @cached_property
+    def _store_words(self) -> frozenset[str]:
+        return frozenset(_WORD_RE.findall(self._store))
+
+    @cached_property
+    def _answer_words(self) -> frozenset[str]:
+        return frozenset(_WORD_RE.findall(self._answer))
+
+    @cached_property
+    def _store_numbers(self) -> frozenset[str]:
+        return frozenset(_norm_number(n) for n in _numbers_of(self._store))
+
+    @cached_property
+    def _answer_numbers(self) -> frozenset[str]:
+        return frozenset(_norm_number(n) for n in _numbers_of(self._answer))
+
+    def number(self, number: str) -> bool:
+        """The number (as `_numbers_of` spells it) is in the store AND the answer."""
+        norm = _norm_number(number)
+        return norm in self._store_numbers and norm in self._answer_numbers
+
+    def in_store(self, run: str) -> bool:
+        return _words_in(run, self._store_words)
+
+    def in_answer(self, run: str) -> bool:
+        return _words_in(run, self._answer_words)
+
+
 _HEX8_RE = re.compile(r"[0-9a-f]{8}", re.I)
 
 
@@ -327,8 +408,14 @@ def prune_source_file_ids(
     return payload.model_copy(update={"facts": facts}), dropped
 
 
-def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
-    """The deterministic checks — empty list means the payload passes."""
+def gate_problems(
+    payload: AnswerPayload, index: dict[str, dict], grounding: Grounding | None = None
+) -> list[str]:
+    """The deterministic checks — empty list means the payload passes.
+
+    Check 1 judges citations against `index`, the capped, citable evidence.
+    Checks 2-3 ground in `index` first and then in `grounding` (see `Grounding`);
+    without one they are the capped-index checks."""
     problems: list[str] = []
 
     unknown = [c for c in payload.citations if c not in index]
@@ -340,24 +427,45 @@ def gate_problems(payload: AnswerPayload, index: dict[str, dict]) -> list[str]:
     if payload.kind != "answer":
         return problems  # nothing to ground in an abstention / clarification
 
+    grounding = grounding or Grounding()
     prose, cells = _prose_and_cells(payload, index)
     blob = _evidence_blob(index)
     blob_numbers = blob.replace(",", "")
 
     ungrounded_numbers = sorted(
-        n for n in _numbers_of(prose) | _numbers_of(cells) if n not in blob_numbers
+        n
+        for n in _numbers_of(prose) | _numbers_of(cells)
+        if n not in blob_numbers and not grounding.number(n)
     )
     if ungrounded_numbers:
         problems.append(
             f"ungrounded number: {', '.join(ungrounded_numbers)} — every number must "
-            "appear verbatim in a tool result; copy it, never reformat or recompute"
+            "appear in the executor answer and in a tool result; copy it verbatim, "
+            "never reformat or recompute"
         )
 
-    ungrounded_entities = sorted(
-        {run for run in _entity_runs(prose) + _entity_runs(cells) if not _is_grounded(run, blob)}
-    )
-    if ungrounded_entities:
-        problems.append(_ungrounded_entity_problem(ungrounded_entities, index))
+    in_no_result: set[str] = set()  # in no tool result
+    unwritten: set[str] = set()  # in a tool result, but not in the executor answer
+    for run in _entity_runs(prose) + _entity_runs(cells):
+        if _is_grounded(run, blob):
+            continue
+        if not grounding.in_store(run):
+            in_no_result.add(run)
+        elif not grounding.in_answer(run):
+            unwritten.add(run)
+    parts: list[str] = []
+    if in_no_result:
+        parts.append(_ungrounded_entity_problem(sorted(in_no_result), index))
+    if unwritten:
+        # The label stays "ungrounded entity": it is the taxonomy the engine
+        # logs are read by.
+        parts.append(
+            f"ungrounded entity: {', '.join(sorted(unwritten))} — a tool result has "
+            "these, but the executor answer does not. Write only what the executor "
+            "answer says; never add a name of your own"
+        )
+    if parts:
+        problems.append("; ".join(parts))
     return problems
 
 
@@ -426,10 +534,12 @@ def _near_miss(run: str, blob_tokens: set[str]) -> bool:
 # Phrased against what `gate_problems` actually tests — any capitalized run —
 # rather than "entity name", which a model does not read a coined heading as.
 _GROUNDING_RULES = """RULES (checked in code — a payload breaking one is rejected):
-- Every number you write must appear verbatim in a value above. Copy it; never
-  reformat, round or recompute.
-- Every capitalized word or phrase you write must appear in a value above —
-  names, places, products alike. If it is not there, do not write it.
+- Every number you write must appear in the executor answer and in a tool
+  result. Copy it verbatim; never reformat, round or recompute.
+- Every capitalized word or phrase you write must appear in the executor answer
+  and in a tool result — names, places, products alike. The values above are
+  tool results, and so is everything else this turn retrieved. If the executor
+  answer does not say it, do not write it.
 - Do not coin section headings or `Label: claim` bullet prefixes. A bullet
   starts with the claim. A heading you invented is an ungrounded phrase.
 - Cite only the ids above, and echo each cited id in `facts`."""
@@ -950,6 +1060,9 @@ class FormatGate(BaseAgent):
             return
 
         index = evidence_index(ctx.invocation_id)
+        # What checks 2-3 may ground in beside the capped index. Final here: no
+        # tool runs between the executor and the gate. Never briefed, never emitted.
+        grounding = Grounding(grounding_text(ctx.invocation_id), executor_text)
         set_formatter_brief(
             ctx.invocation_id,
             compose_brief(executor_text, index, "", provenance(ctx.invocation_id)),
@@ -1034,7 +1147,7 @@ class FormatGate(BaseAgent):
                         payload, pruned_sources = prune_source_file_ids(
                             payload, index, provenance(ctx.invocation_id)
                         )
-                        problems = gate_problems(payload, index)
+                        problems = gate_problems(payload, index, grounding)
                         if not problems:
                             if repaired:
                                 logger.info(
