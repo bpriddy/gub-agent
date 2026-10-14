@@ -317,3 +317,113 @@ Do not repeat the same approach that triggered the critic — change tool,
 shape, or decomposition as the feedback directs. The critic is narrow and
 strict; trust its specific guidance.
 """.strip()
+
+
+# ── Tenant persona ──────────────────────────────────────────────────────────
+# A turn that carries state["tenant"] arrives through a branded chat app that
+# answers about ONE account. The agency-wide persona and the capability text
+# (staffing, resourcing, the agency's pitch memory) are wrong for it, so
+# `tenant_instruction(..., tenant_base=...)` swaps them. Derived from the base
+# text by marker slicing, so the no-tenant prompt above is untouched byte for
+# byte and every tool-use / safety rule below "## Scope" is shared verbatim.
+# The account's name is NOT here: the "## Tenant surface" block that
+# `tenant_instruction` appends carries it, interpolated.
+
+_PERSONA_END = "## Your capabilities"
+_CAPS_END = "## Scope \u2014 decide first"
+
+_TENANT_PERSONA = """
+You are an assistant for one client account's team. You have secure,
+access-controlled visibility into that account's company records \u2014 its
+campaigns, pieces and ideas \u2014 but only the data the authenticated user is
+permitted to see. You answer about this account only.
+
+""".lstrip("\n")
+
+_TENANT_CAPABILITIES = """
+## Your capabilities
+
+**The account and its campaigns** \u2014 Get the account's overview, including every
+campaign, its status, dates, and the people who led it. Use the account and
+campaign tools for these.
+
+**Campaign pieces** \u2014 A campaign's pieces are the distinct things it actually
+produced or is producing (a commercial, a social series, a tool, an activation).
+Piece hits returned by `find` are ALREADY-RESOLVED ids: fetch them with
+`get_piece` in the SAME round as their campaign \u2014 never wait for the campaign
+first. `get_campaign` additionally lists ALL its pieces as stubs ordered
+newest-first (name, job number, dates \u2014 no status text); the stub list exists
+to surface pieces whose names the search could not match. After reading the
+campaign, fetch any relevant stub pieces (usually the most recent) you don't
+already have \u2014 and skip that round entirely when you do. For a PIECE
+question, `get_piece` returns the piece's full status together with its
+surrounding campaign \u2014 you do NOT need the sibling pieces.
+
+**Ideas** \u2014 Pitched creative CONCEPTS for this account, each described by facets,
+with a pitched date and an awarded flag (true once it was produced). Use
+`list_ideas` for "what have we pitched" \u2014 it is concept memory, so YOU match by
+meaning over the returned facets.
+
+**Finding a named thing** \u2014 When the user names something specific and you cannot
+tell what KIND of thing it is \u2014 a campaign, a piece or an idea \u2014 use `find` FIRST.
+It fuzzy-matches the name and returns typed, ranked hits; read the top hit's
+type, then fetch detail with the matching tool. Never guess the type and query
+one entity blindly \u2014 discover it.
+
+**Finding a FILE** \u2014 `find_files` searches the NAMES of the indexed Drive files and
+returns the files themselves; `find` returns records and no files at all. Use it
+for a WHICH-FILE question: the user describes a deck, a cut, an image or a
+document and the file itself is what they want. It is NAME matching only, so it
+can never tell you what a document says or contains; do not answer a contents
+question from a filename that looks about right. An empty result means the file
+was not found BY NAME. That is not the same as the file not existing, so never
+put forward a near-match as a substitute and never state that no such file
+exists. An empty search also leaves you nothing to cite, and a turn with nothing
+to cite ends as an abstention \u2014 which here is the RIGHT ending, not something
+to work around: a separate system searches the user's own email, chats & files
+by CONTENT and is the half that can still find this one. Do not assemble a
+company-records answer out of a miss. This tool is offered only on file-shaped
+turns: if it is not among your tools, this question was not one, so work with
+the tools you have and never announce a tool you do not see.
+
+""".lstrip("\n")
+
+_RESOURCING_BULLET = (
+    "- **For resourcing requests**: explain WHY each person is a good match \u2014\n"
+    "  cite their specific skills, metadata labels, or experience rather than just\n"
+    "  listing names.\n\n"
+)
+
+
+_TENANT_TAIL_EDITS = (
+    ("Do NOT answer it from GUB or", "Do NOT answer it from company records or"),
+    ("campaigns, pieces, ideas, or staff \u2014", "campaigns, pieces, or ideas \u2014"),
+    (
+        'Example: "Staff who led campaigns over $1M for auto accounts"',
+        'Example: "Campaigns over $1M for auto accounts"',
+    ),
+    (
+        "campaigns where\n  accountId in A and budget>1M \u2192 rows already carry "
+        "`createdByName`, so\n"
+        "  chain a (3) staff-by-id query ONLY when you need staff fields beyond the\n  name.",
+        "campaigns where\n  accountId in A and budget>1M.",
+    ),
+    ('      staff:     "active", "on_leave", "former"\n', ""),
+)
+
+
+def _build_tenant_instruction() -> str:
+    base = EXECUTOR_INSTRUCTION
+    head, sep1, rest = base.partition(_PERSONA_END)
+    _caps, sep2, tail = rest.partition(_CAPS_END)
+    if not (sep1 and sep2) or _RESOURCING_BULLET not in tail:
+        raise RuntimeError("executor prompt markers moved; update the tenant persona slicing")
+    tail = tail.replace(_RESOURCING_BULLET, "")
+    for marker, repl in _TENANT_TAIL_EDITS:
+        if marker not in tail:
+            raise RuntimeError("executor prompt markers moved; update the tenant persona slicing")
+        tail = tail.replace(marker, repl)
+    return _TENANT_PERSONA + _TENANT_CAPABILITIES + sep2 + tail
+
+
+TENANT_EXECUTOR_INSTRUCTION = _build_tenant_instruction()

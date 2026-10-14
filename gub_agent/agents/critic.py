@@ -66,7 +66,7 @@ from ..sandbox import (
     sandbox_before_model,
     sandbox_instruction,
 )
-from ..tenant import label_of
+from ..tenant import label_of, tenant_instruction
 from .context_pruning import (
     strip_prior_turn_tool_parts,
     strip_prior_turn_tool_text,
@@ -204,7 +204,8 @@ critic_agent = LlmAgent(
     # so the critic reasons FROM a given fact instead of re-deriving it.
     # Wrapped for the sandbox: state["sandbox"].critic_instruction (or
     # .critic_variant) replaces the critic's prompt for that run only.
-    instruction=sandbox_instruction(_critic_instruction, role="critic"),
+    # Then wrapped for tenancy; no tenant in state = unchanged text.
+    instruction=tenant_instruction(sandbox_instruction(_critic_instruction, role="critic")),
     # The critic REASONS through its remaining checks (entity↔call coverage,
     # closure, grounding, recency) in thinking tokens, then emits only the
     # two-axis decision below — a bare output_schema leaves no room to reason.

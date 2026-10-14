@@ -50,6 +50,7 @@ from ..sandbox import (
     sandbox_instruction,
 )
 from ..schemas.router import FALLBACK_DECISION, RouterDecision
+from ..tenant import tenant_instruction
 from .context_pruning import (
     strip_prior_turn_tool_parts,
     strip_prior_turn_tool_text,
@@ -101,7 +102,11 @@ router_agent = LlmAgent(
     # .router_variant) replaces the prompt for that run only — the one
     # practical way to drive the misroute rate down without a redeploy.
     # InstructionProvider — appends today's date deterministically per request.
-    instruction=sandbox_instruction(with_current_date(ROUTER_INSTRUCTION), role="router"),
+    # Wrapped for tenancy OUTSIDE the sandbox wrapper; no tenant in state =
+    # the inner text unchanged (gub_agent/tenant.py).
+    instruction=tenant_instruction(
+        sandbox_instruction(with_current_date(ROUTER_INSTRUCTION), role="router")
+    ),
     # Thinking off (thinking_budget=0; LOW with ROUTER_THINKING_OFF=0), from
     # sandbox.py so the provenance can't drift from what runs. The router exists
     # to save model turns; at LOW its ~99 thought tokens a call put TTFT p90 at
