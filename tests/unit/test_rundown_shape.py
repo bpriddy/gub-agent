@@ -22,7 +22,9 @@ THE FIX, pinned here:
   * they reach ADK's own validation of the formatter's reply, and the early
     abort's scan, and nothing else — no leak into the pipeline around the gate;
   * the executor writes in the shape the synthesizer will (bold opener, a bullet
-    per entity, no tables), so the voice does not flip at the end.
+    per entity, no tables), so the voice does not flip at the end — for an
+    ANSWER: the bare `NO_COMPANY_RECORDS` marker and a request to rephrase keep
+    their own shapes, and the Format rule says so.
 
 The gate-flow tests run the real `FormatGate`; two of them run the REAL
 formatter LlmAgent through ADK with only the model stubbed, because "the
@@ -204,6 +206,59 @@ def test_the_no_tables_rule_leaves_the_verbatim_status_writeup_alone():
     assert "Rendering `statusMarkdown` verbatim is ONLY for explicit" in prompt
     format_rule = prompt[prompt.index("No markdown headings and no tables") :]
     assert "The one exception is `statusMarkdown` rendered verbatim" in format_rule[:400]
+
+
+def _format_rules(prompt: str) -> str:
+    """The executor's Format rule, from its heading to the next rule."""
+    return prompt[prompt.index("**Format**:") : prompt.index("**Never expose internal identifiers")]
+
+
+def test_the_executors_format_rules_are_for_answers_not_for_the_abstain_or_the_ask():
+    """Scope tells the executor to reply `NO_COMPANY_RECORDS` alone, or to ask the
+    reader to rephrase. The Format rule then told EVERY reply to open on a bold
+    sentence and never to end on a question. The marker is recognised only as the
+    bare word (the gate, the critic's pass and the bot all read it as a prefix), so
+    a bolded one reads as an answer; and the ask IS a question. The Format rule now
+    says whom it is for, before the rules it exempts them from."""
+    prompt = _flat(EXECUTOR_INSTRUCTION)
+    rules = _format_rules(prompt)
+    lead = rules[: rules.index("- Open with the answer itself")]
+
+    assert "The rules below shape an ANSWER" in lead
+    assert (
+        "`NO_COMPANY_RECORDS` is that one word and nothing else — never bold, never quoted, "
+        "never inside a sentence" in lead
+    )
+    assert (
+        "a request to rephrase is one short plain question with no bold opener: "
+        "the only reply that may end on a question" in lead
+    )
+    assert rules.index("shape an ANSWER") < rules.index("in bold — the value for a fact")
+    assert rules.index("the only reply that may end on a question") < rules.index(
+        'Do not close with a question, an offer or a "next step" line'
+    )
+    # …and the two Scope bullets say the same where they are first read
+    scope = prompt[: prompt.index("## How to work")]
+    assert (
+        "Respond with EXACTLY `NO_COMPANY_RECORDS` and nothing else — plain, never bold or quoted."
+        in scope
+    )
+    assert (
+        "That plain question is the whole reply: the Format rules below are for answers." in scope
+    )
+
+
+def test_the_bold_rule_leaves_room_for_the_bold_opener():
+    """The opener is ONE WHOLE LINE in bold, so "never a whole line of prose" in the
+    same rule contradicted it: the rule now names the opener as the one exception."""
+    rules = _format_rules(_flat(EXECUTOR_INSTRUCTION))
+
+    assert "one sentence on its own line, in bold" in rules
+    assert "never a whole line of prose" not in rules
+    assert (
+        "the opening sentence is the one whole line that is bold, and no other line or "
+        "sentence of prose is" in rules
+    )
 
 
 def test_the_executors_example_is_a_pattern_not_a_real_record():

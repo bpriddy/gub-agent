@@ -14,7 +14,8 @@ refused. Pinned here:
     does the same, and its field rows go only after every stub field row;
   * a campaign's `pieces` are STUBS (the tool contract: no status), so a
     piece-heavy campaign cannot starve a later detail row, and their loss is
-    counted as `get_campaign.pieces`, never as `get_campaign`;
+    counted as `campaign_pieces`, never as `get_campaign` (the label holds no tool
+    name, so a text search for the tool finds detail entries only);
   * a stub row is still first-come, never evicts, and its whole-entity row is
     never evicted;
   * when the room runs out part way through a detail row, the status text is
@@ -48,6 +49,7 @@ from gub_agent.agents.evidence_index import (
     record_evidence,
     reset_evidence_index,
 )
+from gub_agent.tools import ALL_TOOLS
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "recorded_chevy_turn_2026-09-17.json"
 
@@ -219,7 +221,7 @@ def test_a_campaigns_pieces_are_stubs_that_never_take_a_slot_from_a_detail_row(m
     # full index, so it is refused whole — and counted under its own label.
     assert all(f"get_campaign:c1{k}" in index for k in ("", ":name", ":status"))
     assert not any(k.startswith("get_campaign:p1") for k in index)
-    assert dropped_by_tool("inv-p") == {"get_campaign.pieces": 2, "org_query": 3}
+    assert dropped_by_tool("inv-p") == {"campaign_pieces": 2, "org_query": 3}
     assert "get_campaign" not in dropped_by_tool("inv-p")
 
 
@@ -246,7 +248,35 @@ def test_an_evicted_piece_field_row_is_counted_as_a_piece_loss_not_a_campaign_lo
     assert "get_campaign:p1" in index and "get_campaign:p1:name" not in index
     assert "get_campaign:p2:name" not in index and "org_query:s:x" not in index
     assert all(f"get_campaign:c2{k}" in index for k in ("", ":a", ":b"))
-    assert dropped_by_tool("inv-p") == {"get_campaign.pieces": 2, "org_query": 1}
+    assert dropped_by_tool("inv-p") == {"campaign_pieces": 2, "org_query": 1}
+
+
+def test_no_own_list_label_contains_the_name_of_a_tool(monkeypatch):
+    """`dropped_by_tool` is read by tool name: by eye, and by a text search for
+    `get_campaign` on the cap line. A label that embeds a tool's name makes that
+    search find a stub loss — `get_campaign.pieces` did, on the very turn the
+    acceptance number was written for. Each own list's loss is provoked here and
+    its label read back."""
+    pieces = _start(monkeypatch, 3, "inv-label-pieces")
+    record_evidence(
+        _tool("get_campaign"),
+        {},
+        pieces,
+        {"id": "c", "name": "C", "pieces": [{"id": "p", "name": "P"}]},
+    )  # the campaign's two entries fit; its piece's field row does not
+    metadata = _start(monkeypatch, 3, "inv-label-metadata")
+    record_evidence(
+        _tool("get_staff_profile"),
+        {},
+        metadata,
+        {"id": "s", "name": "S", "metadata": [{"id": "m", "label": "L"}]},
+    )  # the profile and its member fit; the member's field row does not
+
+    labels = set(dropped_by_tool("inv-label-pieces")) | set(dropped_by_tool("inv-label-metadata"))
+    tools = {tool.__name__ for tool in ALL_TOOLS}
+
+    assert not [(label, tool) for label in labels for tool in sorted(tools) if tool in label]
+    assert labels == {"campaign_pieces", "profile_metadata"}
 
 
 def _overview(n_campaigns: int = 47) -> dict:
@@ -418,7 +448,7 @@ def test_member_field_rows_are_evicted_only_after_every_stub_field_row(monkeypat
     # A member loss is the profile's own list, never the profile or a campaign…
     assert dropped_by_tool("inv-p") == {
         "get_campaign": 1,
-        "get_staff_profile.metadata": 2,
+        "profile_metadata": 2,
         "org_query": 4,
     }
 
@@ -667,6 +697,26 @@ def test_each_of_the_six_recorded_get_campaign_responses_indexes_rows():
         assert index[f"{key}:budget"]["value"] == str(campaign["budget"])
     assert "get_campaign" not in dropped  # the live acceptance number
     assert len(index) == MAX_ENTRIES  # the cap still binds: it is a prompt budget
+
+
+def test_the_recorded_turns_cap_line_does_not_name_get_campaign_at_all(caplog):
+    """The acceptance probe, read as text: `dropped_by_tool` may name `get_campaign`
+    only for a detail entry that found no room. Every detail row of the recorded
+    turn fits, and five piece stubs were lost: the line must not hold the string."""
+    index, dropped = _replay()
+    # the premise, carried by the fixture: stubs of a detail response WERE lost
+    assert sum(count for label, count in dropped.items() if "pieces" in label) == 5
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.evidence_index"):
+        log_cap("chevy-replay", "chevy", index)
+
+    [line] = [r.getMessage() for r in caplog.records if "evidence_index: cap" in r.getMessage()]
+    assert line == (
+        "evidence_index: cap kept=400 dropped=184"
+        " dropped_by_tool=campaign_pieces:5,find:61,get_account_overview:118"
+        " inv=chevy-replay tenant=chevy"
+    )
+    assert "get_campaign" not in line
 
 
 def test_the_recorded_accounts_nested_status_is_indexed():

@@ -9,7 +9,8 @@ has a sharp edge:
 
   * the FIELD row `<tool>:<id>:statusMarkdown` stores `str(value)` whole;
   * the WHOLE-ENTITY row `<tool>:<id>` is `_compact_row`, capped at
-    MAX_ENTITY_VALUE_CHARS (2 000).
+    MAX_ENTITY_VALUE_CHARS (2 000) — one JSON object whose long strings are
+    shortened to fit.
 
 Measured on `gub_prod_copy` 2026-09-17: 30 of the 47 campaigns carrying
 markers have a `status_markdown` longer than that cap, and only 364 of the 689
@@ -70,7 +71,8 @@ async def test_src_markers_survive_whole_on_the_status_markdown_field_row():
 async def test_the_whole_entity_row_truncates_and_loses_the_later_markers():
     """Why §5.2 must parse the FIELD row. A long status is cut mid-document,
     so the entity row's marker set is the head of the file only — on live data
-    that is 52.8 % of them."""
+    that is 52.8 % of them. The row stays one JSON object: the status is shortened
+    inside it (and marked) and nothing else is cut."""
     ctx = _fresh()
     recorded = _recorded()
     head = recorded["statusMarkdown"]
@@ -83,8 +85,11 @@ async def test_the_whole_entity_row_truncates_and_loses_the_later_markers():
     index = evidence_index("inv-src")
 
     entity_value = index["get_campaign:cmp-ev-social"]["value"]
-    assert len(entity_value) == MAX_ENTITY_VALUE_CHARS
+    assert len(entity_value) <= MAX_ENTITY_VALUE_CHARS
     assert "1LATEmarkerPastTheEntityCap_00000000000" not in entity_value
+    cut_status = json.loads(entity_value)["statusMarkdown"]  # parses: no cut string
+    assert cut_status.endswith("…") and len(cut_status) < len(recorded["statusMarkdown"])
+    assert recorded["statusMarkdown"].startswith(cut_status[:-1])
 
     field_value = index["get_campaign:cmp-ev-social:statusMarkdown"]["value"]
     assert field_value == recorded["statusMarkdown"]

@@ -10,7 +10,9 @@ Pinned:
     admitted exactly as before;
   * `answer_shape: …` — once per gate run, when a payload is accepted or the
     template is emitted (deep path and fast path alike), with a retention that
-    is the share of the executor's capitalised runs the payload kept;
+    is the share of the executor's capitalised runs the payload kept, and how
+    many of the facts echoing a whole-entity row carry a value the surface can
+    open as a JSON object (`entity_facts`, `entity_facts_parsed`);
   * neither new line carries the substring `format_gate` — the gate's drop and
     repair rates are read with `textPayload:"format_gate"` and an engine line
     carries its logger's file name — in its text, its logger name or its file;
@@ -218,8 +220,41 @@ def test_shape_line_counts_blocks_words_cites_and_retention(caplog):
     # words: headline 5 + text 8 + bullets 5+3 + assumption 3 + follow-up 3 = 27
     assert line.getMessage() == (
         f"answer_shape: kind=answer words=27 text_blocks=1 bullets=2 table_rows=2 cites=1"
-        f" exec_chars={len(EXECUTOR)} retention=0.67 inv={INV} tenant=chevy"
+        f" exec_chars={len(EXECUTOR)} retention=0.67 entity_facts=0 entity_facts_parsed=0"
+        f" inv={INV} tenant=chevy"
     )
+
+
+def test_shape_line_counts_the_entity_facts_the_surface_can_open(caplog):
+    """`entity_facts` echo a whole-entity row (an entity, a value, no field); the
+    surface opens that value as a JSON object to read the record, so how many of
+    them open is how many cited records it can read. A field row arrives ready and
+    is not counted, nor is a fact with no value."""
+    whole = '{"id": "c1", "name": "Q3 push", "status": "live"}'
+    cut = '{"id": "c2", "name": "Red Tag", "statusMarkdown": "Launch is on tra'
+    ids = ["get_campaign:c1", "get_campaign:c2", "get_campaign:c3", "get_campaign:c4"]
+    payload = _answer(
+        citations=[*ids, "get_campaign:c1:status", "get_campaign:c5"],
+        facts=[
+            {"evidence_id": ids[0], "entity_id": "c1", "value": whole},
+            {"evidence_id": ids[1], "entity_id": "c2", "value": cut},  # sliced mid-string
+            {"evidence_id": ids[2], "entity_id": "c3", "value": "[1, 2]"},  # JSON, not an object
+            {"evidence_id": ids[3], "entity_id": "c4", "value": "live"},  # not JSON at all
+            {
+                "evidence_id": "get_campaign:c1:status",
+                "entity_id": "c1",
+                "field": "status",
+                "value": "live",
+            },
+            {"evidence_id": "get_campaign:c5", "entity_id": "c5"},  # no value
+        ],
+    )
+    with caplog.at_level(logging.INFO, logger=EVIDENCE_LOGGER):
+        log_answer_shape(INV, "chevy", payload, EXECUTOR)
+
+    [line] = _lines(caplog, "answer_shape:")
+    assert " entity_facts=4 entity_facts_parsed=1 inv=" in line.getMessage()
+    assert line.getMessage().endswith(f"inv={INV} tenant=chevy")
 
 
 def test_retention_is_a_dash_without_executor_text_or_runs(caplog):
@@ -298,8 +333,45 @@ async def test_gate_logs_cap_and_shape_once_on_an_accepted_payload(caplog):
     [shape] = _lines(caplog, "answer_shape:")
     assert shape.getMessage() == (
         "answer_shape: kind=answer words=13 text_blocks=1 bullets=0 table_rows=0 cites=1"
-        f" exec_chars={len(EXECUTOR)} retention=0.33 inv={INV} tenant=chevy"
+        f" exec_chars={len(EXECUTOR)} retention=0.33 entity_facts=0 entity_facts_parsed=0"
+        f" inv={INV} tenant=chevy"
     )
+
+
+async def test_a_long_campaigns_whole_entity_fact_is_read_as_a_record_through_the_gate(caplog):
+    """The compaction and the readout, end to end: a campaign whose status is far
+    past the whole-entity row's cap is cited by that row, the formatter copies the
+    index value, and the shape line says the surface can open it."""
+    ctx = SimpleNamespace(invocation_id=INV)
+    reset_evidence_index(ctx)
+    status = "Q3 push launch is on track. " * 150
+    record_evidence(
+        _tool("get_campaign"),
+        {},
+        ctx,
+        {
+            "id": "c1",
+            "name": "Q3 push",
+            "status": "live",
+            "budget": 1200000,
+            "statusMarkdown": status,
+        },
+    )
+    value = evidence_index(INV)["get_campaign:c1"]["value"]
+    assert len(status) > ei.MAX_ENTITY_VALUE_CHARS and len(value) <= ei.MAX_ENTITY_VALUE_CHARS
+    cited = _answer(
+        citations=["get_campaign:c1"],
+        facts=[{"evidence_id": "get_campaign:c1", "entity_id": "c1", "value": value}],
+    )
+    formatter = _scripted([cited.model_dump(exclude_none=True)])
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    with caplog.at_level(logging.INFO):
+        events = [e async for e in gate.run_async(await _gate_ctx(EXECUTOR, "chevy"))]
+
+    shipped = AnswerPayload.model_validate(events[-1].actions.state_delta["answer_payload"])
+    assert [f.evidence_id for f in shipped.facts] == ["get_campaign:c1"]  # the formatter's own
+    [shape] = _lines(caplog, "answer_shape:")
+    assert " entity_facts=1 entity_facts_parsed=1 inv=" in shape.getMessage()
 
 
 async def test_gate_logs_the_shape_of_the_template_when_it_is_emitted(caplog):

@@ -3,7 +3,8 @@ evidence_index.py — after_tool_callback building the turn's citable evidence.
 
 Every tool result the executor receives is broken into addressable rows:
 
-    "<tool>:<row id>"          — a whole entity (value = its scalar fields)
+    "<tool>:<row id>"          — a whole entity (value = its scalar fields, as one
+                                 JSON object: see `_compact_row`)
     "<tool>:<row id>:<field>"  — one field of it
     "<tool>:<key>"             — a top-level response scalar (org_query `total`)
 
@@ -78,6 +79,7 @@ import json
 import logging
 import re
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 
 from ..schemas.answer import AnswerPayload, BulletBlock, TableBlock, TextBlock, count_words
@@ -113,21 +115,29 @@ _WRAPPED_DETAIL_TOOLS = frozenset({"get_piece"})
 _STUB = 0  # first-come, whole row or nothing; its fields are evictable
 _MEMBER = 1  # admitted ahead of stubs (evicts one); its fields are evictable, after the stubs'
 _DETAIL = 2  # admitted ahead of stubs (evicts one); its fields are never evicted
-# The lists a detail response carries ABOUT ITSELF, and what each member is. The
-# tool contract calls a campaign's `pieces` STUBS (name, dates, no status), so
-# they never take a slot from a detail row; a profile's `metadata` (skills,
-# interests, certifications) is the person's own content. Every other list of
-# any response is a stub list, counted under the tool's own name; an own list is
-# counted as "<tool>.<list>", so `dropped_by_tool.get_campaign` is only ever
-# DETAIL entries lost.
-_OWN_LISTS: dict[str, dict[str, int]] = {
-    "get_campaign": {"pieces": _STUB},
-    "get_staff_profile": {"metadata": _MEMBER},
+# The lists a detail response carries ABOUT ITSELF: what each member is, and the
+# label its loss is counted under. The tool contract calls a campaign's `pieces`
+# STUBS (name, dates, no status), so they never take a slot from a detail row; a
+# profile's `metadata` (skills, interests, certifications) is the person's own
+# content. Every other list of any response is a stub list, counted under the
+# tool's own name. An own list is counted under a label of its own that does NOT
+# contain the tool's name, so `dropped_by_tool` names `get_campaign` only for
+# DETAIL entries lost, to a reader or a substring match alike (the label was
+# `get_campaign.pieces`, which a text search for the tool also found).
+_OWN_LISTS: dict[str, dict[str, tuple[int, str]]] = {
+    "get_campaign": {"pieces": (_STUB, "campaign_pieces")},
+    "get_staff_profile": {"metadata": (_MEMBER, "profile_metadata")},
 }
-# A whole-entity value is the row's scalars as JSON; cap it so statusMarkdown
-# and friends do not turn one row into a page. Field-level values stay whole —
-# they are what numbers and names are grounded against.
+# A whole-entity value is the row's scalars as ONE JSON OBJECT of at most this many
+# characters, so statusMarkdown and friends do not turn one row into a page
+# (`_compact_row`). Field-level values stay whole — they are what numbers and
+# names are grounded against.
 MAX_ENTITY_VALUE_CHARS = 2_000
+# What a string value shortened to fit that cap ends with: a cut that says so.
+_CUT_MARK = "…"
+# A string value is shortened no further than this many characters (names, dates and
+# ids are shorter): a row that still does not fit gives up its last fields instead.
+_MIN_CUT_CHARS = 64
 
 _INDEX: OrderedDict[str, dict[str, dict[str, Any]]] = OrderedDict()
 # entity_id → Drive file ids its status text cites — UNCAPPED, beside the
@@ -263,9 +273,9 @@ def log_evidence_rows(invocation_id: str, tenant: str, rows: list[dict[str, Any]
 def dropped_by_tool(invocation_id: str) -> dict[str, int]:
     """Entries the cap refused or evicted this invocation, per tool (empty =
     none). An evicted stub counts against ITS tool, not the detail row's, and
-    the members of a detail response's own list count as "<tool>.<list>"
-    (`get_campaign.pieces`), so a `get_campaign` count is only ever a detail
-    entry the index had no room for."""
+    the members of a detail response's own list count under a label of their own
+    (`campaign_pieces`, `profile_metadata`: see `_OWN_LISTS`), so a `get_campaign`
+    count is only ever a detail entry the index had no room for."""
     return dict(_DROPPED.get(invocation_id, {}))
 
 
@@ -273,7 +283,8 @@ def log_cap(invocation_id: str, tenant: str, index: dict[str, dict[str, Any]]) -
     """The cap's one line per gate run: how many entries the index kept (after
     any eviction) and how many MAX_ENTRIES refused or evicted, by tool.
     `dropped_by_tool` is a sorted `tool:count,…` string, `-` when nothing was
-    refused or evicted.
+    refused or evicted; the loss of a detail response's own list reads under
+    that list's label (`campaign_pieces:5`), never under the tool's name.
 
     Like `log_evidence_rows`, logged from THIS module: an engine line carries
     its file name, and `textPayload:"format_gate"` is how the gate's drop and
@@ -342,6 +353,13 @@ def retention(executor_text: str, payload: AnswerPayload) -> str:
     return f"{kept / len(runs):.2f}"
 
 
+def _is_json_object(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except ValueError:
+        return False
+
+
 def log_answer_shape(
     invocation_id: str, tenant: str, payload: AnswerPayload, executor_text: str
 ) -> None:
@@ -352,7 +370,13 @@ def log_answer_shape(
     bullets, assumptions, follow-ups; tables are data). That is MORE than the
     contract's budget total, which leaves assumptions and follow-ups out (BE-5):
     the key keeps its meaning so a series that spans the change stays
-    comparable. Logged from THIS module for the reason `log_cap` is."""
+    comparable.
+
+    `entity_facts` counts the facts that echo a whole-entity row, and
+    `entity_facts_parsed` how many of their values open as a JSON object: the
+    surface reads a record's fields out of that value, so `parsed < facts` is a
+    cited record it cannot read (the formatter copied the value inexactly, or the
+    template shortened it). Logged from THIS module for the reason `log_cap` is."""
     words = count_words(payload.headline)
     text_blocks = bullets = table_rows = 0
     for block in payload.blocks:
@@ -366,9 +390,12 @@ def log_answer_shape(
             table_rows += len(block.rows)
     words += sum(count_words(a) for a in payload.assumptions)
     words += sum(count_words(f) for f in payload.follow_ups)
+    # A fact the surface opens as a record: it names an entity and a value and no
+    # field (a field row arrives ready, so there is nothing to open).
+    entity_values = [f.value for f in payload.facts if f.entity_id and f.value and not f.field]
     logger.info(
         "answer_shape: kind=%s words=%d text_blocks=%d bullets=%d table_rows=%d cites=%d "
-        "exec_chars=%d retention=%s inv=%s tenant=%s",
+        "exec_chars=%d retention=%s entity_facts=%d entity_facts_parsed=%d inv=%s tenant=%s",
         payload.kind,
         words,
         text_blocks,
@@ -377,6 +404,8 @@ def log_answer_shape(
         len(payload.citations),
         len(executor_text or ""),
         retention(executor_text, payload),
+        len(entity_values),
+        sum(_is_json_object(value) for value in entity_values),
         invocation_id,
         tenant,
     )
@@ -513,14 +542,65 @@ def _is_scalar(value: Any) -> bool:
     return isinstance(value, (str, int, float, bool))
 
 
+def _object_text(fields: dict[str, Any]) -> str:
+    return json.dumps(fields, ensure_ascii=False, default=str)
+
+
+def _fits(fields: dict[str, Any]) -> bool:
+    return len(_object_text(fields)) <= MAX_ENTITY_VALUE_CHARS
+
+
+def _shortened(fields: dict[str, Any], limit: int) -> dict[str, Any]:
+    """`fields` with every string longer than `limit` characters cut to `limit` and
+    marked as cut. Only strings change: a number is never touched."""
+    return {
+        key: value[:limit].rstrip() + _CUT_MARK
+        if isinstance(value, str) and len(value) > limit
+        else value
+        for key, value in fields.items()
+    }
+
+
+def _largest_fitting(low: int, high: int, fits: Callable[[int], bool]) -> int:
+    """The largest n in [low, high] with `fits(n)`, given that `fits(low)` holds and
+    that `fits` holds up to some n and fails beyond it. A bisection: a handful of
+    calls on a row that is already over the cap."""
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits(mid):
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
 def _compact_row(row: dict[str, Any]) -> str:
-    """The row's scalar fields as one JSON line — what a whole-entity citation
-    carries as its value (and what entity names are grounded against)."""
+    """The row's scalar fields as ONE JSON OBJECT of at most MAX_ENTITY_VALUE_CHARS
+    characters — what a whole-entity citation carries as its value (and what
+    entity names are grounded against).
+
+    Always a complete object: the surface that receives a cited value opens it
+    with a JSON parser to read the record's fields, and text cut in the middle of
+    a string is no object at all, so a citation of the whole entity then carries
+    no facts (5 of the 6 recorded campaign details had a status long enough to be
+    cut that way). A row over the cap is shortened where its length is instead:
+    its string values are cut, the longest first, to the longest length at which
+    the object fits, and end with `…` (a status text is a field row of its own,
+    whole). Every field stays, in the row's order, and no number is touched. A
+    string is never cut below _MIN_CUT_CHARS; a row that still does not fit gives
+    up its LAST fields."""
     scalars = {k: v for k, v in row.items() if _is_scalar(v) and not k.startswith("_")}
-    text = json.dumps(scalars, ensure_ascii=False, default=str)
-    if len(text) > MAX_ENTITY_VALUE_CHARS:
-        text = text[:MAX_ENTITY_VALUE_CHARS]
-    return text
+    text = _object_text(scalars)
+    if len(text) <= MAX_ENTITY_VALUE_CHARS:
+        return text
+    squeezed = _shortened(scalars, _MIN_CUT_CHARS)
+    if _fits(squeezed):
+        longest = max((len(v) for v in scalars.values() if isinstance(v, str)), default=0)
+        limit = _largest_fitting(_MIN_CUT_CHARS, longest, lambda n: _fits(_shortened(scalars, n)))
+        return _object_text(_shortened(scalars, limit))
+    fields = list(squeezed.items())
+    kept = _largest_fitting(0, len(fields), lambda n: _fits(dict(fields[:n])))
+    return _object_text(dict(fields[:kept]))
 
 
 def source_file_ids(text: Any) -> list[str]:
@@ -871,9 +951,9 @@ def _index_response(
             continue  # _sources and friends are attribution plumbing, not evidence
         if isinstance(value, list):
             # What a member of THIS list is: a stub, unless the entity owns the
-            # list as content (a profile's metadata).
-            member_tier = own_lists.get(key, _STUB)
-            label = f"{tool_name}.{key}" if key in own_lists else tool_name
+            # list as content (a profile's metadata), and what its loss is
+            # counted under.
+            member_tier, label = own_lists.get(key, (_STUB, tool_name))
             for item in value:
                 if isinstance(item, dict):
                     _index_row(

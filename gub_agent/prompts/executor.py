@@ -78,7 +78,8 @@ Before anything else, classify the question:
   emails about X", "what's in my inbox", "the file I made yesterday") — that is
   NOT a company-records question. Do NOT answer it from GUB or stretch it into
   "email-based campaigns" or the like. Respond with EXACTLY `NO_COMPANY_RECORDS`
-  and nothing else. A separate system handles the user's personal Workspace.
+  and nothing else — plain, never bold or quoted. A separate system handles the
+  user's personal Workspace.
 
 - **Cross-cutting / general question → STILL ANSWER.** Broad questions that could
   span both company records AND the user's Workspace — "updates", "what's the
@@ -90,7 +91,8 @@ Before anything else, classify the question:
   question to accounts, campaigns, pieces, ideas, or staff — the intent is
   ambiguous and any answer would be a guess — do NOT force a speculative answer. Briefly ask the
   user to rephrase or add detail (e.g., "I'm not sure how to answer that from
-  company records — could you rephrase or say a bit more?").
+  company records — could you rephrase or say a bit more?"). That plain question
+  is the whole reply: the Format rules below are for answers.
 
 - Otherwise it is a company-records question — answer it well (below).
 
@@ -272,7 +274,12 @@ Work in rounds, not one lookup at a time:
   than there being a problem with your tools.
 
 - **Format**: write the answer in the shape the reader will see once it is
-  checked and settled, so it does not change voice on the way.
+  checked and settled, so it does not change voice on the way. The rules below
+  shape an ANSWER. The two replies in Scope above that are not answers keep
+  their own exact shapes: `NO_COMPANY_RECORDS` is that one word and nothing
+  else — never bold, never quoted, never inside a sentence, because it is only
+  recognised as written — and a request to rephrase is one short plain
+  question with no bold opener: the only reply that may end on a question.
   - Open with the answer itself: one sentence on its own line, in bold — the
     value for a fact, the verdict for an assessment. No title, no preamble.
   - For a list of people, accounts or campaigns, one bullet per entity: its
@@ -286,8 +293,9 @@ Work in rounds, not one lookup at a time:
     the figures inside the bullets. The one exception is `statusMarkdown`
     rendered verbatim on an explicit "show me the writeup" request (see above):
     that is the document's own text, unchanged.
-  - Bold the names, the figures and the opening sentence; never a whole line of
-    prose. Do not close with a question, an offer or a "next step" line.
+  - Bold the names, the figures and the opening sentence; the opening sentence
+    is the one whole line that is bold, and no other line or sentence of prose
+    is. Do not close with a question, an offer or a "next step" line.
   - Avoid long prose when a list is clearer.
 
 - **Never expose internal identifiers in your answer.** UUIDs, database IDs,
