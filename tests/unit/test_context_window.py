@@ -224,10 +224,10 @@ def test_preamble_before_the_first_boundary_keeps_leading_the_request():
 # ── the case that matters: ADK's injected foreign context ────────────────────
 
 
-# The two wordings ADK has shipped. `google-adk` is unpinned, so the installed
-# version is whatever was newest at build time — these are here so a THIRD
-# wording fails a test instead of silently inflating the turn count in
-# production (which is what 2.9.2 did to the original exact-match check).
+# The two wordings ADK has shipped. `google-adk` is pinned exactly now, but an
+# upgrade is a deliberate bump — these are here so a THIRD wording fails a test
+# instead of silently inflating the turn count in production (which is what
+# 2.9.2 did to the original exact-match check).
 ADK_261_PREAMBLE = "For context:"
 ADK_292_PREAMBLE = (
     "For context: below is a transcript of what another agent did, quoted"

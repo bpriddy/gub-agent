@@ -62,11 +62,13 @@ from typing import Any
 
 import pytest
 from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.events import Event, EventActions
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
+from google.adk.sessions import InMemorySessionService
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types as genai_types
 
@@ -90,6 +92,7 @@ from gub_agent.config import AGENT_NAME
 from gub_agent.models import VendorRouter
 from gub_agent.sandbox import SandboxEcho
 from gub_agent.schemas import AnswerPayload, RouterDecision
+from gub_agent.schemas.router import FALLBACK_DECISION
 from gub_agent.tenant import tenant_instruction
 
 REPO = Path(__file__).resolve().parents[2]
@@ -893,6 +896,187 @@ async def test_the_speculation_never_reads_the_previous_turns_decision(monkeypat
     assert _lines(caplog, "speculation:")[-1].startswith("speculation: outcome=kept ")
 
 
+# ── kept: the fork reads the REAL decision from the keep on (BE-4) ───────────
+
+
+def _briefs_of(built: SimpleNamespace) -> list[str]:
+    """The brief each formatter call was sent: its one user message."""
+    briefs = []
+    for request in built.models.formatter.requests:
+        [text] = [p for role, parts in request["contents"] if role == "user" for p in parts]
+        assert text.startswith("text:")
+        briefs.append(text.removeprefix("text:"))
+    return briefs
+
+
+def _probe_decision_at_the_formatter(monkeypatch) -> list[RouterDecision]:
+    """What `decision_from` answers inside the formatter's request callback —
+    the moment the gate's brief has just been composed."""
+    seen: list[RouterDecision] = []
+    original = formatter_module._formatter_before_model
+
+    def probe(callback_context, llm_request):
+        seen.append(router_module.decision_from(callback_context))
+        return original(callback_context, llm_request)
+
+    monkeypatch.setattr(formatter_module, "_formatter_before_model", probe)
+    return seen
+
+
+async def test_a_kept_speculation_reads_the_real_decision_not_the_fallback(monkeypatch, caplog):
+    """The fork is cut before the router answers, so it carries FALLBACK_DECISION
+    — which is right for the executor it started. A KEPT run is the run the real
+    decision would have made, and from the keep on whatever reads the decision
+    (the format gate's brief) must read the real one. Here the router lands
+    while the executor is still working, so the gate reads it."""
+    seen = _probe_decision_at_the_formatter(monkeypatch)
+    decision = _decision("assessment", 0.9)
+    runs = []
+    for speculative in (False, True):
+        seen.clear()
+        built = _build(speculative=speculative, router=[decision], exec_delay=0.12)
+        with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
+            turn = await _one_turn(built, "how is chevy doing?")
+        runs.append((built, turn, list(seen)))
+
+    (_, before, serial_seen), (built, after, kept_seen) = runs
+    assert "outcome=kept " in _lines(caplog, "speculation:")[-1]
+    assert "finished=0" in _lines(caplog, "speculation:")[-1]  # still running at the decision
+    expected = RouterDecision.model_validate_json(decision)
+    assert serial_seen == [expected]
+    assert kept_seen == [expected]
+    assert kept_seen[0] != FALLBACK_DECISION
+    # …and the brief the formatter was sent is the serial root's, question and intent in it
+    [brief] = _briefs_of(built)
+    assert brief.startswith("QUESTION: how is chevy doing?\nINTENT: assessment\n\nEXECUTOR ANSWER")
+    assert _briefs_of(built) == [_briefs_of(runs[0][0])[0]]
+    # The fork's state is the fork's: the real session is the serial root's.
+    assert after.state == before.state
+    assert _shape(after.events) == _shape(before.events)
+
+
+class _Idle(BaseAgent):
+    """An agent that does nothing, to hold a fork open."""
+
+    async def _run_async_impl(self, ctx):
+        return
+        yield  # pragma: no cover — makes this an async generator
+
+
+async def test_adopt_gives_the_fork_the_real_decision_and_leaves_the_session_alone():
+    """The keep's one write, on its own: the fork reads the real decision from
+    then on, and the real session's state is not the fork's."""
+    previous = _decision("assessment", 0.7)
+    real = RouterDecision.model_validate_json(_decision("account_facts", 0.8))
+    service = InMemorySessionService()
+    session = await service.create_session(
+        app_name="gub", user_id="u", state={"router_decision": previous}
+    )
+    ctx = InvocationContext(
+        session_service=service,
+        invocation_id="inv-adopt",
+        agent=BaseAgent(name="host"),
+        session=session,
+    )
+    run = speculation._Speculation(
+        _Idle(name="idle"), ctx, decision=FALLBACK_DECISION, router_name="router", speculative=False
+    )
+    try:
+        assert router_module.decision_from(run.ctx) == FALLBACK_DECISION  # the fork, before
+        run.adopt(real)
+        assert router_module.decision_from(run.ctx) == real
+        assert router_module.decision_from(run.ctx) != FALLBACK_DECISION
+        assert session.state["router_decision"] == previous  # the real session, untouched
+        # The fork's decision, fallback or real, is this turn's — the brief may
+        # name it; the real session holds an earlier turn's, which it may not.
+        assert router_module.decision_is_this_turns(run.ctx)
+        assert not router_module.decision_is_this_turns(ctx)
+        assert router_module.FORK_DECISION_KEY not in session.state
+    finally:
+        await run.close()
+
+
+async def test_a_run_that_finished_before_the_router_keeps_the_brief_it_composed(
+    monkeypatch, caplog
+):
+    """A router slower than the whole deep run: the gate composed its brief
+    when the decision was still the fork's FALLBACK. The question is in it; an
+    intent is not — and neither is the previous turn's, which session state
+    still holds."""
+    seen = _probe_decision_at_the_formatter(monkeypatch)
+    built = _build(
+        speculative=True,
+        router=[_decision("assessment", 0.9), _decision("exploratory", 0.8)],
+        router_until=ran_to_end,
+    )
+    session = await _Session(built.root).open()
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
+        await session.turn("first question")
+        await session.turn("second question")
+
+    assert [line.split()[1] for line in _lines(caplog, "speculation:")] == ["outcome=kept"] * 2
+    assert seen == [FALLBACK_DECISION, FALLBACK_DECISION]
+    first, second = _briefs_of(built)
+    assert first.startswith("QUESTION: first question\n\nEXECUTOR ANSWER")
+    assert second.startswith("QUESTION: second question\n\nEXECUTOR ANSWER")
+    assert "INTENT:" not in first + second and "assessment" not in second
+
+
+async def test_a_fast_decision_kept_for_a_lookup_that_declines_in_code_reads_it_too(
+    monkeypatch, caplog
+):
+    """SPECULATIVE_FAST_PRECHECK keeps the run for a fast decision the lookup
+    would hand back. The deep run's brief then names that decision's intent —
+    the serial root's brief, whose fast path declined and whose deep path read
+    the same decision from the real session."""
+    seen = _probe_decision_at_the_formatter(monkeypatch)
+    _gub_tools(monkeypatch)
+    briefs = []
+    for speculative in (False, True):
+        seen.clear()
+        if speculative:
+            monkeypatch.setattr(speculation, "SPECULATIVE_FAST_PRECHECK", True)
+            built = _build(speculative=True, router=[Q9], exec_delays=[0.4], router_until=mid_call)
+        else:
+            built = _build(speculative=False, router=[Q9])
+        monkeypatch.setattr(dp, "fast_path", built.fast)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="gub_agent"):
+            await _one_turn(built, Q9_TEXT)
+        [brief] = _briefs_of(built)
+        briefs.append(brief)
+        assert [d.intent for d in seen] == ["count_or_rank"]
+
+    assert any(line.startswith("speculation: outcome=kept ") for line in _gub_lines(caplog))
+    assert briefs[0] == briefs[1]
+    assert briefs[1].startswith(f"QUESTION: {Q9_TEXT}\nINTENT: count_or_rank\n\nEXECUTOR ANSWER")
+
+
+async def test_a_restarted_run_is_forked_with_the_decision_and_briefs_it(monkeypatch, caplog):
+    """The restart already carried the real decision; it must keep doing so."""
+    monkeypatch.setattr(config, "FILE_SEARCH_ENABLED", True)
+    seen = _probe_decision_at_the_formatter(monkeypatch)
+    # The router answers once the speculative run has ended, not on a clock: the
+    # run reaches its formatter (and composes its brief) on the fork's fallback
+    # before the decision exists, however slow the machine is.
+    built = _build(
+        speculative=True,
+        router=[_decision("file_lookup", 0.9)],
+        router_delay=0.01,
+        router_until=ran_to_end,
+    )
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.dispatcher"):
+        await _one_turn(built, "find the chevy brief")
+
+    assert "outcome=restarted:file_lookup" in _lines(caplog, "speculation:")[-1]
+    # The thrown-away run had already reached its formatter on the fork's
+    # fallback (nothing of it is kept); the restart is the turn's real run.
+    discarded, restarted = _briefs_of(built)
+    assert [d.intent for d in seen] == ["exploratory", "file_lookup"]
+    assert discarded.startswith("QUESTION: find the chevy brief\n\nEXECUTOR ANSWER")
+    assert restarted.startswith("QUESTION: find the chevy brief\nINTENT: file_lookup\n\n")
+
+
 async def test_a_declining_fast_path_runs_alone_and_then_a_fresh_deep_path(monkeypatch, caplog):
     """The fast path resets and fills the invocation's evidence index, so it
     never runs beside a speculation: the speculation is stopped first, and a
@@ -980,6 +1164,7 @@ async def test_a_fast_path_answer_after_a_finished_speculation_leaves_nothing_of
 # ── kept: a fast path that would decline in code (SPECULATIVE_FAST_PRECHECK) ──
 
 ACCOUNT_ID = "fdb3f9ff-8094-4851-8ad4-a62f82761ad9"
+PIECE_ID = "5e1c7d2a-9b3f-4c68-8a41-0d2f6b7e9c13"
 # The bot's prefix when it has a best guess (blend 02), which the router copies
 # into `entity_id` and the fast path reads as part of the question.
 GUESS = (
@@ -1031,6 +1216,26 @@ DECLINED_IN_CODE = [
         "shape_other",
         1,
         id="which-campaigns",
+    ),
+    # BE-6, the 2026-10-08 18:32 turn: the reader picked a piece, the router
+    # copied its id and routed a campaign intent. `_campaign` hands this over
+    # before any call, so the precheck says so and the speculation is kept.
+    pytest.param(
+        _decision("campaign_facts", 0.95, entity_surface="Hero Spot 30s", entity_id=PIECE_ID),
+        f'User selected piece {PIECE_ID} "Hero Spot 30s". Original question: статус ролика',
+        "entity_type",
+        0,
+        id="piece-id-on-a-campaign-intent",
+    ),
+    # The same turn once the chat client has reworded the prefix head: nothing
+    # vouches for the id any more. With the precheck on `_campaign` never runs,
+    # so this slug is the only line that tells the drift from a piece turn.
+    pytest.param(
+        _decision("campaign_facts", 0.95, entity_surface="Hero Spot 30s", entity_id=PIECE_ID),
+        f'User picked piece {PIECE_ID} "Hero Spot 30s". Original question: статус ролика',
+        "entity_type_unknown",
+        0,
+        id="piece-id-from-a-reworded-prefix",
     ),
 ]
 

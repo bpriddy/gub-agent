@@ -28,6 +28,8 @@ from typing import Any
 
 from google.genai import types as genai_types
 
+from ..tenant import label_of
+
 logger = logging.getLogger(__name__)
 
 # Healthy questions finish in 2-4 rounds (find → detail → maybe refine → answer).
@@ -90,5 +92,10 @@ def round_limit(callback_context: Any, llm_request: Any) -> None:
             ],
         )
     ]
-    logger.warning("round_limit: HIT (round %d, inv=%s) — tools removed", rnd, invocation_id)
+    logger.warning(
+        "round_limit: HIT (round %d, inv=%s) — tools removed tenant=%s",
+        rnd,
+        invocation_id,
+        label_of(callback_context),
+    )
     return None

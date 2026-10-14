@@ -28,6 +28,11 @@ from ..config import GUB_AUTHORIZATION_ID, GUB_BASE_URL, GUB_SERVICE_JWT
 
 logger = logging.getLogger(__name__)
 
+# Returned to the model as the tool result, which it can quote into its answer:
+# a fixed, system-neutral sentence. The exception text (hostnames, TLS detail)
+# stays in the logger.error line next to each use and never reaches the model.
+_UNREACHABLE_MESSAGE = "Could not reach company records right now."
+
 # ── Shared client ─────────────────────────────────────────────────────────────
 
 TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
@@ -275,7 +280,7 @@ async def gub_get(
         }
     except httpx.RequestError as exc:
         logger.error("GUB GET %s request error: %s", path, exc)
-        return {"error": True, "status": 0, "message": f"Could not reach GUB backend: {exc}"}
+        return {"error": True, "status": 0, "message": _UNREACHABLE_MESSAGE}
 
 
 async def gub_post(
@@ -307,14 +312,14 @@ async def gub_post(
         }
     except httpx.RequestError as exc:
         logger.error("GUB POST %s request error: %s", path, exc)
-        return {"error": True, "status": 0, "message": f"Could not reach GUB backend: {exc}"}
+        return {"error": True, "status": 0, "message": _UNREACHABLE_MESSAGE}
 
 
 def _friendly_error(status: int, path: str) -> str:
     if status == 401:
-        return "Authentication failed — the GUB session may have expired."
+        return "Authentication failed — your session may have expired."
     if status == 403:
         return f"Access denied to {path}. The user may not have permission to view this data."
     if status == 404:
         return f"Resource not found at {path}."
-    return f"GUB returned an unexpected error ({status}) for {path}."
+    return f"Company records returned an unexpected error ({status}) for {path}."

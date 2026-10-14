@@ -21,6 +21,7 @@ from google.adk.agents import BaseAgent
 from google.adk.events import Event, EventActions
 from google.genai import types as genai_types
 
+from gub_agent.agents import dispatcher as dp
 from gub_agent.agents import fast_path as fp
 from gub_agent.agents.answers import not_found_payload
 from gub_agent.agents.evidence_index import answer_draft, evidence_index
@@ -28,6 +29,8 @@ from gub_agent.agents.format_gate import FormatGate, gate_problems
 from gub_agent.agents.formatter import ANSWER_STATE_KEY
 from gub_agent.schemas import RouterDecision
 from tests.helpers import invocation_ctx
+
+from .test_router import CAMPAIGN_ID, PIECE_ID, _guess, _selected
 
 INV = "inv-fast"
 
@@ -126,6 +129,22 @@ async def _ctx(decision: RouterDecision | None = None, question: str = "стат
     if decision is not None:
         state["router_decision"] = decision.model_dump()
     return await invocation_ctx(state=state, invocation_id=INV, user_text=question)
+
+
+async def _bot_ctx(
+    kind: str,
+    entity_id: str,
+    question: str = "статус Silverado 2026 Q3",
+    *,
+    guess: bool = False,
+    name: str = "Silverado 2026 Q3",
+    **over,
+):
+    """A turn the bot resolved: its prefix in front of `question` — the bot's
+    own wording, so `entity_type` comes out of the same parse production runs —
+    and a router decision that copied the id out of it."""
+    prefix = (_guess if guess else _selected)(kind, entity_id, name, question)
+    return await _ctx(_decision(entity_id=entity_id, **over), prefix)
 
 
 def _hit(**over) -> dict:
@@ -383,9 +402,10 @@ def _progress(events: list) -> list[tuple[str, bool]]:
     return out
 
 
-async def test_a_selected_campaign_id_skips_the_search_entirely(gub, gate):
+@pytest.mark.parametrize("guess", [False, True], ids=["selected", "best-guess"])
+async def test_a_bot_supplied_campaign_id_skips_the_search_entirely(gub, gate, guess):
     gub.on("GET", "/org/campaigns/", CAMPAIGN)
-    ctx = await _ctx(_decision(entity_id="c1"))
+    ctx = await _bot_ctx("campaign", "c1", guess=guess)
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
@@ -454,8 +474,12 @@ async def test_an_empty_detail_result_falls_through_to_the_deep_path(gub, gate):
 
 
 async def test_a_403_is_answered_immediately_without_the_gate(gub, gate):
-    gub.on("GET", "/org/campaigns/", {"error": True, "status": 403, "message": "denied"})
-    ctx = await _ctx(_decision(entity_id="c1"))
+    # The id came from this path's own search, so a refusal about it IS the
+    # answer to what was asked. (A bot-supplied id is another case, below.)
+    gub.on("GET", "/org/search", {"hits": [_hit()]}).on(
+        "GET", "/org/campaigns/", {"error": True, "status": 403, "message": "denied"}
+    )
+    ctx = await _ctx(_decision())
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
@@ -469,8 +493,10 @@ async def test_a_403_is_answered_immediately_without_the_gate(gub, gate):
 
 
 async def test_a_404_names_what_was_looked_for_in_the_assumption_line(gub, gate):
-    gub.on("GET", "/org/campaigns/", {"error": True, "status": 404, "message": "nope"})
-    ctx = await _ctx(_decision(entity_id="c9"))
+    gub.on("GET", "/org/search", {"hits": [_hit(id="c9")]}).on(
+        "GET", "/org/campaigns/", {"error": True, "status": 404, "message": "nope"}
+    )
+    ctx = await _ctx(_decision())
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
@@ -481,9 +507,225 @@ async def test_a_404_names_what_was_looked_for_in_the_assumption_line(gub, gate)
     assert gate_problems(not_found_payload("ru", "Silverado 2026 Q3"), {}) == []
 
 
+# ── a bot-supplied id (BE-6) ──────────────────────────────────────────────────
+#
+# 2026-10-08 18:32: the reader picked a PIECE from a card; the router copied its
+# id into `entity_id` and called the intent campaign_facts; the fast path asked
+# `/org/campaigns/<piece id>`, got a 404 for a record that exists, and answered
+# "not found" — a shortcut taken on a question nobody had asked. The id is now
+# used only when the bot's own prefix says it is a campaign, and a refusal about
+# an id the bot handed over goes to the deep path (once) instead of being the
+# reader's answer.
+
+PIECE_PREFIXED = "статус ролика Hero Spot 30s"  # the reader's own words, Russian
+
+
+async def _piece_turn(**over):
+    """The 18:32 turn: a piece picked from a card, routed as a campaign intent."""
+    return await _bot_ctx(
+        "piece",
+        PIECE_ID,
+        PIECE_PREFIXED,
+        name="Hero Spot 30s",
+        intent="campaign_facts",
+        entity_surface="Hero Spot 30s",
+        **over,
+    )
+
+
+async def test_a_piece_id_is_never_sent_to_the_campaigns_endpoint(gub, gate):
+    """The 10-08 18:32 case. With GUB answering exactly as it did that evening
+    (404 on `/org/campaigns/<id>`), the old path ANSWERED "not found". Now the
+    fast path makes no call at all — not even the surface search, which could
+    settle on a different campaign than the piece the reader chose — and the
+    turn is the deep path's."""
+    gub.on("GET", "/org/campaigns/", {"error": True, "status": 404, "message": "not found"})
+    gub.on("GET", "/org/search", {"hits": [_hit(name="Hero Spot 30s")]})  # a tempting campaign
+    ctx = await _piece_turn()
+
+    events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert gub.calls == []  # neither /org/campaigns/<piece id> nor /org/search
+    assert _answers(events) == []  # no "not found" for the reader
+    assert fp.outcome(INV) == "deep" and gate.runs == []
+
+
+async def test_the_piece_turn_is_answered_by_the_deep_path_through_the_dispatcher(
+    gub, gate, monkeypatch
+):
+    """…and the turn does get answered: through the dispatcher, the deep agent
+    runs exactly once and its payload is the only one the reader receives."""
+    deep_runs = []
+
+    class Deep(BaseAgent):
+        async def _run_async_impl(self, ctx):
+            deep_runs.append(ctx.invocation_id)
+            payload = {"kind": "answer", "headline": "deep", "citations": [], "facts": []}
+            yield Event(
+                invocation_id=ctx.invocation_id,
+                author="format_gate",
+                content=genai_types.Content(
+                    role="model", parts=[genai_types.Part(text=json.dumps(payload))]
+                ),
+                actions=EventActions(state_delta={ANSWER_STATE_KEY: payload}),
+            )
+
+    gub.on("GET", "/org/campaigns/", {"error": True, "status": 404, "message": "not found"})
+    fast = fp.FastPath(name="fast_path")  # the singleton already has its parent
+    monkeypatch.setattr(dp, "fast_path", fast)
+    agent = dp.Dispatcher(name="dispatcher", sub_agents=[fast, Deep(name="gub_pipeline")])
+    ctx = await _piece_turn(confidence=0.95)
+
+    events = [e async for e in agent.run_async(ctx)]
+
+    assert deep_runs == [INV]
+    assert gub.calls == []
+    payloads = [e.actions.state_delta[ANSWER_STATE_KEY] for e in _answers(events)]
+    assert [p["headline"] for p in payloads] == ["deep"]
+
+
+@pytest.mark.parametrize("kind", ["account", "piece", "staff"])
+@pytest.mark.parametrize("intent", ["campaign_status", "campaign_facts"])
+async def test_only_a_campaign_id_is_used_as_one(gub, gate, caplog, kind, intent):
+    gub.on("GET", "/org/campaigns/", CAMPAIGN)
+    ctx = await _bot_ctx(kind, "x-1", intent=intent)
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert gub.calls == []
+    assert _answers(events) == [] and fp.outcome(INV) == "deep"
+    [line] = [r.getMessage() for r in caplog.records if "is not a campaign" in r.getMessage()]
+    assert line == (
+        f"fast_path: bot-supplied id is not a campaign entity_type={kind} intent={intent}"
+        f" — deep path (inv={INV}) tenant=anomaly"
+    )
+
+
+async def test_an_id_the_prefix_does_not_vouch_for_is_not_used(gub, gate):
+    """The router "copied" an id that is not the prefix's (or there is no prefix
+    to copy it from). Whatever it is, it is not shown to be a campaign."""
+    gub.on("GET", "/org/campaigns/", CAMPAIGN)
+    other = _decision(entity_id="c1")  # prefix names a different id
+    mangled = await _ctx(other, _selected("campaign", "c2", "Silverado", "статус?"))
+    invented = await _ctx(_decision(entity_id="c1"), "статус Silverado 2026 Q3")
+
+    for ctx in (mangled, invented):
+        events = [e async for e in fp.fast_path.run_async(ctx)]
+        assert _answers(events) == [] and fp.outcome(INV) == "deep"
+    assert gub.calls == []
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize("guess", [False, True], ids=["selected", "best-guess"])
+async def test_a_refusal_about_a_bot_supplied_id_falls_through_to_the_deep_path_once(
+    gub, gate, caplog, status, guess
+):
+    gub.on("GET", "/org/campaigns/", {"error": True, "status": status, "message": "refused"})
+    ctx = await _bot_ctx("campaign", "c1", guess=guess)
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert gub.calls == [("GET", "/org/campaigns/c1")]  # asked once: no retry, no search
+    assert _answers(events) == []  # no "not found" / "no access" on the reader's behalf
+    assert fp.outcome(INV) == "deep" and gate.runs == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any(m.startswith("fast_path: shortcut") for m in messages)  # nothing was answered
+    assert f"fast_path: bot-supplied id refused status={status} entity_type=campaign" in (
+        next(m for m in messages if "bot-supplied id refused" in m)
+    )
+
+
+async def test_the_deep_path_runs_exactly_once_after_a_refused_bot_id(gub, gate, monkeypatch):
+    deep_runs = []
+
+    class Deep(BaseAgent):
+        async def _run_async_impl(self, ctx):
+            deep_runs.append(ctx.invocation_id)
+            return
+            yield  # pragma: no cover — an async generator that says nothing
+
+    gub.on("GET", "/org/campaigns/", {"error": True, "status": 404, "message": "gone"})
+    fast = fp.FastPath(name="fast_path")
+    monkeypatch.setattr(dp, "fast_path", fast)
+    agent = dp.Dispatcher(name="dispatcher", sub_agents=[fast, Deep(name="gub_pipeline")])
+    ctx = await _bot_ctx("campaign", "c1", confidence=0.95)
+
+    [e async for e in agent.run_async(ctx)]
+
+    assert deep_runs == [INV]
+    assert gub.calls == [("GET", "/org/campaigns/c1")]
+
+
+async def test_a_refusal_about_an_id_this_path_found_is_still_answered_on_the_spot(
+    gub, gate, caplog
+):
+    """The fall-through is for ids the bot HANDED OVER. An id the fast path
+    resolved itself, from the reader's own words, keeps the shortcut — and its
+    line, byte for byte."""
+    gub.on("GET", "/org/search", {"hits": [_hit()]}).on(
+        "GET", "/org/campaigns/", {"error": True, "status": 404, "message": "nope"}
+    )
+    ctx = await _ctx(_decision())
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        events = [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert len(_answers(events)) == 1 and fp.outcome(INV) == "answered"
+    assert [r.getMessage() for r in caplog.records if "shortcut" in r.getMessage()] == [
+        f"fast_path: shortcut status=404 intent=campaign_status inv={INV} tenant=anomaly"
+    ]
+    assert not any("bot-supplied" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_prefix_less_turn_resolves_exactly_as_before(gub, gate):
+    """No prefix, no id: the surface goes through `/org/search` and the hit's id
+    is fetched — the path every turn without a bot-resolved entity takes."""
+    gub.on("GET", "/org/search", {"hits": [_hit()]}).on("GET", "/org/campaigns/", CAMPAIGN)
+    ctx = await _ctx(_decision(), "статус Silverado 2026 Q3")
+
+    [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert gub.calls == [("GET", "/org/search"), ("GET", "/org/campaigns/c1")]
+    assert fp.outcome(INV) == "answered"
+
+
+async def test_the_bots_literal_prefix_reaches_the_lookup_end_to_end(gub, gate):
+    """The wire, start to finish, with the bot's own Russian original question:
+    its prefix → the parsed type → the one `/org/campaigns/<uuid>` call."""
+    gub.on("GET", "/org/campaigns/", CAMPAIGN)
+    text = _guess("campaign", CAMPAIGN_ID, "Silverado", "какой статус у кампании?", "Chevy")
+    ctx = await _ctx(_decision(entity_id=CAMPAIGN_ID), text)
+
+    [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert gub.calls == [("GET", f"/org/campaigns/{CAMPAIGN_ID}")]
+    assert fp.outcome(INV) == "answered"
+
+
+async def test_ids_of_other_types_do_not_touch_the_account_and_staff_lookups(gub, gate):
+    """BE-6 changes the campaign lookup only: the account and staff lookups
+    never read `entity_id`, with or without a type."""
+    gub.on("GET", "/org/search", {"hits": [_hit(type="account", id="a1", name="Chevy")]})
+    gub.on("GET", "/org/accounts/", {"id": "a1", "name": "Chevy", "status": "active"})
+    ctx = await _bot_ctx(
+        "account",
+        "a1",
+        "как дела у Chevy?",
+        name="Chevy",
+        intent="account_facts",
+        entity_surface="Chevy",
+    )
+
+    [e async for e in fp.fast_path.run_async(ctx)]
+
+    assert [path for _, path in gub.calls][0] == "/org/search"  # resolved by name, as before
+
+
 async def test_a_500_falls_through_to_the_deep_path(gub, gate):
     gub.on("GET", "/org/campaigns/", {"error": True, "status": 500, "message": "boom"})
-    ctx = await _ctx(_decision(entity_id="c1"))
+    ctx = await _bot_ctx("campaign", "c1")
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
@@ -496,7 +738,7 @@ async def test_an_unexpected_exception_costs_the_deep_path_not_the_turn(monkeypa
         raise RuntimeError("httpx exploded")
 
     monkeypatch.setattr(import_module("gub_agent.tools.accounts"), "gub_get", boom)
-    ctx = await _ctx(_decision(entity_id="c1"))
+    ctx = await _bot_ctx("campaign", "c1")
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
@@ -602,7 +844,7 @@ async def test_the_real_gate_renders_the_fast_path_draft_and_grounds_it(gub, mon
 
 async def test_the_fast_path_announces_its_tool_before_calling_it(gub, gate):
     gub.on("GET", "/org/campaigns/", CAMPAIGN)
-    ctx = await _ctx(_decision(entity_id="c1"))
+    ctx = await _bot_ctx("campaign", "c1")
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
@@ -632,7 +874,7 @@ async def test_a_ping_carries_no_text_so_it_cannot_reach_the_answer(gub, gate):
     """The bot builds the reply from `extractText(evt)`. A progress ping that
     carried text would be appended to the answer the reader sees."""
     gub.on("GET", "/org/campaigns/", CAMPAIGN)
-    ctx = await _ctx(_decision(entity_id="c1"))
+    ctx = await _bot_ctx("campaign", "c1")
 
     events = [e async for e in fp.fast_path.run_async(ctx)]
 
@@ -784,6 +1026,52 @@ PURE_DECLINES = [
         "no_surface",
         id="campaign-blank-no-id",
     ),
+    # BE-6: the id the bot handed over is a piece (the 2026-10-08 18:32 turn) or
+    # an account, so `_campaign` hands the turn over before any call — whatever
+    # the surface says, and with the prefix the real run reads its type from.
+    pytest.param(
+        {
+            "intent": "campaign_facts",
+            "entity_surface": "Hero Spot 30s",
+            "entity_id": PIECE_ID,
+            "entity_type": "piece",
+        },
+        _selected("piece", PIECE_ID, "Hero Spot 30s", "статус ролика Hero Spot 30s"),
+        "entity_type",
+        id="campaign-intent-on-a-piece-id",
+    ),
+    pytest.param(
+        {
+            "intent": "campaign_status",
+            "entity_surface": None,
+            "entity_id": ACCOUNT_ID,
+            "entity_type": "account",
+        },
+        GUESS + "What is the status?",
+        "entity_type",
+        id="campaign-intent-on-an-account-id-by-id-only",
+    ),
+    # An id with no type the prefix vouches for: the router invented it, or
+    # mangled the copy. The lookup treats it the same way.
+    pytest.param(
+        {"intent": "campaign_status", "entity_surface": "Silverado", "entity_id": "c1"},
+        "статус Silverado",
+        "entity_type_unknown",
+        id="campaign-intent-on-an-untyped-id",
+    ),
+    # The chat client rewords the prefix head: the id the router copied is no
+    # longer vouched for, and that is a reason of its own (not "entity_type"),
+    # so the drift stays countable when the precheck is the only line written.
+    pytest.param(
+        {
+            "intent": "campaign_facts",
+            "entity_surface": "Hero Spot 30s",
+            "entity_id": PIECE_ID,
+        },
+        f'User picked piece {PIECE_ID} "Hero Spot 30s". Original question: статус ролика',
+        "entity_type_unknown",
+        id="campaign-intent-on-an-id-from-a-reworded-prefix",
+    ),
     pytest.param(
         {
             "intent": "count_or_rank",
@@ -907,9 +1195,26 @@ async def test_a_ranking_without_a_metric_is_declined_without_resolving_the_acco
 NEEDS_A_CALL = [
     pytest.param({"intent": "campaign_status"}, "статус Silverado 2026 Q3", id="campaign-by-name"),
     pytest.param(
-        {"intent": "campaign_facts", "entity_surface": None, "entity_id": "c1"},
+        {
+            "intent": "campaign_facts",
+            "entity_surface": None,
+            "entity_id": "c1",
+            "entity_type": "campaign",
+        },
         "tell me about it",
         id="campaign-by-id",
+    ),
+    # An id the bot vouched for as a campaign is fetched even with a blank
+    # surface; only the call can say whether GUB has it.
+    pytest.param(
+        {
+            "intent": "campaign_status",
+            "entity_surface": "Silverado",
+            "entity_id": "c1",
+            "entity_type": "campaign",
+        },
+        "статус Silverado",
+        id="campaign-by-id-and-name",
     ),
     pytest.param(
         {"intent": "account_facts", "entity_surface": "Chevy"}, "chevy?", id="account-by-name"
@@ -979,8 +1284,15 @@ def _soundness_table() -> list[tuple[dict, str]]:
     for intent in ("campaign_status", "campaign_facts", "account_facts", "staff_lookup"):
         for surface in (None, "", "   ", "Chevy"):
             for entity_id in (None, "", ACCOUNT_ID):
-                over = {"intent": intent, "entity_surface": surface, "entity_id": entity_id}
-                cases.append((over, GUESS + "how is chevy doing?"))
+                # What the bot's prefix said the id is (None: nothing vouched).
+                for entity_type in (None, "campaign", "account"):
+                    over = {
+                        "intent": intent,
+                        "entity_surface": surface,
+                        "entity_id": entity_id,
+                        "entity_type": entity_type,
+                    }
+                    cases.append((over, GUESS + "how is chevy doing?"))
     questions = (
         "how many campaigns are live?",  # count
         "which campaign has the largest budget?",  # rank

@@ -21,6 +21,14 @@ Two rules this schema encodes, both load-bearing:
   it on its own. An id the router invented would send a deterministic lookup
   at a nonexistent row.
 
+`entity_type` is the id's KIND, and it is not the router's to say. The id came
+from a prefix that names its type, and a model asked to repeat that word is a
+model that can get it wrong; so code reads it off the prefix
+(`agents/router.py:with_entity_type`) and the router's structured output never
+mentions it. That is also why it is hidden from the JSON schema and from
+`model_dump`: the router's request and its stored decision stay byte-for-byte
+what they were.
+
 `slots` is a TYPED object, not the free `dict[str, str]` the spec sketched.
 Measured 2026-09-10 on `gemini-3.5-flash`: the free-map shape is accepted by
 Vertex structured output but the model leaves it EMPTY — over six runs, in the
@@ -47,6 +55,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 
 # The eleven intents. Ordered as the prompt lists them: the five FACT-shaped
 # ones the fast path can serve, then the ones that need the executor, then the
@@ -126,6 +135,15 @@ class RouterDecision(BaseModel):
     # Copied from the bot's "User selected …" / "Best guess: …" prefix, never
     # invented.
     entity_id: str | None = None
+    # The kind of record `entity_id` names — "campaign", "account", "piece" or
+    # "staff" (the bot's CLARIFIABLE_TYPES) — read in code off that same
+    # prefix, and None on every turn that has no bot-supplied id. Never part
+    # of what the router emits (see the module docstring): `SkipJsonSchema`
+    # keeps it out of the structured-output schema the model is given, and
+    # `exclude` keeps it out of the stored decision. It still VALIDATES, so a
+    # decision can be built with it, and `agents/router.py:decision_from`
+    # always overwrites it with what the prefix says.
+    entity_type: SkipJsonSchema[str | None] = Field(default=None, exclude=True)
     slots: Slots = Field(default_factory=Slots)
     missing_slots: list[str] = Field(default_factory=list)
     language: Literal["ru", "en"] = "en"
