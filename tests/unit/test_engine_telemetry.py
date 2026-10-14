@@ -15,7 +15,11 @@ Pinned:
     repair rates are read with `textPayload:"format_gate"` and an engine line
     carries its logger's file name — in its text, its logger name or its file;
   * the five existing lines keep their old text byte for byte and end in
-    `tenant=<label>`; the 403/404 shortcut has a line of its own.
+    `tenant=<label>`; the 403/404 shortcut has a line of its own;
+  * BE-6 adds two fast-path lines and changes no old one: a 403/404 on an id the
+    bot supplied (`bot-supplied id refused …`) and an id that is not a campaign
+    (`bot-supplied id is not a campaign …`); the `shortcut` line still counts
+    only the refusals the fast path answered itself.
 """
 
 from __future__ import annotations
@@ -447,6 +451,78 @@ async def test_the_403_404_shortcut_has_its_own_line(status, caplog):
     assert [r.getMessage() for r in caplog.records] == [
         f"fast_path: shortcut status={status} intent=campaign_status inv={INV} tenant=chevy"
     ]
+
+
+@pytest.mark.parametrize("status", [403, 404])
+async def test_a_refused_bot_supplied_id_has_its_own_line_and_no_shortcut_line(status, caplog):
+    """BE-6. The `shortcut` line counts the turns the fast path ANSWERED on a
+    refusal; a refusal about an id the bot handed over is answered by the deep
+    path, so it is logged apart and the old line keeps its meaning."""
+    ctx = await invocation_ctx(state={"tenant": "chevy"}, invocation_id=INV, user_text="x")
+    shim = fp._ToolShim(ctx)
+    decision = _decision(entity_id="c1", entity_type="campaign")
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        assert (
+            fp._shortcut({"error": True, "status": status}, decision, shim, bot_supplied=True)
+            is None
+        )
+    [line] = [r.getMessage() for r in caplog.records]
+    assert line == (
+        f"fast_path: bot-supplied id refused status={status} entity_type=campaign"
+        f" intent=campaign_status — deep path (inv={INV}) tenant=chevy"
+    )
+    assert "fast_path: shortcut" not in line
+
+
+async def test_a_bot_supplied_id_with_any_other_error_logs_the_usual_deep_path_line(caplog):
+    ctx = await invocation_ctx(state={"tenant": "chevy"}, invocation_id=INV, user_text="x")
+    decision = _decision(entity_id="c1", entity_type="campaign")
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        assert (
+            fp._shortcut(
+                {"error": True, "status": 500}, decision, fp._ToolShim(ctx), bot_supplied=True
+            )
+            is None
+        )
+    assert [r.getMessage() for r in caplog.records] == [
+        f"fast_path: 500 from the lookup — deep path (inv={INV}) tenant=chevy"
+    ]
+
+
+async def test_the_untyped_id_line_says_dash_and_ends_in_tenant(caplog):
+    ctx = await invocation_ctx(
+        state={"gub_jwt": "jwt", "tenant": "chevy"}, invocation_id=INV, user_text="x"
+    )
+    decision = _decision(entity_id="c1")  # an id no prefix vouched for
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        assert await fp._campaign(decision, fp._ToolShim(ctx), "x") is None
+    assert [r.getMessage() for r in caplog.records] == [
+        "fast_path: bot-supplied id is not a campaign entity_type=- intent=campaign_status"
+        f" — deep path (inv={INV}) tenant=chevy"
+    ]
+
+
+async def test_the_new_fast_path_lines_never_match_the_format_gate_query(caplog):
+    """`textPayload:"format_gate"` is the gate's drop/repair rate query (see
+    the module docstring): neither BE-6 line may match it, in its text, its
+    logger name or its file."""
+    ctx = await invocation_ctx(state={"tenant": "chevy"}, invocation_id=INV, user_text="x")
+    shim = fp._ToolShim(ctx)
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.fast_path"):
+        fp._shortcut(
+            {"error": True, "status": 404},
+            _decision(entity_id="c1", entity_type="campaign"),
+            shim,
+            bot_supplied=True,
+        )
+        await fp._campaign(_decision(entity_id="c1", entity_type="piece"), shim, "x")
+    assert len(caplog.records) == 2
+    for record in caplog.records:
+        assert "format_gate" not in record.getMessage()
+        assert "format_gate" not in record.name
+        assert "format_gate" not in record.filename
+        assert "format_gate" not in record.pathname
+        assert record.getMessage().endswith("tenant=chevy")
 
 
 async def test_other_statuses_log_only_the_deep_path_line(caplog):
