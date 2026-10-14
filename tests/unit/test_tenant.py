@@ -199,8 +199,10 @@ from gub_agent.prompts import (  # noqa: E402
 )
 
 # sha256 of the base prompts as they were BEFORE the tenant persona landed.
+# The executor pin is the base after the format-rule fix that landed on the same
+# branch; the tenant persona itself does not change the no-tenant text.
 _BASE_SHA = {
-    "executor": "3ed9237c0c5391ff101fc11ee7f347105af2273fc2527327cb9d77ac0e6e9233",
+    "executor": "263a872ec6faff5a477d7ed835264320b90c79da2543e88dbe7d68bdee27f428",
     "router": "4f1cd2536b86bcd705e72173479e5c855fe9a5f060be5cf660f3de8095a0b33e",
     "critic": "be0f0e11fb1f524d917c1112e588381f5a28ba1aa439afafe10ed714fd4080db",
 }
