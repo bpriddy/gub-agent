@@ -387,6 +387,23 @@ _RESOURCING_BULLET = (
 )
 
 
+_TENANT_TAIL_EDITS = (
+    ("Do NOT answer it from GUB or", "Do NOT answer it from company records or"),
+    ("campaigns, pieces, ideas, or staff \u2014", "campaigns, pieces, or ideas \u2014"),
+    (
+        'Example: "Staff who led campaigns over $1M for auto accounts"',
+        'Example: "Campaigns over $1M for auto accounts"',
+    ),
+    (
+        "campaigns where\n  accountId in A and budget>1M \u2192 rows already carry "
+        "`createdByName`, so\n"
+        "  chain a (3) staff-by-id query ONLY when you need staff fields beyond the\n  name.",
+        "campaigns where\n  accountId in A and budget>1M.",
+    ),
+    ('      staff:     "active", "on_leave", "former"\n', ""),
+)
+
+
 def _build_tenant_instruction() -> str:
     base = EXECUTOR_INSTRUCTION
     head, sep1, rest = base.partition(_PERSONA_END)
@@ -394,6 +411,10 @@ def _build_tenant_instruction() -> str:
     if not (sep1 and sep2) or _RESOURCING_BULLET not in tail:
         raise RuntimeError("executor prompt markers moved; update the tenant persona slicing")
     tail = tail.replace(_RESOURCING_BULLET, "")
+    for marker, repl in _TENANT_TAIL_EDITS:
+        if marker not in tail:
+            raise RuntimeError("executor prompt markers moved; update the tenant persona slicing")
+        tail = tail.replace(marker, repl)
     return _TENANT_PERSONA + _TENANT_CAPABILITIES + sep2 + tail
 
 

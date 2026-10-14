@@ -278,6 +278,21 @@ def test_tenant_persona_uses_neutral_vocabulary() -> None:
         assert banned not in persona, banned
 
 
+def test_tenant_prompt_has_no_internal_names_or_staff_directory_text() -> None:
+    for banned in (
+        "GUB",
+        "Universal Backend",
+        "Gemini",
+        "federated",
+        "spoke",
+        "on_leave",
+        "Staff who led",
+        "staff-by-id",
+    ):
+        assert banned not in TENANT_EXECUTOR_INSTRUCTION, banned
+    assert "ideas, or staff" not in TENANT_EXECUTOR_INSTRUCTION
+
+
 def test_tenant_executor_prompt_names_no_client_until_the_block() -> None:
     assert "chevy" not in TENANT_EXECUTOR_INSTRUCTION.partition(_SCOPE)[0].lower()
 
