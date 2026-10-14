@@ -198,6 +198,7 @@ def tenant_note_formatter(tenant: str) -> str:
 def tenant_instruction(
     base_provider: Callable[[ReadonlyContext], str],
     note: Callable[[str], str] = tenant_note,
+    tenant_base: Callable[[ReadonlyContext], str] | None = None,
 ) -> Callable[[ReadonlyContext], str]:
     """Wrap an InstructionProvider so a tenant turn carries the scope block.
 
@@ -205,13 +206,16 @@ def tenant_instruction(
     and the surface a turn arrived through is true of that run either way. With
     no tenant in state the base provider's text is returned unchanged — same
     object, no concatenation.
+
+    `tenant_base`, when given, REPLACES the base provider on a tenant turn (the
+    executor's tenant persona); it never runs without a tenant.
     """
 
     def provider(ctx: ReadonlyContext) -> str:
         tenant = read_tenant(_state_of(ctx))
-        base = base_provider(ctx)
         if tenant is None:
-            return base
+            return base_provider(ctx)
+        base = (tenant_base or base_provider)(ctx)
         return f"{base}\n\n{note(tenant)}"
 
     return provider

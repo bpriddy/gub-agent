@@ -182,3 +182,106 @@ def test_dispatcher_line_keeps_its_existing_fields_and_gains_tenant(
     assert line.startswith("dispatcher: intent=count_or_rank confidence=0.91 branch=fast")
     assert "(inv=inv-1)" in line
     assert line.endswith("tenant=chevy")
+
+
+# ── 6. BE-7: tenant-aware persona ───────────────────────────────────────────
+
+import hashlib  # noqa: E402
+
+from gub_agent import agent as _agent  # noqa: E402
+from gub_agent.agents import critic as _critic  # noqa: E402
+from gub_agent.agents import router as _router  # noqa: E402
+from gub_agent.prompts import (  # noqa: E402
+    CRITIC_INSTRUCTION,
+    EXECUTOR_INSTRUCTION,
+    ROUTER_INSTRUCTION,
+    TENANT_EXECUTOR_INSTRUCTION,
+)
+
+# sha256 of the base prompts as they were BEFORE the tenant persona landed.
+_BASE_SHA = {
+    "executor": "3ed9237c0c5391ff101fc11ee7f347105af2273fc2527327cb9d77ac0e6e9233",
+    "router": "4f1cd2536b86bcd705e72173479e5c855fe9a5f060be5cf660f3de8095a0b33e",
+    "critic": "be0f0e11fb1f524d917c1112e588381f5a28ba1aa439afafe10ed714fd4080db",
+}
+_SCOPE = "## Scope — decide first"
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _render(agent, state: dict) -> str:
+    ctx = SimpleNamespace(state=state, session=SimpleNamespace(state=state, events=[]))
+    return agent.instruction(ctx)
+
+
+def test_base_prompts_are_byte_identical_to_pre_tenant_persona() -> None:
+    assert _sha(EXECUTOR_INSTRUCTION) == _BASE_SHA["executor"]
+    assert _sha(ROUTER_INSTRUCTION) == _BASE_SHA["router"]
+    assert _sha(CRITIC_INSTRUCTION) == _BASE_SHA["critic"]
+
+
+@pytest.mark.parametrize(
+    "agent", [_agent.executor_agent, _router.router_agent, _critic.critic_agent]
+)
+def test_no_tenant_renders_no_tenant_text(agent) -> None:
+    out = _render(agent, {"gub_jwt": "jwt"})
+    assert "## Tenant surface" not in out
+    assert "one client account's team" not in out
+
+
+def test_no_tenant_executor_keeps_the_agency_persona() -> None:
+    out = _render(_agent.executor_agent, {"gub_jwt": "jwt"})
+    assert out.startswith(EXECUTOR_INSTRUCTION)
+
+
+@pytest.mark.parametrize("agent", [_router.router_agent, _critic.critic_agent])
+def test_router_and_critic_carry_the_scope_block_on_a_tenant_turn(agent) -> None:
+    out = _render(agent, {"gub_jwt": "jwt", "tenant": "chevy"})
+    assert "## Tenant surface" in out
+    assert "chevy" in out
+
+
+def test_tenant_executor_swaps_the_agency_persona() -> None:
+    out = _render(_agent.executor_agent, {"gub_jwt": "jwt", "tenant": "chevy"})
+    assert "one client account's team" in out
+    assert "## Tenant surface" in out
+    for gone in (
+        "You are GUB AI",
+        "agency operations",
+        "find_staff_for_resourcing",
+        "get_staff_profile",
+        "resourcing requests",
+        "GUB indexes",
+    ):
+        assert gone not in out, gone
+
+
+def test_tenant_executor_keeps_tool_use_and_safety_rules() -> None:
+    out = _render(_agent.executor_agent, {"gub_jwt": "jwt", "tenant": "chevy"})
+    base_tail = EXECUTOR_INSTRUCTION.partition(_SCOPE)[2]
+    for rule in (
+        "GROUND EVERY ENTITY IN A TOOL RESULT",
+        "NO_COMPANY_RECORDS",
+        "Never expose internal identifiers",
+        "FAN OUT",
+        "`org_query` filter reference",
+    ):
+        assert rule in out, rule
+        assert rule in base_tail, rule
+
+
+def test_tenant_persona_uses_neutral_vocabulary() -> None:
+    persona = TENANT_EXECUTOR_INSTRUCTION.partition(_SCOPE)[0]
+    for banned in ("GUB", "Universal Backend", "Gemini", "federated", "spoke", "agency"):
+        assert banned not in persona, banned
+
+
+def test_tenant_executor_prompt_names_no_client_until_the_block() -> None:
+    assert "chevy" not in TENANT_EXECUTOR_INSTRUCTION.partition(_SCOPE)[0].lower()
+
+
+def test_a_malformed_tenant_still_fails_loud_on_the_executor() -> None:
+    with pytest.raises(ValueError):
+        _render(_agent.executor_agent, {"gub_jwt": "jwt", "tenant": "Chevy!"})

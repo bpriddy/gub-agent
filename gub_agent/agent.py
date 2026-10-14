@@ -92,7 +92,7 @@ from .config import (
 )
 from .instruction_utils import with_current_date
 from .models import bind_model_call
-from .prompts import EXECUTOR_INSTRUCTION
+from .prompts import EXECUTOR_INSTRUCTION, TENANT_EXECUTOR_INSTRUCTION
 from .sandbox import (
     EXECUTOR_THINKING_LEVEL,
     sandbox_before_model,
@@ -178,7 +178,12 @@ executor_agent = Agent(
     # true of a sandbox run too. A turn with no state["tenant"] gets the inner
     # text unchanged (gub_agent/tenant.py).
     instruction=tenant_instruction(
-        sandbox_instruction(with_current_date(EXECUTOR_INSTRUCTION), role="executor")
+        sandbox_instruction(with_current_date(EXECUTOR_INSTRUCTION), role="executor"),
+        # A tenant turn swaps the agency-wide persona and capability text for
+        # the tenant persona (prompts/executor.py); a sandbox override wins.
+        tenant_base=sandbox_instruction(
+            with_current_date(TENANT_EXECUTOR_INSTRUCTION), role="executor"
+        ),
     ),
     # Native thinking capped at MEDIUM. Unbounded (dynamic) thinking was the top
     # latency driver (thinking_tokens ↔ elapsed r=0.86): hard questions ran away
