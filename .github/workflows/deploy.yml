@@ -33,6 +33,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # First step, before checkout and before any credential is minted: this
+      # workflow updates the shared production engine, so it only runs from
+      # main. The ref is read from the environment, never interpolated.
+      - name: Require main
+        env:
+          DEPLOY_REF: ${{ github.ref }}
+        run: |
+          if [ "$DEPLOY_REF" != "refs/heads/main" ]; then
+            echo "::error::Deploy runs from refs/heads/main only (got: $DEPLOY_REF)."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
