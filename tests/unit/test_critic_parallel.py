@@ -24,7 +24,11 @@ stand-ins only for the three model-backed agents):
   model under a real LlmAgent), and still ends on the escalator with a
   verdict authored `critic`, as the bot's per-pass count expects;
 - CRITIC_PARALLEL=0 builds the serial tree it replaced, and makes the same
-  decisions as the parallel one on the same turns.
+  decisions as the parallel one on the same turns;
+- a critic call whose verdict the pass has already settled in code (an abstain
+  payload) is cancelled instead of waited for, and one whose verdict is needed
+  is not: the stalled-critic tests at the end, whose critic waits on an event
+  that only a LATER step of the turn sets, so the old wiring deadlocks on it.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +54,7 @@ from google.genai import types as genai_types
 
 from gub_agent import config
 from gub_agent.agent import build_deep_agent
+from gub_agent.agents import critic as critic_module
 from gub_agent.agents.critic import (
     CriticGate,
     CriticResolver,
@@ -56,7 +62,8 @@ from gub_agent.agents.critic import (
     EscalateIfSufficient,
     SpeculativeCritic,
 )
-from gub_agent.config import AGENT_NAME
+from gub_agent.config import AGENT_NAME, GEMINI_MODEL
+from gub_agent.models import VendorRouter, bind_model_call
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -106,9 +113,12 @@ class _Executor(BaseAgent):
 
     passes: list = []  # [(made_tool_call, text)], one per pass
     runs: int = 0
+    pass_started: list = []  # asyncio.Event per pass, set when that pass begins
 
     async def _run_async_impl(self, ctx):
         tool_call, text = self.passes[min(self.runs, len(self.passes) - 1)]
+        if self.runs < len(self.pass_started):
+            self.pass_started[self.runs].set()
         self.runs += 1
         if tool_call:
             yield Event(
@@ -147,7 +157,7 @@ class _Formatter(BaseAgent):
     """The format gate's formatter: its payload event carries the branch ADK
     gave it, exactly as an LlmAgent's does."""
 
-    payloads: list = []  # one per pass; None = the gate emits nothing
+    payloads: list = []  # one per pass; None = the gate emits nothing; a tuple = several events
     runs: int = 0
     started: asyncio.Event | None = None  # set on entry
     done: asyncio.Event | None = None  # set once its payload is committed
@@ -164,15 +174,17 @@ class _Formatter(BaseAgent):
             await asyncio.wait_for(self.wait_for.wait(), timeout=self.timeout)
         if self.delay:
             await asyncio.sleep(self.delay)
-        if payload is not None:
+        for emitted in payload if isinstance(payload, tuple) else (payload,):
+            if emitted is None:
+                continue
             yield Event(
                 invocation_id=ctx.invocation_id,
                 author=self.name,
                 branch=ctx.branch,
                 content=genai_types.Content(
-                    role="model", parts=[genai_types.Part(text=json.dumps(payload))]
+                    role="model", parts=[genai_types.Part(text=json.dumps(emitted))]
                 ),
-                actions=EventActions(state_delta={"answer_payload": payload}),
+                actions=EventActions(state_delta={"answer_payload": emitted}),
             )
         # Resumed only after the runner consumed (and appended) the event.
         if self.done is not None:
@@ -232,10 +244,11 @@ def _pipeline(
     verdicts: list | None = None,
     critic_raises: Exception | None = None,
     critic: BaseAgent | None = None,
+    gate_callback=None,
 ) -> tuple[LoopAgent, _Executor, _Formatter, _Critic]:
     executor = _Executor(name=AGENT_NAME, passes=executor_passes, runs=0)
     formatter = _Formatter(name="formatter", payloads=payloads, runs=0)
-    gate = _Gate(name="format_gate", sub_agents=[formatter])
+    gate = _Gate(name="format_gate", sub_agents=[formatter], after_agent_callback=gate_callback)
     if critic is None:
         critic = _Critic(
             name="critic",
@@ -781,9 +794,9 @@ async def test_the_first_pass_still_asks_the_critic_model(parallel):
 @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
 async def test_a_from_memory_retry_is_not_judged_by_the_model_either(parallel):
     """Pass 1 is sent back in code (the from-memory re-query), pass 2 is the
-    last: neither pass is judged by the model. The parallel wiring still spends
-    pass 1's speculative call — the abstain payload is only known after the
-    join — and drops its verdict; pass 2 makes none."""
+    last: neither pass is judged by the model. The parallel wiring still STARTS
+    pass 1's speculative call — the abstain payload is only known once the gate
+    ends — and drops its verdict; pass 2 makes none."""
     critic, model = _llm_critic([INSUFFICIENT])
     loop, executor, _, _ = _pipeline(
         parallel=parallel,
@@ -794,7 +807,12 @@ async def test_a_from_memory_retry_is_not_judged_by_the_model_either(parallel):
 
     streamed, state, _ = await _run(loop, question="whats new")
 
-    assert model.calls == (1 if parallel else 0) and executor.runs == 2
+    # The speculative call is cancelled when the gate ends on the abstain payload
+    # (`settle_speculation`), and here the formatter stand-in answers at once, so
+    # whether the stub model was reached before the cancel is a matter of
+    # scheduling: the bound is what is pinned, not the count. Serial never calls.
+    assert model.calls <= (1 if parallel else 0)
+    assert executor.runs == 2
     requery, last = _critic_verdicts(streamed)
     assert requery["sufficient"] is False and "NO tool call" in requery["feedback"]
     assert last["reason"] == FINAL_PASS_REASON
@@ -954,3 +972,534 @@ async def test_both_wirings_reach_the_same_decisions(
             )
         )
     assert results[0] == results[1]
+
+
+# ── a critic call whose verdict the pass has already settled ──────────────────
+#
+# The ParallelAgent joins only when BOTH branches end. Before the gate's
+# after-callback (critic.py:settle_speculation) an abstain payload — which the
+# resolver settles in code and whose critic verdict it drops — still waited out
+# the critic's model call (tens of seconds on a measured turn). The critic here is
+# STALLED on an event that only a later step of the turn sets (or nobody does),
+# so under the old wiring these turns deadlock, bounded by `_bounded`'s timeout
+# and never by a sleep. No test below synchronises on time.
+
+CLARIFY = {"kind": "clarify", "headline": "Which campaign do you mean?"}
+ABSTAIN_PASS = "Deterministic pass: abstain AnswerPayload (no critic LLM run)."
+
+
+class _StalledCritic(_Critic):
+    """A critic that waits (up to `timeout`, far past any test's own bound) and
+    counts the cancellations it was handed — the proof that a call was
+    abandoned and not merely outlasted."""
+
+    cancelled: int = 0
+    timeout: float = 30.0
+    stall_once: bool = False  # only the first call waits; a re-run answers at once
+
+    async def _run_async_impl(self, ctx):
+        try:
+            async for event in super()._run_async_impl(ctx):
+                yield event
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            if self.stall_once:
+                self.wait_for = None
+            raise
+
+
+def _stalled_pipeline(
+    *,
+    executor_passes: list,
+    payloads: list,
+    release: asyncio.Event | None = None,
+    parallel: bool = True,
+    verdicts: list | None = None,
+    gate_callback=None,
+):
+    """A pipeline whose critic waits on `release` (never set, by default).
+
+    The formatter ends only after the critic call has STARTED: that is when the
+    call is a running task the gate's callback can reach. (In production the
+    formatter takes seconds; here it would otherwise answer before the sibling
+    branch had been scheduled, and the turn would fall back to the old wait.)"""
+    critic = _StalledCritic(
+        name="critic",
+        verdicts=verdicts or [INSUFFICIENT],
+        ran=[],
+        saw=[],
+        session_authors=[],
+        started=asyncio.Event(),
+        wait_for=release if release is not None else asyncio.Event(),
+    )
+    loop, executor, formatter, _ = _pipeline(
+        parallel=parallel,
+        executor_passes=executor_passes,
+        payloads=payloads,
+        critic=critic,
+        gate_callback=gate_callback,
+    )
+    if parallel:
+        formatter.wait_for = critic.started
+    return loop, executor, formatter, critic
+
+
+async def _bounded(loop: LoopAgent, **kwargs):
+    """`_run`, with a fail-safe: a turn that waits on the stalled critic fails
+    here, as an assertion, instead of hanging the suite."""
+    try:
+        return await asyncio.wait_for(_run(loop, **kwargs), timeout=3.0)
+    except TimeoutError:
+        pytest.fail("the turn did not finish: it is waiting for a critic call it does not need")
+
+
+def _nothing_left_running() -> None:
+    """No critic call in the registry, no task of the turn still alive. (The
+    registry is read with a default so a turn that never had one — the old
+    wiring — is judged by its tasks alone.)"""
+    assert getattr(critic_module, "_RUNNING", {}) == {}
+    assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
+
+
+async def test_a_stalled_critic_does_not_delay_the_pass_it_was_dropped_from(caplog):
+    """The case this exists for: pass 1 is a from-memory draft, the gate abstains, the
+    resolver sends it back for a re-query in code — and pass 2 waited for a
+    critic call whose verdict was thrown away. The critic here waits for pass 2
+    to START, which under the old wiring only comes after the join: a deadlock.
+    Now the call is cancelled the moment the gate ends on the abstain payload,
+    and pass 2 runs."""
+    release = asyncio.Event()
+    loop, executor, _, critic = _stalled_pipeline(
+        executor_passes=[(False, "Here is what's new: 3 hires."), (True, "3 hires, 12 live.")],
+        payloads=[ABSTAIN, ANSWER],
+        release=release,
+    )
+    executor.pass_started = [asyncio.Event(), release]
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.critic"):
+        streamed, state, _ = await _bounded(loop, question="whats new")
+
+    assert executor.runs == 2 and release.is_set()  # pass 2 ran
+    assert critic.cancelled == 1  # cancelled — not timed out, not answered
+    assert critic.saw == []  # it never got as far as a verdict
+    requery, last = _critic_verdicts(streamed)
+    assert requery["sufficient"] is False and "NO tool call" in requery["feedback"]
+    assert last["reason"] == FINAL_PASS_REASON
+    assert streamed[-1].author == "loop_escalator"
+    assert "call abandoned" in caplog.text
+    _nothing_left_running()
+
+
+async def test_a_stalled_critic_does_not_delay_an_abstain_after_a_tool_call():
+    """The deterministic pass: the executor looked, the gate abstained, the
+    resolver passes in code. The critic would never have been read; the turn
+    ends without waiting for it (nobody ever releases it here)."""
+    loop, executor, _, critic = _stalled_pipeline(
+        executor_passes=[(True, "No account by that name.")], payloads=[ABSTAIN]
+    )
+
+    streamed, state, session_events = await _bounded(loop)
+
+    assert executor.runs == 1 and critic.cancelled == 1 and critic.saw == []
+    assert state["critic_verdict"]["reason"] == ABSTAIN_PASS
+    assert "critic" not in [e.author for e in streamed]
+    assert "critic" not in [e.author for e in session_events]
+    assert streamed[-1].author == "loop_escalator" and streamed[-1].actions.escalate
+    _nothing_left_running()
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        pytest.param([ANSWER], id="answer"),
+        pytest.param([CLARIFY], id="clarify"),
+        pytest.param([None], id="no-payload"),
+        # One pass, two payload events: the gate abstained, retried and ended on an
+        # answer. The callback reads the pass's LAST payload, not its first.
+        pytest.param([(ABSTAIN, ANSWER)], id="abstain-then-answer"),
+    ],
+)
+async def test_a_verdict_that_matters_is_still_awaited(payloads, caplog):
+    """The critic is released only once the formatter is done. A payload the
+    resolver does not settle in code leaves the call running, and its verdict
+    is the one the loop acts on."""
+    critic = _StalledCritic(
+        name="critic",
+        verdicts=[SUFFICIENT],
+        ran=[],
+        saw=[],
+        session_authors=[],
+        started=asyncio.Event(),
+    )
+    loop, _, formatter, _ = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "12 live campaigns.")],
+        payloads=payloads,
+        critic=critic,
+    )
+    formatter.done = asyncio.Event()
+    critic.wait_for = formatter.done  # the call ends only after the gate has
+    formatter.wait_for = critic.started  # and the gate ends only once it runs
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.critic"):
+        streamed, state, _ = await _bounded(loop)
+
+    assert critic.cancelled == 0 and len(critic.saw) == 1  # it ran to its verdict
+    assert state["critic_verdict"] == SUFFICIENT  # the critic's, not one made in code
+    assert _critic_verdicts(streamed) == [SUFFICIENT]
+    assert "call abandoned" not in caplog.text
+    assert "verdict discarded" not in caplog.text
+    _nothing_left_running()
+
+
+@pytest.mark.parametrize(
+    "executor_passes,payloads",
+    [
+        pytest.param([(False, "Copied."), (True, "12 live.")], [ABSTAIN, ANSWER], id="from-memory"),
+        pytest.param([(True, "No such account.")], [ABSTAIN], id="abstain-after-tool-call"),
+    ],
+)
+async def test_the_stalled_critic_changes_neither_the_events_nor_the_state(
+    executor_passes, payloads
+):
+    """The abandon is invisible to everything downstream: for the same turn the
+    serial wiring (which never calls the critic on an abstain) and the parallel
+    one produce the same complete events, in the same order, with the same
+    state deltas and the same final verdict."""
+    results = []
+    for parallel in (False, True):
+        release = asyncio.Event()
+        loop, executor, _, _ = _stalled_pipeline(
+            executor_passes=executor_passes,
+            payloads=payloads,
+            release=release,
+            parallel=parallel,
+        )
+        executor.pass_started = [asyncio.Event(), release]
+        streamed, state, session_events = await _bounded(loop, question="whats new")
+        results.append(
+            (
+                executor.runs,
+                state["critic_verdict"],
+                _authors(streamed),
+                [json.dumps(e.actions.state_delta, sort_keys=True) for e in _complete(streamed)],
+                [e.author for e in session_events],
+            )
+        )
+    assert results[0] == results[1]
+    _nothing_left_running()
+
+
+async def test_an_abandoned_call_logs_one_line_and_the_discard_line_still_logs(caplog):
+    """Telemetry: ONE new info line, keys in the engine's order with tenant last,
+    and the existing `verdict discarded` line exactly where it was. A second
+    settle (a callback chained AFTER ours calls it again) finds the run already
+    abandoned: no second line, no second cancel — and proves the gate's own
+    callback is chained, not replaced."""
+    chained: list[str] = []
+
+    def later(callback_context):
+        chained.append(callback_context.invocation_id)
+        assert critic_module.settle_speculation(callback_context) is None
+
+    loop, _, _, critic = _stalled_pipeline(
+        executor_passes=[(True, "No account by that name.")],
+        payloads=[ABSTAIN],
+        gate_callback=later,
+    )
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.critic"):
+        await _bounded(loop)
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "gub_agent.agents.critic"]
+    [abandoned] = [m for m in messages if "call abandoned" in m]
+    match = re.fullmatch(
+        r"critic_speculation: call abandoned \(inv=(\S+)\) critic_ms=(\d+) tenant=anomaly",
+        abandoned,
+    )
+    assert match, abandoned
+    [discarded] = [m for m in messages if "critic_speculation: verdict discarded" in m]
+    assert f"(inv={match.group(1)})" in discarded and discarded.endswith(ABSTAIN_PASS)
+    assert messages.index(abandoned) < messages.index(discarded)
+    assert not any("format_gate" in m for m in messages)
+    assert len(chained) == 1 and critic.cancelled == 1
+    _nothing_left_running()
+
+
+async def test_cancelling_the_turn_leaves_no_critic_call_behind():
+    """The outer cancellation (a turn that ended, or a speculative deep run that
+    was thrown away): the call is cancelled and awaited with it — no task, no
+    registry entry — whichever of the two branches was still running."""
+    stuck = asyncio.Event()
+    loop, _, formatter, critic = _stalled_pipeline(
+        executor_passes=[(True, "12 live campaigns.")], payloads=[ANSWER]
+    )
+    formatter.wait_for = stuck  # the gate is still rendering when the cancel comes
+    formatter.timeout = 30.0
+    formatter.started = asyncio.Event()
+
+    turn = asyncio.create_task(_run(loop))
+    await asyncio.wait_for(critic.started.wait(), timeout=3.0)
+    await asyncio.wait_for(formatter.started.wait(), timeout=3.0)
+    assert list(critic_module._RUNNING) != []  # the call is registered while it runs
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert critic.cancelled == 1
+    _nothing_left_running()
+
+
+async def test_a_real_critic_model_call_is_cancelled_and_logs_its_status(caplog):
+    """What the after-deploy readout counts: an abandoned call whose request was
+    in flight writes its `model_call:` line as `agent=critic status=error:cancelled`
+    (models.py), once, so abandoned count == cancelled critic calls. A call
+    cancelled before its request was sent writes no line, so the counts can
+    differ by those."""
+
+    class _Hanging(BaseLlm):
+        reached: asyncio.Event | None = None
+
+        @classmethod
+        def supported_models(cls):
+            return [r".*"]
+
+        async def generate_content_async(self, llm_request, stream=False):
+            self.reached.set()
+            await asyncio.Event().wait()
+            yield LlmResponse()  # unreachable
+
+    model = _Hanging(model=GEMINI_MODEL, reached=asyncio.Event())
+    critic = LlmAgent(
+        name="critic",
+        model=VendorRouter(model=GEMINI_MODEL, gemini=model),  # type: ignore[arg-type]
+        instruction="Judge the executor's tool coverage.",
+        output_schema=CriticVerdict,
+        output_key="critic_verdict",
+        before_model_callback=lambda callback_context, llm_request: bind_model_call(
+            callback_context
+        ),
+    )
+    loop, executor, formatter, _ = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "No account by that name.")],
+        payloads=[ABSTAIN],
+        critic=critic,
+    )
+    formatter.wait_for = model.reached  # the request is on the wire when the gate ends
+
+    with caplog.at_level(logging.INFO):
+        _, state, _ = await _bounded(loop)
+
+    calls = [r.getMessage() for r in caplog.records if r.getMessage().startswith("model_call: ")]
+    [line] = calls
+    assert " agent=critic " in line and " status=error:cancelled " in line
+    assert state["critic_verdict"]["reason"] == ABSTAIN_PASS
+    assert caplog.text.count("critic_speculation: call abandoned") == 1
+    _nothing_left_running()
+
+
+# ── the wiring and the callback itself ───────────────────────────────────────
+
+
+def test_the_parallel_builder_attaches_the_callback_once_and_chains_what_is_there():
+    seen: list = []
+
+    def existing(callback_context):
+        seen.append(callback_context)
+
+    loop, *_ = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "x")],
+        payloads=[ANSWER],
+        gate_callback=existing,
+    )
+    gate = loop.sub_agents[1].sub_agents[0]
+    assert gate.after_agent_callback == [critic_module.settle_speculation, existing]
+    assert loop.sub_agents[1].sub_agents[1].payload_authors == ("format_gate", "formatter")
+
+    # The same gate built into a second loop (the builder can run again over
+    # the module's shared gate): no second copy. ADK allows an agent one
+    # parent, so the first loop lets go of its agents first.
+    executor, fork, _, escalator = loop.sub_agents
+    critic = fork.sub_agents[1].sub_agents[0]
+    for agent in (executor, gate, critic, escalator):
+        agent.parent_agent = None
+    build_deep_agent(executor, gate, critic, escalator, parallel=True)
+    assert gate.after_agent_callback == [critic_module.settle_speculation, existing]
+
+
+def test_the_serial_builder_attaches_nothing():
+    loop, *_ = _pipeline(parallel=False, executor_passes=[(True, "x")], payloads=[ANSWER])
+    assert loop.sub_agents[1].after_agent_callback is None
+
+
+def test_critic_parallel_0_leaves_the_shared_gate_without_a_callback():
+    """The rollback is exact: a fresh interpreter with CRITIC_PARALLEL=0 builds
+    the module's format gate with no after-callback at all."""
+    env = {**os.environ, "CRITIC_PARALLEL": "0", "SPECULATIVE_DEEP": "0", "PYTHONPATH": str(REPO)}
+    code = (
+        "from gub_agent import agent\n"
+        "from gub_agent.agents.format_gate import format_gate\n"
+        "print(format_gate.after_agent_callback)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-W", "ignore", "-c", code],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    assert out.stdout.strip().splitlines()[-1] == "None"
+
+
+def test_the_deployed_gate_carries_the_callback_in_the_parallel_wiring():
+    from gub_agent.agents.format_gate import format_gate
+
+    if not config.CRITIC_PARALLEL:
+        pytest.skip("CRITIC_PARALLEL=0 in this environment — the serial tree is pinned above")
+    assert format_gate.after_agent_callback == [critic_module.settle_speculation]
+
+
+def test_settling_with_nothing_running_is_a_silent_no_op(caplog):
+    """The format gate is shared with the fast path, where no critic call is ever
+    registered, and the serial wiring never registers one: the callback finds
+    nothing and emits nothing."""
+    from types import SimpleNamespace
+
+    with caplog.at_level(logging.INFO):
+        result = critic_module.settle_speculation(
+            SimpleNamespace(invocation_id="inv-fast", session=None)
+        )
+
+    assert result is None
+    assert caplog.records == []
+    assert critic_module._RUNNING == {}
+
+
+async def test_a_broken_settle_never_fails_the_turn(caplog):
+    """The callback is an optimisation: whatever goes wrong inside it is caught
+    and logged, with the invocation id, and the call is left running."""
+    from types import SimpleNamespace
+
+    run = critic_module._Speculation(
+        authors=("format_gate",), task=asyncio.ensure_future(asyncio.sleep(0))
+    )
+    critic_module._RUNNING["inv-broken"] = run
+    try:
+        # No `session`: reading this pass's payload raises inside the callback.
+        with caplog.at_level(logging.WARNING, logger="gub_agent.agents.critic"):
+            result = critic_module.settle_speculation(SimpleNamespace(invocation_id="inv-broken"))
+    finally:
+        del critic_module._RUNNING["inv-broken"]
+        await run.task
+
+    assert result is None
+    assert run.abandoned is False
+    assert "critic_speculation: settle failed (inv=inv-broken) (AttributeError)" in caplog.text
+    assert "format_gate" not in caplog.text
+
+
+async def test_a_broken_settle_leaves_the_turn_to_wait_for_the_critic_as_before(caplog):
+    """Through a real turn: the gate's callback breaks (reading the pass's payload
+    raises for the callback's context only), the warning is logged, the call is
+    not abandoned, and the turn ends as it did before the callback existed —
+    the critic ran to its verdict, which the resolver then drops."""
+    from google.adk.agents.invocation_context import InvocationContext
+
+    real = critic_module._this_pass_payload
+
+    def flaky(ctx, authors):
+        if isinstance(ctx, InvocationContext):  # the resolver's own read
+            return real(ctx, authors)
+        release.set()  # the old wiring's wait ends: the critic is let finish
+        raise RuntimeError("broken callback")
+
+    release = asyncio.Event()  # the critic stalls until the callback has broken
+    loop, _, _, critic = _stalled_pipeline(
+        executor_passes=[(True, "No account by that name.")], payloads=[ABSTAIN], release=release
+    )
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.critic"):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(critic_module, "_this_pass_payload", flaky)
+            _, state, _ = await _bounded(loop)
+
+    assert "critic_speculation: settle failed" in caplog.text
+    assert "(RuntimeError) tenant=anomaly" in caplog.text
+    assert "call abandoned" not in caplog.text
+    assert critic.cancelled == 0 and len(critic.saw) == 1  # it ran to its verdict
+    assert state["critic_verdict"]["reason"] == ABSTAIN_PASS  # …which was dropped
+    assert "verdict discarded" in caplog.text
+    _nothing_left_running()
+
+
+async def test_the_gate_ending_at_once_still_abandons_the_call(caplog):
+    """The production ordering, with no barrier: the gate abstains the moment it
+    runs, as it can in a turn, and nothing makes it wait for the critic's task to
+    exist. ParallelAgent resumes a branch only after its event was consumed, so
+    the call is registered by then; if a change registered it later the callback
+    would find nothing and this turn would wait for the stalled critic."""
+    critic = _StalledCritic(
+        name="critic",
+        verdicts=[INSUFFICIENT],
+        ran=[],
+        saw=[],
+        session_authors=[],
+        started=asyncio.Event(),
+        wait_for=asyncio.Event(),  # never set
+    )
+    loop, _, formatter, _ = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "No account by that name.")],
+        payloads=[ABSTAIN],
+        critic=critic,
+    )
+    assert formatter.wait_for is None  # nothing orders the gate after the critic
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.critic"):
+        _, state, _ = await _bounded(loop)
+
+    assert "call abandoned" in caplog.text
+    assert state["critic_verdict"]["reason"] == ABSTAIN_PASS
+    _nothing_left_running()
+
+
+async def test_an_abandoned_call_the_resolver_still_needs_is_run_serially(caplog):
+    """If the callback's predicate and the resolver's decision ever disagree (here
+    forced: the resolver is made to leave an abstain payload to the critic), the
+    abandoned run holds no verdict, so the resolver falls back to today's serial
+    order — the critic runs now, after the payload — and ITS verdict is the one in
+    the stream and the state. Nothing is leaked and no verdict is invented."""
+    critic = _StalledCritic(
+        name="critic",
+        verdicts=[SUFFICIENT],
+        ran=[],
+        saw=[],
+        session_authors=[],
+        started=asyncio.Event(),
+        wait_for=asyncio.Event(),  # never set: only the first call stalls
+        stall_once=True,
+    )
+    loop, _, formatter, _ = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "12 live campaigns.")],
+        payloads=[ABSTAIN],
+        critic=critic,
+    )
+    formatter.wait_for = critic.started
+
+    with caplog.at_level(logging.INFO, logger="gub_agent.agents.critic"):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(CriticGate, "_abstain_verdict", lambda self, ctx, payload: None)
+            streamed, state, _ = await _bounded(loop)
+
+    assert "call abandoned" in caplog.text
+    assert "critic_speculation: nothing held" in caplog.text
+    assert "verdict discarded" not in caplog.text
+    assert critic.cancelled == 1 and len(critic.ran) == 2  # abandoned, then run serially
+    assert state["critic_verdict"] == SUFFICIENT
+    assert _critic_verdicts(streamed) == [SUFFICIENT]
+    _nothing_left_running()

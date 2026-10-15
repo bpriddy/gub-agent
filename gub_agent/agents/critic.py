@@ -36,11 +36,15 @@ Two wirings, chosen by CRITIC_PARALLEL (agent.py:build_deep_agent):
                 → CriticResolver → escalator. The critic LLM runs while the
                 formatter does, and the resolver — named `critic_gate`, so
                 its events are authored as before — makes CriticGate's
-                decisions after the join, on the payload of THIS pass.
+                decisions after the join, on the payload of THIS pass. The
+                format gate's after-callback (`settle_speculation`) cancels the
+                critic call when that payload is one the resolver settles in
+                code, so the join does not wait for a verdict it will drop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -331,6 +335,21 @@ def _is_final_pass(agent: BaseAgent, ctx: InvocationContext) -> bool:
     return _passes_judged(ctx) + 1 >= loop.max_iterations
 
 
+def _settles_in_code(payload: object) -> bool:
+    """The resolver writes this pass's verdict in code for `payload`: it is an
+    abstain AnswerPayload, so the critic LLM's verdict is dropped whatever it
+    says (`CriticGate._abstain_verdict`).
+
+    One predicate for both sides of the parallel wiring — the resolver's
+    decision and the callback that abandons the critic call
+    (`settle_speculation`) — because a call is only safe to cancel when the
+    resolver certainly will not read it. An abstain payload is settled in code
+    with or without a tool call this turn: a from-memory re-query without one,
+    the deterministic pass with one.
+    """
+    return isinstance(payload, dict) and payload.get("kind") == "abstain"
+
+
 class CriticGate(BaseAgent):
     """Deterministic pre-check in front of the critic LLM.
 
@@ -498,7 +517,7 @@ class CriticGate(BaseAgent):
         # about the conversation itself, "what did I just ask?"), the abstain
         # passes as it always did rather than spending a verdict on a loop that
         # has no iteration left.
-        if isinstance(payload, dict) and payload.get("kind") == "abstain":
+        if _settles_in_code(payload):
             if not _executor_made_tool_call(ctx) and not self._already_sent_back(ctx):
                 return self._requery_event(ctx)
             return self._pass_event(
@@ -570,10 +589,19 @@ escalator_agent = EscalateIfSufficient(name="loop_escalator")
 @dataclass
 class _Speculation:
     """What the critic LLM produced beside the format gate, held for the
-    resolver: its events in order, or the exception that ended it."""
+    resolver: its events in order, or the exception that ended it.
+
+    The rest is the call while it runs: the task it runs in, the authors of
+    this pass's payload (what `settle_speculation` reads to decide), when it
+    started, and whether the pass abandoned it — an abandoned run holds no
+    events and no error, only the fact that it was made."""
 
     events: list[Event] = field(default_factory=list)
     error: Exception | None = None
+    abandoned: bool = False
+    task: asyncio.Task | None = None
+    authors: tuple[str, ...] = ()
+    started: float = 0.0  # time.monotonic()
 
 
 # Keyed on invocation id, like the evidence index's stores: the branch and the
@@ -581,6 +609,13 @@ class _Speculation:
 # is the very channel whose timing this hand-off exists to control.
 _SPECULATIONS: OrderedDict[str, _Speculation] = OrderedDict()
 _MAX_TRACKED = 256
+
+# The calls still RUNNING, by invocation id: what the format gate's
+# after-callback can reach to abandon one (`settle_speculation`). Separate from
+# the held ones above — those have ended — and never evicted by size: an entry
+# is added when the task starts and popped by the branch that owns it, on
+# every path out of it (`SpeculativeCritic._run_async_impl`).
+_RUNNING: dict[str, _Speculation] = {}
 
 
 def _hold(invocation_id: str, run: _Speculation) -> None:
@@ -666,8 +701,28 @@ class SpeculativeCritic(BaseAgent):
     The payload-independent passes (sandbox off, the bare NO_COMPANY_RECORDS
     marker, the loop's last iteration) are known before the fork, so for them
     no call is made at all. Only an abstain payload costs a call whose verdict
-    is then dropped.
+    is then dropped — and that call is cut short: a ParallelAgent joins only
+    when BOTH branches end, so an abstain payload the resolver settles in code
+    would still wait out the critic's model call (tens of seconds on a measured turn,
+    before the retry or the answer could start). The call therefore runs as a
+    task of its own, listed in `_RUNNING`, and the format gate's
+    after-callback (`settle_speculation`) cancels it the moment the gate's
+    payload is one the resolver settles in code. This branch then ends at
+    once, holding the abandoned run for the resolver's log line.
     """
+
+    #: The authors of this pass's payload, as on CriticResolver — what
+    #: `settle_speculation` reads the gate's payload by
+    #: (agent.py:build_deep_agent).
+    payload_authors: tuple[str, ...] = ()
+
+    async def _call(self, ctx: InvocationContext, run: _Speculation) -> None:
+        """The critic's run, filling `run`. A failure is held, never raised."""
+        try:
+            async for event in self.sub_agents[0].run_async(ctx):
+                run.events.append(event)
+        except Exception as exc:
+            run.error = exc  # the resolver's to raise, if it needs the verdict
 
     async def _run_async_impl(
         self,
@@ -676,15 +731,85 @@ class SpeculativeCritic(BaseAgent):
         _SPECULATIONS.pop(ctx.invocation_id, None)  # never an earlier pass's
         if _pass_reason_before_format(ctx) is not None or _is_final_pass(self, ctx):
             return
-        run = _Speculation()
+        run = _Speculation(authors=self.payload_authors, started=time.monotonic())
+        run.task = asyncio.create_task(
+            self._call(ctx, run), name=f"speculative-critic {ctx.invocation_id}"
+        )
+        _RUNNING[ctx.invocation_id] = run
         try:
-            async for event in self.sub_agents[0].run_async(ctx):
-                run.events.append(event)
-        except Exception as exc:
-            run.error = exc  # the resolver's to raise, if it needs the verdict
+            # `wait`, not `await task`: it returns when the task ends however it
+            # ended, so an abandon (the task cancelled from outside) reads as
+            # the end of the call. A cancellation of THIS branch is the one
+            # that raises here — that is how the two stay apart.
+            await asyncio.wait({run.task})
+        finally:
+            if _RUNNING.get(ctx.invocation_id) is run:
+                del _RUNNING[ctx.invocation_id]
+            if not run.task.done():
+                # This branch is being cancelled (the turn ended, a speculative
+                # deep run was thrown away): the call must not outlive it.
+                run.task.cancel()
+                await asyncio.wait({run.task})
+        if run.abandoned:
+            # Whatever it streamed before the cancel was never a verdict: the
+            # resolver must not relay it, and no error of it can fail the turn.
+            run.events.clear()
+            run.error = None
+        elif run.task.cancelled():
+            raise asyncio.CancelledError  # cancelled by someone else: not ours to swallow
         _hold(ctx.invocation_id, run)
         return
         yield  # an async generator that holds everything it produces
+
+
+def settle_speculation(callback_context) -> None:
+    """The format gate's after_agent_callback (agent.py:build_deep_agent): cut
+    the speculative critic call short once this pass's verdict is settled.
+
+    The callback fires when the gate has yielded everything it will, so the
+    pass's payload is in the session. If it is one the resolver settles in code
+    (`_settles_in_code`), the verdict the critic is still computing will be
+    dropped (`CriticResolver`: "verdict discarded") — so the call is cancelled
+    instead of waited for. Cancelled at a model call it logs
+    `status=error:cancelled`, which is what an abandoned call costs; a call that
+    was cancelled before its request was sent logs no model_call line at all.
+
+    A no-op for everything else — the payload is an answer, a clarification or
+    absent (the critic's verdict is needed), the call already ended, nothing was
+    started (the serial wiring, the fast path that shares the format gate, a
+    pass the critic never ran) — and a second call finds the run abandoned.
+    Emits nothing (returns None), and a failure in here is logged, never raised:
+    an optimisation must not fail a turn.
+
+    `_RUNNING` is keyed by invocation id alone. With SPECULATIVE_DEEP the fast
+    path's own run of the (shared) gate carries the same invocation id as the
+    forked deep run, so an abstain there could cancel the deep run's critic call.
+    That is harmless: a deep run kept beside a fast-path answer is discarded, and
+    if it were ever kept the resolver falls back to running the critic serially
+    ("nothing held"), which is today's behaviour.
+    """
+    try:
+        run = _RUNNING.get(callback_context.invocation_id)
+        if run is None or run.abandoned or run.task is None or run.task.done():
+            return None
+        if not _settles_in_code(_this_pass_payload(callback_context, run.authors)):
+            return None
+        run.abandoned = True
+        run.task.cancel()
+        logger.info(
+            "critic_speculation: call abandoned (inv=%s) critic_ms=%d tenant=%s",
+            callback_context.invocation_id,
+            round((time.monotonic() - run.started) * 1000),
+            label_of(callback_context),
+        )
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        logger.warning(
+            "critic_speculation: settle failed (inv=%s) (%s) tenant=%s",
+            getattr(callback_context, "invocation_id", None),
+            type(exc).__name__,
+            label_of(callback_context),
+        )
+    return None
 
 
 class CriticResolver(CriticGate):
@@ -732,11 +857,15 @@ class CriticResolver(CriticGate):
             yield verdict
             return
 
-        if held is None:
+        if held is None or held.abandoned:
             # The branch holds a result whenever it had a call to make, so this
             # is a pass it never ran (a resumed invocation, or an entry evicted
-            # from the store). Fall back to the serial order rather than write
-            # a verdict nobody reached: run the critic now, after the payload.
+            # from the store) — or one the pass abandoned (`settle_speculation`),
+            # which holds no verdict. The abandon is decided by the predicate
+            # the checks above ended on, so the two cannot disagree today; if
+            # they ever do, the answer is the same: fall back to the serial
+            # order — run the critic now, after the payload — rather than
+            # write a verdict nobody reached.
             logger.warning(
                 "critic_speculation: nothing held (inv=%s) tenant=%s — running the critic serially",
                 ctx.invocation_id,
