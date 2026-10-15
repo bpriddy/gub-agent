@@ -80,6 +80,30 @@ identical requests' answers: only when it arrives changes.
   with the same `tenant=` clause it is the share of turns that paid for a
   second router call (~$0.004 for a short session's 2.6k-token router prompt,
   ~$0.03 for the ~20k-token uncached prompt of a long one).
+
+The executor and formatter hedges (EXECUTOR_HEDGE_AFTER_MS,
+FORMATTER_HEDGE_AFTER_MS). The same mechanism, keyed on the same label, for
+the two agents whose stalls a reader waits through on a deep turn: an executor
+ReAct round's first token has waited 102.7 s with the request healthy (no
+retry), and a formatter's 62 s. Each agent has its own deadline
+(`agent_hedge_after_ms`), because a healthy first chunk takes very different
+times — the executor thinks before its first chunk, the router and the
+formatter do not. Everything above holds for them as for the router: one copy
+of the request taken before the first send, one stream relayed whole, the
+loser cancelled and logged, no second send while genai retries.
+
+- Nothing a model call does has a side effect: the executor's tools run in
+  ADK AFTER the model's reply has been read, from the relayed (winning) stream
+  only, so a duplicated request never duplicates a GUB call.
+- The router keeps its `router_hedge:` line, byte for byte. A fired executor
+  or formatter hedge logs its own line instead (added, never a renamed one):
+
+    model_hedge: agent=<name> fired=1 winner=<primary|hedge|->
+      primary_ttft_ms=<n|-> hedge_ttft_ms=<n|-> inv=… tenant=…
+
+  Against the agent's `model_call:` lines without ` hedge=1`, it is the share
+  of that agent's calls that paid for a second send — at the executor's
+  prompt sizes (20-65k tokens, often uncached) ~$0.03-0.10 per fire.
 """
 
 from __future__ import annotations
@@ -100,7 +124,7 @@ from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 from typing_extensions import override
 
 from .tenant import label_of
@@ -111,7 +135,9 @@ CLAUDE_PREFIX = "claude-"
 
 #: The agent whose calls are hedged: agents/router.py's ROUTER_NAME, which ADK
 #: puts in every request's `adk_agent_name` label. Not imported from there —
-#: that module imports this one; a test pins the two together.
+#: that module imports this one; a test pins the two together. Its deadline is
+#: `router_hedge_after_ms` and its line `router_hedge:`; every other agent's is
+#: `agent_hedge_after_ms` and `model_hedge:`.
 HEDGED_AGENT = "router"
 
 
@@ -137,6 +163,11 @@ class VendorRouter(BaseLlm):
     #: request is sent a second time (module docstring, "The router hedge");
     #: 0 never does. config.build_model passes ROUTER_HEDGE_AFTER_MS.
     router_hedge_after_ms: int = 0
+    #: The same deadline for other agents, by the name the `model_call:` line
+    #: uses (module docstring, "The executor and formatter hedges"); an agent
+    #: absent here, or at 0, never hedges. config.build_model passes the
+    #: executor's and the formatter's (EXECUTOR_/FORMATTER_HEDGE_AFTER_MS).
+    agent_hedge_after_ms: dict[str, int] = Field(default_factory=dict)
 
     _claude: dict[str, BaseLlm] = PrivateAttr(default_factory=dict)
 
@@ -176,10 +207,14 @@ class VendorRouter(BaseLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
-        if self.router_hedge_after_ms > 0 and _agent_of(llm_request) == HEDGED_AGENT:
-            spare = _spare_of(llm_request)
+        agent = _agent_of(llm_request)
+        after_ms = self._hedge_after_ms(agent)
+        if after_ms > 0:
+            spare = _spare_of(llm_request, agent)
             if spare is not None:
-                async with aclosing(self._hedged(llm_request, spare, stream)) as responses:
+                async with aclosing(
+                    self._hedged(llm_request, spare, stream, after_ms=after_ms, agent=agent)
+                ) as responses:
                     async for response in responses:
                         yield response
                 return
@@ -203,6 +238,12 @@ class VendorRouter(BaseLlm):
         finally:
             call.log()
 
+    def _hedge_after_ms(self, agent: str) -> int:
+        """The hedge deadline for this agent's calls, in ms; 0 = never hedged."""
+        if agent == HEDGED_AGENT:
+            return self.router_hedge_after_ms
+        return self.agent_hedge_after_ms.get(agent, 0)
+
     async def _generate(
         self, llm_request: LlmRequest, stream: bool
     ) -> AsyncGenerator[LlmResponse, None]:
@@ -217,17 +258,24 @@ class VendorRouter(BaseLlm):
             yield trim_json_reply(response) if wants_json and not response.partial else response
 
     async def _hedged(
-        self, llm_request: LlmRequest, spare: LlmRequest, stream: bool
+        self,
+        llm_request: LlmRequest,
+        spare: LlmRequest,
+        stream: bool,
+        *,
+        after_ms: int,
+        agent: str,
     ) -> AsyncGenerator[LlmResponse, None]:
-        """A router call whose request is sent a second time, as `spare`, when
-        its first chunk is late (module docstring, "The router hedge")."""
+        """A call whose request is sent a second time, as `spare`, when its
+        first chunk is `after_ms` late (module docstring, "The router hedge" —
+        the same for every hedged agent but for its line)."""
         primary = _Leg(self, llm_request, stream, hedge=False)
         legs = [primary]
         stopping = "error:cancelled"  # what a request still going at the end logs
         reported = False  # the `router_hedge:` line, once per fired hedge
         try:
             asked = primary.ask()
-            await asyncio.wait({asked}, timeout=self.router_hedge_after_ms / 1000)
+            await asyncio.wait({asked}, timeout=after_ms / 1000)
             if asked.done() or primary.call.retries:
                 # In time — a failure too, raised below exactly as it is
                 # unhedged — or genai is already retrying it: no second send.
@@ -237,7 +285,7 @@ class VendorRouter(BaseLlm):
                 legs.append(hedge)
                 winner, outcome = await _race(primary, asked, hedge, hedge.ask())
                 reported = True
-                _log_hedge(primary, hedge, winner)
+                _log_hedge(agent, primary, hedge, winner)
                 for leg in legs:
                     if leg is not winner:
                         leg.stop("error:cancelled")
@@ -260,7 +308,7 @@ class VendorRouter(BaseLlm):
             if len(legs) > 1 and not reported:
                 # Fired, and the caller left before either answered: the
                 # second send was still paid for, so it is still counted.
-                _log_hedge(primary, legs[1], None)
+                _log_hedge(agent, primary, legs[1], None)
 
 
 # ── The per-call line ─────────────────────────────────────────────────────────
@@ -389,7 +437,7 @@ class _ModelCall:
         self.usage: Any = None
         self.status = "ok"
         self.retries = 0
-        self.hedge = False  # the second request of a hedged router call
+        self.hedge = False  # the second request of a hedged call
 
     @classmethod
     def begin(cls, router: VendorRouter, llm_request: LlmRequest, stream: bool) -> _ModelCall:
@@ -467,18 +515,26 @@ class _Failed:
     error: Exception
 
 
-def _spare_of(llm_request: LlmRequest) -> LlmRequest | None:
+def _spare_of(llm_request: LlmRequest, agent: str = HEDGED_AGENT) -> LlmRequest | None:
     """The request a hedge sends: a deep copy taken NOW, before the first
     send. The vendor client edits the request it is handed — ADK's Gemini
     appends a user turn after a model one and merges its tracking headers
     into `config.http_options` — so a copy taken later would not be what the
     first request sent, and two sends must never share one object. About
-    1 ms for a 20k-token router request. None if it cannot be copied: the
-    call then runs unhedged, exactly as with the flag off."""
+    1 ms for a 20k-token router request, a few ms for an executor round with
+    its tool results. None if it cannot be copied: the call then runs
+    unhedged, exactly as with the flag off."""
     try:
         return llm_request.model_copy(deep=True)
     except Exception as exc:  # noqa: BLE001 — a hedge must never cost the call
-        logger.warning("router_hedge: request not copyable (%s) — unhedged", type(exc).__name__)
+        if agent == HEDGED_AGENT:
+            logger.warning("router_hedge: request not copyable (%s) — unhedged", type(exc).__name__)
+        else:
+            logger.warning(
+                "model_hedge: agent=%s request not copyable (%s) — unhedged",
+                agent,
+                type(exc).__name__,
+            )
         return None
 
 
@@ -488,7 +544,7 @@ def _settle(asked: asyncio.Future[Any] | None, outcome: Any) -> None:
 
 
 class _Leg:
-    """One request of a hedged router call, in a task of its own.
+    """One request of a hedged call, in a task of its own.
 
     The task owns the vendor's generator from its first step to its close and
     advances it one chunk per `ask()`: the stream is read when ADK reads it,
@@ -511,7 +567,8 @@ class _Leg:
         self._started = False
         self._stop_status: str | None = None
         self.task = asyncio.create_task(
-            self._run(router._generate(llm_request, stream)), name=f"router-{self.role}"
+            self._run(router._generate(llm_request, stream)),
+            name=f"{self.call.agent}-{self.role}",
         )
 
     def ask(self) -> asyncio.Future[Any]:
@@ -594,16 +651,29 @@ async def _race(
     return None, failed[primary.role]
 
 
-def _log_hedge(primary: _Leg, hedge: _Leg, winner: _Leg | None) -> None:
+def _log_hedge(agent: str, primary: _Leg, hedge: _Leg, winner: _Leg | None) -> None:
+    """The fired hedge's one line: the router's `router_hedge:` as it always
+    was, every other agent's `model_hedge: agent=…` (module docstring)."""
     caller = primary.call.caller
-    logger.info(
-        "router_hedge: fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s inv=%s tenant=%s",
+    where = (
         winner.role if winner is not None else "-",
         primary.call.ttft_ms,
         hedge.call.ttft_ms,
         caller.invocation_id if caller else "-",
         caller.tenant if caller else "-",
     )
+    if agent == HEDGED_AGENT:
+        logger.info(
+            "router_hedge: fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s inv=%s tenant=%s",
+            *where,
+        )
+    else:
+        logger.info(
+            "model_hedge: agent=%s fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s "
+            "inv=%s tenant=%s",
+            agent,
+            *where,
+        )
 
 
 # ── Request adaptation ────────────────────────────────────────────────────────

@@ -185,6 +185,38 @@ FORMATTER_THINKING_OFF: bool = os.environ.get("FORMATTER_THINKING_OFF", "1").low
 # redeploy. Set explicitly in both deploy env files, like the other rollbacks.
 ROUTER_HEDGE_AFTER_MS: int = int(os.environ.get("ROUTER_HEDGE_AFTER_MS", "4000"))
 
+# ── A stalled executor or formatter call is sent twice ───────────────────────
+# The router hedge above, for the two agents a reader waits through on every
+# deep turn (models.py, "The executor and formatter hedges"). The first token
+# of an executor ReAct round has waited 102.7 s on a production turn with no
+# retry and nothing wrong with the request (2026-10-15, round 3 of a "whats
+# new?" turn: prompt 57.6k, ttft_ms=102724, retries=0); a formatter's 62 s on
+# another. The condition is the server's, as for the router, so the same copy
+# of the same request sent again answers on its own clock.
+#
+# Two deadlines, not one: the executor thinks before its first chunk (healthy
+# rounds take seconds to start), the formatter runs with thinking off. Each is
+# the milliseconds a call of THAT agent may go without a first chunk before
+# its request is sent a second time; the stream that answers first is relayed
+# whole and the other is cancelled. The answer is unchanged — same model, same
+# request, same config — and so are the tools: ADK runs them after the reply,
+# from the relayed stream only.
+#
+# The price is one extra call's input on the calls it fires on, never
+# otherwise: an executor round is 20-65k prompt tokens, often uncached, so
+# ~$0.03-0.10 per fire at the Flash input rate; a formatter brief up to ~75k.
+#
+# 0 is the code default and the ROLLBACK: nothing is ever sent twice and every
+# call takes today's path byte for byte. Read at import: a redeploy either
+# way. Stated in both deploy env files.
+EXECUTOR_HEDGE_AFTER_MS: int = int(os.environ.get("EXECUTOR_HEDGE_AFTER_MS", "0"))
+FORMATTER_HEDGE_AFTER_MS: int = int(os.environ.get("FORMATTER_HEDGE_AFTER_MS", "0"))
+
+#: The formatter's agent name (agents/formatter.py FORMATTER_NAME), the key its
+#: hedge deadline is looked up by. Restated here because that module imports
+#: this one; a test pins the two together.
+FORMATTER_AGENT_NAME = "formatter"
+
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
 # id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
@@ -389,6 +421,8 @@ def build_model() -> BaseLlm:
     The router hedge (ROUTER_HEDGE_AFTER_MS) sits above this, not inside it:
     one second send per router call at most, never one per attempt, never
     while the first send is retrying, and each send counts its own retries.
+    The executor and formatter hedges (EXECUTOR_/FORMATTER_HEDGE_AFTER_MS)
+    work the same way, on their own deadlines.
     """
     from .models import VendorRouter  # noqa: PLC0415 — models.py imports config
 
@@ -407,4 +441,12 @@ def build_model() -> BaseLlm:
         gemini=gemini,
         claude_location=CLAUDE_VERTEX_LOCATION,
         router_hedge_after_ms=ROUTER_HEDGE_AFTER_MS,
+        agent_hedge_after_ms={
+            name: after_ms
+            for name, after_ms in (
+                (AGENT_NAME, EXECUTOR_HEDGE_AFTER_MS),
+                (FORMATTER_AGENT_NAME, FORMATTER_HEDGE_AFTER_MS),
+            )
+            if after_ms > 0
+        },
     )
