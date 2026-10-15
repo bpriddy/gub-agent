@@ -92,6 +92,13 @@ formatter do not. Everything above holds for them as for the router: one copy
 of the request taken before the first send, one stream relayed whole, the
 loser cancelled and logged, no second send while genai retries.
 
+- Streamed calls only. "No first chunk after the deadline" means a late
+  first TOKEN only when the call streams (the run's RunConfig is SSE, as the
+  Chat bots run it): a call without streaming has exactly one chunk, the
+  whole reply, so its deadline would bound the whole generation and fire on
+  every long, healthy executor round or formatter brief — a sandbox /batch
+  run, a caller with no run_config. Those take the unhedged path. The
+  router's reply is short enough that its hedge keeps covering both.
 - Nothing a model call does has a side effect: the executor's tools run in
   ADK AFTER the model's reply has been read, from the relayed (winning) stream
   only, so a duplicated request never duplicates a GUB call.
@@ -103,7 +110,11 @@ loser cancelled and logged, no second send while genai retries.
 
   Against the agent's `model_call:` lines without ` hedge=1`, it is the share
   of that agent's calls that paid for a second send — at the executor's
-  prompt sizes (20-65k tokens, often uncached) ~$0.03-0.10 per fire.
+  prompt sizes (20-65k tokens, often uncached) ~$0.03-0.10 per fire, up to
+  ~$0.11 for a 75k formatter brief. Input only: the cancelled request may
+  also have spent thinking tokens, and its `model_call:` line reports none of
+  its usage (no usage arrives before its first chunk), so a token sum over
+  `model_call:` lines does not include the second sends.
 """
 
 from __future__ import annotations
@@ -208,7 +219,7 @@ class VendorRouter(BaseLlm):
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
         agent = _agent_of(llm_request)
-        after_ms = self._hedge_after_ms(agent)
+        after_ms = self._hedge_after_ms(agent, stream)
         if after_ms > 0:
             spare = _spare_of(llm_request, agent)
             if spare is not None:
@@ -238,10 +249,14 @@ class VendorRouter(BaseLlm):
         finally:
             call.log()
 
-    def _hedge_after_ms(self, agent: str) -> int:
-        """The hedge deadline for this agent's calls, in ms; 0 = never hedged."""
+    def _hedge_after_ms(self, agent: str, stream: bool) -> int:
+        """The hedge deadline for this agent's calls, in ms; 0 = never hedged.
+        Every agent but the router is hedged only on a streamed call (module
+        docstring, "Streamed calls only")."""
         if agent == HEDGED_AGENT:
             return self.router_hedge_after_ms
+        if not stream:
+            return 0
         return self.agent_hedge_after_ms.get(agent, 0)
 
     async def _generate(
@@ -272,7 +287,7 @@ class VendorRouter(BaseLlm):
         primary = _Leg(self, llm_request, stream, hedge=False)
         legs = [primary]
         stopping = "error:cancelled"  # what a request still going at the end logs
-        reported = False  # the `router_hedge:` line, once per fired hedge
+        reported = False  # the `router_hedge:` / `model_hedge:` line, once per fired hedge
         try:
             asked = primary.ask()
             await asyncio.wait({asked}, timeout=after_ms / 1000)
@@ -530,10 +545,13 @@ def _spare_of(llm_request: LlmRequest, agent: str = HEDGED_AGENT) -> LlmRequest 
         if agent == HEDGED_AGENT:
             logger.warning("router_hedge: request not copyable (%s) — unhedged", type(exc).__name__)
         else:
+            caller = _CALLER.get()
             logger.warning(
-                "model_hedge: agent=%s request not copyable (%s) — unhedged",
+                "model_hedge: agent=%s request not copyable (%s) — unhedged inv=%s tenant=%s",
                 agent,
                 type(exc).__name__,
+                caller.invocation_id if caller else "-",
+                caller.tenant if caller else "-",
             )
         return None
 

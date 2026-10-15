@@ -8,6 +8,9 @@ switched on per agent by `agent_hedge_after_ms`. Pinned here, for what is new:
 - a stalled executor or formatter call loses to its hedge, streamed; a healthy
   one never fires it; each agent fires on its OWN deadline and the router's
   deadline never applies to them (nor theirs to the router);
+- a call that does not stream is never hedged: its one chunk is the whole
+  reply, so a deadline there would bound the generation, not the first token
+  (the router's own hedge still covers both);
 - a reply that is a function call is relayed from ONE request only, the
   winner's: the tools ADK then runs are run once;
 - a fired hedge logs one `model_hedge: agent=…` line (`tenant=` last) and no
@@ -196,6 +199,51 @@ async def test_each_agent_fires_on_its_own_deadline(logs):
     assert _model_hedge_lines(logs) == []
 
 
+async def test_each_agent_fires_at_its_own_deadline_not_at_anothers(logs):
+    """A positive case: the executor's hedge goes out at ITS deadline (400 ms),
+    not at the formatter's (50 ms)."""
+    agent_ms = {EXECUTOR: 400, FORMATTER: AFTER_MS}
+    router, stub = _vendor(
+        [STALL, *_answer("primary")], [0.01, *_answer("hedge")], agent_ms=agent_ms
+    )
+    _bind(agent=EXECUTOR)
+
+    started = time.monotonic()
+    sent: list[float] = []
+    original = stub.generate_content_async
+
+    async def timed(llm_request, stream=False):
+        sent.append(time.monotonic() - started)
+        async for response in original(llm_request, stream=stream):
+            yield response
+
+    object.__setattr__(stub, "generate_content_async", timed)
+    out = await _drain(router.generate_content_async(_request(EXECUTOR), stream=True))
+
+    assert _who(out) == {"hedge"} and len(sent) == 2
+    assert sent[1] >= 0.39, sent  # the executor's deadline, not the formatter's 50 ms
+
+
+@pytest.mark.parametrize("agent", [EXECUTOR, FORMATTER], ids=["executor", "formatter"])
+async def test_a_call_that_does_not_stream_is_never_hedged(logs, agent):
+    """A run with no SSE run_config (a sandbox /batch run, a caller that sends
+    none): the one chunk is the whole reply. A healthy 150 ms generation past a
+    50 ms deadline must not be sent twice."""
+    router, stub = _vendor(
+        [0.15, _text("A whole reply (by primary).", usage=USAGE)],
+        [0.01, _text("never (by hedge).")],
+        agent_ms={agent: AFTER_MS},
+    )
+    _bind(agent=agent)
+
+    out = await _drain(router.generate_content_async(_request(agent), stream=False))
+
+    assert _who(out) == {"primary"} and len(stub.seen) == 1
+    assert _model_hedge_lines(logs) == []
+    [line] = _calls(logs)
+    assert line["stream"] == "0" and not line["_hedge"]
+
+
 async def test_the_router_deadline_never_hedges_the_executor_nor_the_reverse(logs):
     router, stub = _vendor(
         [0.15, *_answer("primary")], [0.01, *_answer("hedge")], router_ms=AFTER_MS
@@ -263,7 +311,10 @@ async def test_a_request_that_cannot_be_copied_runs_unhedged(logs, monkeypatch):
 
     assert _who(out) == {"primary"} and len(stub.seen) == 1
     warnings = [r.getMessage() for r in logs.records if r.levelno == logging.WARNING]
-    assert "model_hedge: agent=formatter request not copyable (TypeError) — unhedged" in warnings
+    assert (
+        "model_hedge: agent=formatter request not copyable (TypeError) — unhedged "
+        "inv=inv-1 tenant=chevy"
+    ) in warnings
 
 
 # ── the flags off: today's path, byte for byte ───────────────────────────────
