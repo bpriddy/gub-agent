@@ -355,6 +355,29 @@ CRITIC_SKIP_FINAL_PASS: bool = os.environ.get("CRITIC_SKIP_FINAL_PASS", "1").low
     "yes",
 )
 
+# A first pass that answered from memory is sent back without a formatter call
+# (agents/critic.py:from_memory_pass; the shortcut in agents/format_gate.py).
+# Such a pass made no tool call, so the evidence index is empty and the gate
+# could only abstain; the critic gate then re-queries on that abstain in code
+# (`CriticGate._abstain_verdict`). The formatter call that produces the abstain
+# takes 2-4.6 s on a healthy turn and 15-30 s when its first token stalls, and
+# the speculative critic started beside it is cancelled unread. With the switch
+# on, the gate writes the same abstain payload itself and no critic call is
+# started for the pass. The verdict, its reason and its feedback are today's.
+#
+# Two things differ. A from-memory pass whose formatter would have chosen
+# `clarify` over abstain is now re-queried as well. And the pass-1 payload
+# event, which a stream reader sees before the retry's answer replaces it, is
+# the gate's own generic abstain instead of the formatter's wording.
+#
+# 0 is the code default and the ROLLBACK: the formatter is called as before.
+# Read as a module attribute at call time. Stated in both deploy env files.
+REQUERY_SKIPS_FORMATTER: bool = os.environ.get("REQUERY_SKIPS_FORMATTER", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Stop a formatter attempt the answer contract has already rejected
 # (agents/format_gate.py, "Early abort"). The contract's field checks — filler,
 # word budgets, block shape — on the headline and the blocks are decidable the

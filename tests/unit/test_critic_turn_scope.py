@@ -281,3 +281,41 @@ async def test_the_executor_retry_sees_the_send_back_feedback():
     contents = _get_contents(None, events, AGENT_NAME)
     rendered = " ".join(p.text or "" for c in contents for p in (c.parts or []))
     assert "You made NO tool call this turn" in rendered
+
+
+# ── the re-query's "already sent back" fact is about THIS turn too ───────────
+
+
+def _sent_back(inv: str, author: str = "critic") -> Event:
+    verdict = {"sufficient": False, "reason": "from memory", "feedback": "query GUB"}
+    return Event(
+        invocation_id=inv,
+        author=author,
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part(text=json.dumps(verdict))]
+        ),
+        actions=EventActions(state_delta={"critic_verdict": verdict}),
+    )
+
+
+async def test_an_earlier_turns_send_back_is_not_this_turns():
+    from gub_agent.agents.critic import _sent_back_this_turn
+
+    ctx = await invocation_ctx(
+        invocation_id=NOW,
+        events=[_sent_back(EARLIER), _text(AGENT_NAME, "from memory", NOW)],
+    )
+    assert _sent_back_this_turn(ctx) is False
+    ctx = await invocation_ctx(
+        invocation_id=NOW,
+        events=[_sent_back(EARLIER), _text(AGENT_NAME, "from memory", NOW), _sent_back(NOW)],
+    )
+    assert _sent_back_this_turn(ctx) is True
+
+
+async def test_a_send_back_counts_only_under_the_critics_own_name():
+    from gub_agent.agents.critic import _sent_back_this_turn
+
+    ctx = await invocation_ctx(invocation_id=NOW, events=[_sent_back(NOW, author="other")])
+    assert _sent_back_this_turn(ctx) is False
+    assert _sent_back_this_turn(ctx, "other") is True

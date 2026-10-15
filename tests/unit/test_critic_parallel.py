@@ -63,6 +63,7 @@ from gub_agent.agents.critic import (
     EscalateIfSufficient,
     SpeculativeCritic,
 )
+from gub_agent.agents.format_gate import FormatGate
 from gub_agent.config import AGENT_NAME, GEMINI_MODEL
 from gub_agent.models import VendorRouter, bind_model_call
 
@@ -87,6 +88,14 @@ INSUFFICIENT = {
 FINAL_PASS_REASON = (
     "Deterministic pass: final loop iteration, no retry left to request (no critic LLM run)."
 )
+
+
+@pytest.fixture(autouse=True)
+def _formatter_always_runs(monkeypatch):
+    """The tests below describe the pipeline with the from-memory shortcut OFF,
+    the code default; the deployed value is 1. The shortcut's own tests set it
+    themselves, so a shell that sources the deploy env cannot turn the rest red."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", False, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -1688,3 +1697,239 @@ async def test_the_critic_of_a_second_pass_shares_the_invocations_one_hedge(
         r"^hedge_capped: agent=critic after_ms=50 used=1 limit=1 inv=\S+ tenant=anomaly$", capped
     )
     _nothing_left_running()
+
+
+# ── REQUERY_SKIPS_FORMATTER through the real format gate ─────────────────────
+#
+# The stand-in `_Gate` above cannot take the shortcut: it is the real
+# FormatGate that writes the abstain for a from-memory first pass. These run
+# the deployed pair (FormatGate, CriticResolver or CriticGate) on a real runner.
+
+REQUERY_REASON = (
+    "Deterministic: no tool call this turn and the format gate abstained, "
+    "so the draft was written from memory (no critic LLM run)."
+)
+REQUERY_FEEDBACK = (
+    "You made NO tool call this turn, so your draft repeated earlier answers from memory "
+    "and nothing in it could be grounded. Query GUB now for THIS question - do not reuse "
+    "prior turns - and answer only from what the tools return."
+)
+
+
+def _real_gate_pipeline(*, parallel: bool, executor_passes: list, payloads: list, delay: float):
+    """`_pipeline` with the real FormatGate around the formatter stand-in. The
+    formatter renders for `delay` seconds, so a critic call that is going to
+    start beside it has started before it ends (as it does in production,
+    where the formatter takes seconds)."""
+    executor = _Executor(name=AGENT_NAME, passes=executor_passes, runs=0)
+    formatter = _Formatter(name="formatter", payloads=payloads, runs=0, delay=delay)
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    critic = _Critic(
+        name="critic", verdicts=[INSUFFICIENT], ran=[], saw=[], session_authors=[], raises=None
+    )
+    loop = build_deep_agent(
+        executor, gate, critic, EscalateIfSufficient(name="loop_escalator"), parallel=parallel
+    )
+    return loop, executor, formatter, critic
+
+
+@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "serial"])
+async def test_a_from_memory_first_pass_is_requeried_with_no_formatter_and_no_critic_call(
+    parallel, monkeypatch, caplog
+):
+    """Pass 1 answers from memory: the gate abstains in code, the verdict is
+    today's re-query word for word, and pass 2 runs and is formatted — the
+    stand-in formatter is called once, for pass 2 only. No critic call is made
+    for either pass (pass 2 is the loop's last), so nothing is left to cancel,
+    to discard or to wait for."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", False)
+    loop, executor, formatter, critic = _real_gate_pipeline(
+        parallel=parallel,
+        executor_passes=[(False, "Here is what's new: 3 hires."), (True, "3 hires, 12 live.")],
+        payloads=[ABSTAIN],
+        delay=0.05,
+    )
+
+    with caplog.at_level(logging.INFO):
+        streamed, state, session_events = await _run(loop, question="whats new")
+
+    assert formatter.runs == 1  # pass 2's; pass 1's was never called
+    assert critic.ran == []  # neither pass: pass 1 is settled in code, pass 2 is the last
+    assert executor.runs == 2
+    (requery,) = _critic_verdicts(streamed)  # pass 2's pass is the gate's, not the critic's
+    assert requery["reason"] == REQUERY_REASON
+    assert requery["feedback"] == REQUERY_FEEDBACK
+    assert requery["sufficient"] is False and requery["info_sufficient"] is False
+    assert state["critic_verdict"]["reason"] == ABSTAIN_PASS
+    assert streamed[-1].author == "loop_escalator" and streamed[-1].actions.escalate
+    # the send-back reads as the critic's, after the gate's own abstain
+    order = [e.author for e in _complete(session_events) if e.author in ("format_gate", "critic")]
+    assert order[:2] == ["format_gate", "critic"]
+    # the shortcut line, once; and nothing about a critic call that was made
+    assert len([m for m in caplog.messages if m.startswith("critic_requery: shortcut")]) == 1
+    for noise in ("nothing held", "verdict discarded", "call abandoned"):
+        assert noise not in caplog.text
+    # nothing running, nothing held for the next pass or turn
+    assert critic_module._RUNNING == {}
+    assert critic_module._SPECULATIONS == {}
+
+
+async def test_the_shortcut_pass_does_not_wait_for_a_stalled_critic(monkeypatch):
+    """The race the speculative critic's skip exists for: the gate ends at
+    once, long before a critic task could be registered, and the join must not
+    wait out a call (a tenant's p90 is 42 s) whose verdict is discarded. The critic here
+    waits for an event nobody sets, so a pass that starts it cannot finish."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", False)
+    loop, executor, formatter, critic = _real_gate_pipeline(
+        parallel=True,
+        executor_passes=[(False, "Here is what's new: 3 hires."), (True, "3 hires, 12 live.")],
+        payloads=[ABSTAIN],
+        delay=0.0,
+    )
+    critic.wait_for, critic.timeout = asyncio.Event(), 30.0
+    try:
+        await asyncio.wait_for(_run(loop, question="whats new"), timeout=3.0)
+    except TimeoutError:
+        pytest.fail("the from-memory pass is waiting for a critic call it does not need")
+    assert critic.ran == [] and formatter.runs == 1 and executor.runs == 2
+    _nothing_left_running()
+
+
+@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "serial"])
+async def test_with_the_flag_at_0_the_formatter_and_the_critic_start_as_before(
+    parallel, monkeypatch
+):
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", False)
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", False)
+    loop, executor, formatter, critic = _real_gate_pipeline(
+        parallel=parallel,
+        executor_passes=[(False, "Here is what's new: 3 hires."), (True, "3 hires, 12 live.")],
+        payloads=[ABSTAIN],
+        delay=0.05,
+    )
+
+    streamed, _, _ = await _run(loop, question="whats new")
+
+    assert formatter.runs == 2  # pass 1 is formatted too
+    # the speculative call is started beside the formatter and cancelled on the
+    # abstain (parallel); the serial wiring never reaches its critic
+    assert len(critic.ran) == (1 if parallel else 0)
+    (requery,) = _critic_verdicts(streamed)
+    assert requery["reason"] == REQUERY_REASON and requery["feedback"] == REQUERY_FEEDBACK
+
+
+async def test_a_pass_with_a_tool_call_still_runs_the_formatter_and_the_critic(monkeypatch):
+    """Eligibility is the tool call, not the evidence index: this pass indexed
+    nothing, and is still formatted and judged."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", False)
+    loop, executor, formatter, critic = _real_gate_pipeline(
+        parallel=True,
+        executor_passes=[(True, "GUB has no account by that name.")],
+        payloads=[ABSTAIN],
+        delay=0.05,
+    )
+
+    _, state, _ = await _run(loop)
+
+    assert formatter.runs == 1 and executor.runs == 1
+    assert len(critic.ran) == 1  # started beside the formatter, as before
+    assert state["critic_verdict"]["reason"] == ABSTAIN_PASS
+
+
+def _stated(name: str, key: str) -> list[str]:
+    return [
+        line.partition("=")[2].strip()
+        for line in (REPO / name).read_text().splitlines()
+        if line.startswith(f"{key}=")
+    ]
+
+
+def test_both_deploy_env_files_state_the_requery_flag_with_one_value():
+    """Stated, not defaulted — the rollback is a line already in front of the
+    operator — ON, and the same in both, so a sandbox run measures what
+    production runs."""
+    prod = _stated("deploy-prod.env", "REQUERY_SKIPS_FORMATTER")
+    sandbox = _stated("deploy-sandbox.env", "REQUERY_SKIPS_FORMATTER")
+    assert prod == sandbox == ["1"], (prod, sandbox)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(None, False), ("0", False), ("1", True)], ids=["unset", "0", "1"]
+)
+def test_the_requery_flag_defaults_to_todays_behaviour(value, expected):
+    """Read at import, so each setting gets a fresh interpreter. Unset is the
+    code default and the rollback: the formatter is called."""
+    env = {k: v for k, v in os.environ.items() if k != "REQUERY_SKIPS_FORMATTER"}
+    if value is not None:
+        env["REQUERY_SKIPS_FORMATTER"] = value
+    env["PYTHONPATH"] = str(REPO)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "ignore",
+            "-c",
+            "from gub_agent import config; print(config.REQUERY_SKIPS_FORMATTER)",
+        ],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    assert out.stdout.strip().splitlines()[-1] == str(expected)
+
+
+async def test_a_first_pass_with_no_text_and_no_tool_call_still_starts_the_critic(
+    monkeypatch, caplog
+):
+    """The executor wrote nothing (it died): the gate emits nothing, so the
+    critic started beside it is the only verdict there will be and must not be
+    skipped as if the pass were a from-memory draft."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", False)
+    loop, executor, formatter, critic = _real_gate_pipeline(
+        parallel=True,
+        executor_passes=[(False, ""), (True, "3 hires, 12 live.")],
+        payloads=[ANSWER],
+        delay=0.05,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await _run(loop, question="whats new")
+
+    assert len(critic.ran) == 1  # pass 1's speculative call was made (pass 2 is the last)
+    assert "critic_speculation: nothing held" not in caplog.text
+    assert "critic_requery: shortcut" not in caplog.text
+
+
+async def test_the_shortcut_pass_leaves_no_trace_in_the_critics_later_requests(monkeypatch):
+    """Under the parallel wiring the speculative critic runs on a sibling branch
+    of the gate. The gate's code abstain must be hidden from it, as the
+    formatter's was: with CRITIC_SKIP_FINAL_PASS=0 the critic judges pass 2,
+    and its request must carry no `[format_gate] said` payload of pass 1."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    monkeypatch.setattr(config, "EVIDENCE_ROWS_EVENT", False)
+    monkeypatch.setattr(config, "CRITIC_SKIP_FINAL_PASS", False)
+    loop, executor, formatter, critic = _real_gate_pipeline(
+        parallel=True,
+        executor_passes=[(False, "Here is what's new: 3 hires."), (True, "3 hires, 12 live.")],
+        payloads=[ANSWER],
+        delay=0.05,
+    )
+
+    _, _, session_events = await _run(loop, question="whats new")
+
+    assert len(critic.ran) == 1 and formatter.runs == 1  # only pass 2 was judged and formatted
+    assert "[format_gate] said" not in critic.saw[0]
+    assert "NO_COMPANY_RECORDS" not in critic.saw[0]
+    abstains = [
+        e
+        for e in session_events
+        if e.author == "format_gate" and e.content and "abstain" in e.content.parts[0].text
+    ]
+    assert abstains and all(e.branch for e in abstains)  # in the session, on the gate's branch
