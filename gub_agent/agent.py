@@ -74,6 +74,7 @@ from .agents.critic import (
     SpeculativeCritic,
     critic_agent,
     escalator_agent,
+    settle_speculation,
 )
 from .agents.dispatcher import Dispatcher
 from .agents.evidence_index import record_evidence, reset_evidence_index
@@ -250,7 +251,10 @@ def build_deep_agent(
     re-query — moves to a resolver after the join (agents/critic.py:
     CriticResolver), which reads THIS pass's payload and holds the critic's
     events until it has decided, so the stream and the state see what they
-    saw before: payload, verdict, escalator.
+    saw before: payload, verdict, escalator. The join would also wait out a
+    critic call whose verdict the resolver then drops (an abstain payload is
+    settled in code), so the gate carries an after-callback that cancels that
+    call (critic.py:settle_speculation).
 
     A function over the agents, not over the module singletons, so both
     shapes can be built in one process for the tests; the module builds one.
@@ -259,7 +263,23 @@ def build_deep_agent(
     # off state, which can still hold an earlier turn's (critic.py:_this_pass_payload).
     payload_authors = (gate.name, *(agent.name for agent in gate.sub_agents))
     if parallel:
-        speculation = SpeculativeCritic(name="critic_speculation", sub_agents=[critic])
+        speculation = SpeculativeCritic(
+            name="critic_speculation", sub_agents=[critic], payload_authors=payload_authors
+        )
+        # On the gate's own callback, not on the fork: it fires the moment the
+        # gate has yielded its last payload, which is when the abandon is
+        # decided. Idempotent — the builder can run again over the same gate —
+        # and chained behind any callback the gate already has, never in place
+        # of it. First in the chain, so an earlier callback's content cannot
+        # skip it (a chain stops at the first truthy result). The gate is
+        # shared with the fast path, where the callback finds no speculation
+        # and does nothing; the serial wiring attaches none.
+        existing = gate.after_agent_callback
+        callbacks = (
+            [] if existing is None else list(existing) if isinstance(existing, list) else [existing]
+        )
+        if settle_speculation not in callbacks:
+            gate.after_agent_callback = [settle_speculation, *callbacks]
         middle: list[BaseAgent] = [
             ParallelAgent(name="format_and_critic", sub_agents=[gate, speculation]),
             CriticResolver(
