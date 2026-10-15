@@ -81,6 +81,7 @@ from ..schemas import AnswerPayload, BulletBlock, Fact, TextBlock
 from ..schemas.answer import HEADLINE_MAX_WORDS, TEXT_BLOCK_MAX_WORDS, answer_budgets
 from ..schemas.router import FALLBACK_DECISION
 from ..tenant import label_of
+from .answers import scrub_for_emit
 from .critic import _last_executor_text, from_memory_pass, log_requery_shortcut
 from .evidence_index import (
     answer_draft,
@@ -1354,15 +1355,25 @@ class FormatGate(BaseAgent):
         )
 
     def _payload_event(
-        self, ctx: InvocationContext, payload: AnswerPayload, *, branch: str | None = None
+        self,
+        ctx: InvocationContext,
+        payload: AnswerPayload,
+        *,
+        scrubbed: bool = False,
+        branch: str | None = None,
     ) -> Event:
         """A gate-authored payload event: the JSON as content text (the bot's
         answer channel parses formatter/format_gate text, last one wins) AND a
         state_delta so `state["answer_payload"]` matches what was emitted —
-        the critic gate reads it for abstain recognition. `branch` stamps the
-        event with the gate's own ADK branch, as the formatter's events carry
-        it: ADK hides a branch-stamped event from a sibling branch (the
-        speculative critic) and shows an unstamped one to every agent."""
+        the critic gate reads it for abstain recognition. `scrubbed` says the
+        caller already ran the reader-text scrub on `payload` (it did so to log
+        the shape of what ships), so it runs once per payload, never twice.
+        `branch` stamps the event with the gate's own ADK branch, as the
+        formatter's events carry it: ADK hides a branch-stamped event from a
+        sibling branch (the speculative critic) and shows an unstamped one to
+        every agent."""
+        if not scrubbed:
+            payload, _ = scrub_for_emit(payload, ctx.invocation_id, label_of(ctx))
         dumped = payload.model_dump(exclude_none=True)
         return Event(
             invocation_id=ctx.invocation_id,
@@ -1541,6 +1552,9 @@ class FormatGate(BaseAgent):
                                     ctx.invocation_id,
                                     label_of(ctx),
                                 )
+                            payload, scrubbed = scrub_for_emit(
+                                payload, ctx.invocation_id, label_of(ctx)
+                            )
                             log_answer_shape(
                                 ctx.invocation_id, label_of(ctx), payload, executor_text
                             )
@@ -1552,8 +1566,8 @@ class FormatGate(BaseAgent):
                             # a pruned source id: left unemitted, the bot would
                             # read the formatter's event and publish a link to
                             # the file the gate just removed.
-                            if repaired or pruned_sources:
-                                yield self._payload_event(ctx, payload)
+                            if repaired or pruned_sources or scrubbed:
+                                yield self._payload_event(ctx, payload, scrubbed=True)
                             return  # else the formatter's event already carried it
                         feedback = "; ".join(problems)
 
@@ -1599,8 +1613,11 @@ class FormatGate(BaseAgent):
             label_of(ctx),
         )
         template = template_payload(executor_text, index, provenance(ctx.invocation_id))
+        # Scrubbed BEFORE its shape is logged, as on the accepted path: the line
+        # then describes what ships.
+        template, _ = scrub_for_emit(template, ctx.invocation_id, label_of(ctx))
         log_answer_shape(ctx.invocation_id, label_of(ctx), template, executor_text)
-        yield self._payload_event(ctx, template)
+        yield self._payload_event(ctx, template, scrubbed=True)
 
 
 format_gate = FormatGate(name="format_gate", sub_agents=[formatter_agent])

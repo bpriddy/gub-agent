@@ -519,16 +519,16 @@ def log_tool_payload(invocation_id: str, tenant: str, tool_name: str, tool_respo
         seen_chars = len(
             json.dumps(_without_plumbing(tool_response), ensure_ascii=False, default=str)
         )
-    except (TypeError, ValueError, RecursionError):
+        logger.info(
+            "tool_payload: tool=%s chars=%d seen_chars=%d inv=%s tenant=%s",
+            tool_name,
+            chars,
+            seen_chars,
+            invocation_id,
+            tenant,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never cost the tool call (an odd __str__ too)
         return
-    logger.info(
-        "tool_payload: tool=%s chars=%d seen_chars=%d inv=%s tenant=%s",
-        tool_name,
-        chars,
-        seen_chars,
-        invocation_id,
-        tenant,
-    )
 
 
 def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any) -> None:

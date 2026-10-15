@@ -432,6 +432,29 @@ EVIDENCE_ROWS_EVENT: bool = os.environ.get("EVIDENCE_ROWS_EVENT", "0").lower() i
     "yes",
 )
 
+# Reader text carries no record ids and no raw ISO timestamps (latency-05 W1-5).
+# An account overview came back as "The account (id: <uuid>) was created on
+# 2026-06-04T18:33:52.846Z ..." because the fast path's draft copies every
+# scalar field of the response, the id and the timestamps included, and the
+# formatter wrote what it was given. On: the draft leaves out the record-id
+# fields (they stay in the evidence rows and `facts`, which is where a machine
+# reads them), and every payload the format gate emits has the record ids and
+# ISO timestamps rewritten out of its reader-visible fields (headline, text
+# blocks, bullets, table cells) by `agents/answers.py:scrub_for_emit` — a UUID
+# out, an ISO timestamp as "Jun 4, 2026"; `facts`, `citations`, source ids and
+# `[n]` / `[evidence id]` markers are never touched. 0 is the ROLLBACK:
+# today's draft and today's payloads, byte for byte. Read at import: a
+# redeploy either way.
+#
+# Watch `reader_text: scrubbed ids=… dates=… inv=… tenant=…`, logged only when
+# a scrub changed something (from answers.py, so `textPayload:"format_gate"`
+# does not see it).
+READER_TEXT_SCRUB: bool = os.environ.get("READER_TEXT_SCRUB", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 

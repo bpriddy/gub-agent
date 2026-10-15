@@ -57,6 +57,7 @@ from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 
+from .. import config
 from ..config import FAST_TIE_BAND
 from ..schemas import AnswerPayload
 from ..schemas.router import RouterDecision
@@ -66,6 +67,7 @@ from ..tools.discovery import find
 from ..tools.org_query import org_query
 from ..tools.staff import get_staff_profile, search_staff
 from .answers import (
+    is_record_id_field,
     no_access_payload,
     not_found_payload,
     payload_event,
@@ -728,10 +730,20 @@ def log_declined_before_lookup(shim: _ToolShim, reason: str) -> None:
 # ── the draft the format gate renders ─────────────────────────────────────────
 
 
+def _hidden_id(key: str, value: Any) -> bool:
+    """READER_TEXT_SCRUB: a record's own id stays out of the draft. The draft is
+    what the formatter writes the answer from, and it wrote "(id: <uuid>)" into
+    a reader's reply because the draft listed one. The id is still in the
+    evidence rows (`ALLOWED_EVIDENCE`), where it is cited and echoed."""
+    return config.READER_TEXT_SCRUB and is_record_id_field(key, value)
+
+
 def _scalar_lines(row: dict) -> list[str]:
     lines = []
     for key, value in row.items():
         if key.startswith("_") or not isinstance(value, (str, int, float, bool)):
+            continue
+        if _hidden_id(key, value):
             continue
         text = str(value)
         if len(text) > MAX_DRAFT_FIELD_CHARS:
@@ -751,6 +763,12 @@ def compose_draft(question: str, decision: RouterDecision, lookup: Lookup) -> st
         f"QUESTION: {question.strip()}",
         "RESULT:",
     ]
+    if config.READER_TEXT_SCRUB:
+        # The formatter prompt's own rule, said again where the fields are.
+        lines[0] += (
+            " Never write a record id or UUID, and write a date as a human date"
+            " (June 4, 2026), never as an ISO timestamp."
+        )
     for _tool, response in lookup.evidence:
         lines.extend(_scalar_lines(response))
         for key, value in response.items():
@@ -764,7 +782,9 @@ def compose_draft(question: str, decision: RouterDecision, lookup: Lookup) -> st
                 scalars = {
                     k: v
                     for k, v in item.items()
-                    if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
+                    if isinstance(v, (str, int, float, bool))
+                    and not k.startswith("_")
+                    and not _hidden_id(k, v)
                 }
                 lines.append(f"- {json.dumps(scalars, ensure_ascii=False, default=str)}")
     return "\n".join(lines)
