@@ -44,6 +44,7 @@ from pathlib import Path
 
 import pytest
 from google.adk.agents import BaseAgent, LlmAgent, LoopAgent, ParallelAgent
+from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.events import Event, EventActions
 from google.adk.flows.llm_flows.contents import _get_contents
 from google.adk.models.base_llm import BaseLlm
@@ -264,9 +265,15 @@ def _pipeline(
 
 
 async def _run(
-    loop: LoopAgent, *, question: str = "how is chevy?", state=None, prior=None
+    loop: LoopAgent,
+    *,
+    question: str = "how is chevy?",
+    state=None,
+    prior=None,
+    run_config: RunConfig | None = None,
 ) -> tuple[list[Event], dict, list[Event]]:
-    """One turn through a real runner: (streamed events, final state, session events)."""
+    """One turn through a real runner: (streamed events, final state, session events).
+    `run_config` is the caller's: the Chat bots run SSE, so a model call streams."""
     runner = InMemoryRunner(agent=loop, app_name="gub")
     session = await runner.session_service.create_session(
         app_name="gub", user_id="u", state=state or {}
@@ -274,9 +281,12 @@ async def _run(
     for event in prior or []:
         await runner.session_service.append_event(session, event)
     message = genai_types.Content(role="user", parts=[genai_types.Part(text=question)])
+    options = {} if run_config is None else {"run_config": run_config}
     streamed = [
         event
-        async for event in runner.run_async(user_id="u", session_id=session.id, new_message=message)
+        async for event in runner.run_async(
+            user_id="u", session_id=session.id, new_message=message, **options
+        )
     ]
     final = await runner.session_service.get_session(
         app_name="gub", user_id="u", session_id=session.id
@@ -1502,4 +1512,179 @@ async def test_an_abandoned_call_the_resolver_still_needs_is_run_serially(caplog
     assert critic.cancelled == 1 and len(critic.ran) == 2  # abandoned, then run serially
     assert state["critic_verdict"] == SUFFICIENT
     assert _critic_verdicts(streamed) == [SUFFICIENT]
+    _nothing_left_running()
+
+
+# ── a hedged critic call (CRITIC_HEDGE_AFTER_MS, models.VendorRouter) ─────────
+#
+# The critic's streamed first token can stall like the executor's, so its call
+# is sent a second time after a deadline (models.py, "The critic hedge"). The
+# tests run the REAL critic LlmAgent over a VendorRouter with the critic's
+# deadline set, under the run config the Chat bots use (SSE: the call streams).
+
+SSE = RunConfig(streaming_mode=StreamingMode.SSE)
+
+
+class _ScriptedCriticModel(BaseLlm):
+    """The critic's model for the hedge tests. Request n replays steps[n] (the
+    last repeats): "hang", a pause in seconds, or a response. `reached` is set
+    once `want` requests are on the wire; `cancelled[n]` says request n was."""
+
+    steps: list = []
+    seen: int = 0
+    want: int = 1
+    reached: asyncio.Event | None = None
+    cancelled: list = []
+
+    @classmethod
+    def supported_models(cls):
+        return [r".*"]
+
+    async def generate_content_async(self, llm_request, stream=False):
+        n = self.seen
+        self.seen += 1
+        self.cancelled.append(False)
+        if self.reached is not None and self.seen >= self.want:
+            self.reached.set()
+        try:
+            for step in self.steps[min(n, len(self.steps) - 1)]:
+                if step == "hang":
+                    await asyncio.Event().wait()
+                elif isinstance(step, (int, float)):
+                    await asyncio.sleep(step)
+                else:
+                    yield step
+        except asyncio.CancelledError:
+            self.cancelled[n] = True
+            raise
+
+
+def _verdict_response(verdict: dict) -> LlmResponse:
+    return LlmResponse(
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part.from_text(text=json.dumps(verdict))]
+        )
+    )
+
+
+def _hedged_critic(model: BaseLlm, *, after_ms: int = 50) -> LlmAgent:
+    return LlmAgent(
+        name="critic",
+        model=VendorRouter(
+            model=GEMINI_MODEL,
+            gemini=model,  # type: ignore[arg-type]
+            agent_hedge_after_ms={config.CRITIC_AGENT_NAME: after_ms},
+        ),
+        instruction="Judge the executor's tool coverage.",
+        output_schema=CriticVerdict,
+        output_key="critic_verdict",
+        before_model_callback=lambda callback_context, llm_request: bind_model_call(
+            callback_context
+        ),
+    )
+
+
+def _logged(caplog, prefix: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+
+
+async def test_a_hedged_critic_call_abandoned_by_e1_stops_both_requests(caplog):
+    """E1 cancels a critic whose spare is already out. The cancellation lands in
+    the hedge race: both requests are stopped and each logs `error:cancelled`
+    (the spare's line ends ` hedge=1`), one `model_hedge:` line reports the fire
+    with no winner, the call is abandoned once, the verdict is the code's pass,
+    and nothing is left running."""
+    model = _ScriptedCriticModel(
+        model=GEMINI_MODEL, steps=[["hang"]], want=2, reached=asyncio.Event(), cancelled=[]
+    )
+    loop, _, formatter, _ = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "No account by that name.")],
+        payloads=[ABSTAIN],
+        critic=_hedged_critic(model),
+    )
+    formatter.wait_for = model.reached  # both requests are on the wire when the gate ends
+
+    with caplog.at_level(logging.INFO):
+        _, state, _ = await _bounded(loop, run_config=SSE)
+
+    calls = _logged(caplog, "model_call: ")
+    assert len(calls) == 2
+    assert all(" agent=critic " in c and " status=error:cancelled " in c for c in calls)
+    assert sorted(c.endswith(" hedge=1") for c in calls) == [False, True]
+    [fired] = _logged(caplog, "model_hedge: ")
+    assert " agent=critic fired=1 winner=- " in fired and fired.endswith(" tenant=anomaly")
+    assert caplog.text.count("critic_speculation: call abandoned") == 1
+    assert _logged(caplog, "hedge_capped:") == []
+    assert model.seen == 2 and model.cancelled == [True, True]
+    assert state["critic_verdict"]["reason"] == ABSTAIN_PASS
+    _nothing_left_running()
+
+
+async def test_a_hedged_critic_verdict_is_relayed_once(caplog):
+    """The critic's first request stalls and its spare answers: the pass is
+    judged by the spare's verdict, once, and the stalled request is cancelled."""
+    model = _ScriptedCriticModel(
+        model=GEMINI_MODEL,
+        steps=[["hang"], [0.01, _verdict_response(SUFFICIENT)]],
+        cancelled=[],
+    )
+    loop, executor, _, _ = _pipeline(
+        parallel=True,
+        executor_passes=[(True, "12 live campaigns.")],
+        payloads=[ANSWER],
+        critic=_hedged_critic(model),
+    )
+
+    with caplog.at_level(logging.INFO):
+        streamed, state, _ = await _bounded(loop, run_config=SSE)
+
+    assert model.seen == 2 and model.cancelled == [True, False]
+    assert _critic_verdicts(streamed) == [SUFFICIENT]  # one verdict reaches the stream
+    assert state["critic_verdict"] == SUFFICIENT and executor.runs == 1
+    [fired] = _logged(caplog, "model_hedge: ")
+    assert " agent=critic fired=1 winner=hedge " in fired
+    assert _logged(caplog, "hedge_capped:") == []
+    _nothing_left_running()
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_the_critic_of_a_second_pass_shares_the_invocations_one_hedge(
+    parallel, monkeypatch, caplog
+):
+    """CRITIC_SKIP_FINAL_PASS=0 makes the critic judge both passes. Both wirings
+    (the serial one is CRITIC_PARALLEL=0 and the resolver's serial fallback)
+    reach the same VendorRouter as `critic` and draw on the same budget of one
+    hedge per invocation: pass 1's stall is rescued, pass 2's waits on its own
+    request and says why."""
+    monkeypatch.setattr(config, "CRITIC_SKIP_FINAL_PASS", False)
+    model = _ScriptedCriticModel(
+        model=GEMINI_MODEL,
+        steps=[
+            ["hang"],  # pass 1, first request: stalls
+            [0.01, _verdict_response(INSUFFICIENT)],  # pass 1's spare
+            [0.3, _verdict_response(SUFFICIENT)],  # pass 2: slow, but healthy
+        ],
+        cancelled=[],
+    )
+    loop, executor, _, _ = _pipeline(
+        parallel=parallel,
+        executor_passes=[(True, "12 live campaigns."), (True, "The Q3 push is live.")],
+        payloads=[ANSWER, ANSWER_2],
+        critic=_hedged_critic(model),
+    )
+
+    with caplog.at_level(logging.INFO):
+        streamed, state, _ = await _bounded(loop, run_config=SSE)
+
+    assert executor.runs == 2
+    assert model.seen == 3 and model.cancelled == [True, False, False]  # no second spare
+    assert _critic_verdicts(streamed) == [INSUFFICIENT, SUFFICIENT]
+    assert state["critic_verdict"] == SUFFICIENT
+    [fired] = _logged(caplog, "model_hedge: ")
+    assert " agent=critic fired=1 winner=hedge " in fired
+    [capped] = _logged(caplog, "hedge_capped:")
+    assert re.match(
+        r"^hedge_capped: agent=critic after_ms=50 used=1 limit=1 inv=\S+ tenant=anomaly$", capped
+    )
     _nothing_left_running()

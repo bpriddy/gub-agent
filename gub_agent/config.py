@@ -217,6 +217,28 @@ FORMATTER_HEDGE_AFTER_MS: int = int(os.environ.get("FORMATTER_HEDGE_AFTER_MS", "
 #: this one; a test pins the two together.
 FORMATTER_AGENT_NAME = "formatter"
 
+# ── A stalled critic call is sent twice ──────────────────────────────────────
+# The executor and formatter hedges above, for the critic (models.py, "The
+# critic hedge"). Its streamed first token stalls the same way, and a pass
+# waits for the verdict. Measured on 33 instrumented tenant turns over 7 days
+# (a $0 log analysis): first-token p50 5.0 s, 35 of 49 calls answer within
+# 9.6 s and 12 took more than 15 s (the other 2 fall in between), each of those
+# 12 with TTFT about equal to its duration and at most 297 thought tokens, so
+# the wait is not thinking. 15000 fires on those 12 alone.
+#
+# The price, only on the calls it fires on: the critic's prompt sent once more,
+# ~$0.045 at the median and ~$0.13 at most — about $0.59 per 100 turns. One
+# invocation fires at most ONE critic hedge (models.py, "The hedge cap").
+#
+# 0 is the code default and the ROLLBACK, as for the other hedges. Read at
+# import: a redeploy either way. Stated in both deploy env files.
+CRITIC_HEDGE_AFTER_MS: int = int(os.environ.get("CRITIC_HEDGE_AFTER_MS", "0"))
+
+#: The critic's agent name (agents/critic.py), the key its hedge deadline and
+#: its hedge budget are looked up by. Restated here because that module imports
+#: this one; a test pins the two together.
+CRITIC_AGENT_NAME = "critic"
+
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
 # id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
@@ -421,8 +443,8 @@ def build_model() -> BaseLlm:
     The router hedge (ROUTER_HEDGE_AFTER_MS) sits above this, not inside it:
     one second send per router call at most, never one per attempt, never
     while the first send is retrying, and each send counts its own retries.
-    The executor and formatter hedges (EXECUTOR_/FORMATTER_HEDGE_AFTER_MS)
-    work the same way, on their own deadlines.
+    The executor, formatter and critic hedges (EXECUTOR_/FORMATTER_/
+    CRITIC_HEDGE_AFTER_MS) work the same way, on their own deadlines.
     """
     from .models import VendorRouter  # noqa: PLC0415 — models.py imports config
 
@@ -446,6 +468,7 @@ def build_model() -> BaseLlm:
             for name, after_ms in (
                 (AGENT_NAME, EXECUTOR_HEDGE_AFTER_MS),
                 (FORMATTER_AGENT_NAME, FORMATTER_HEDGE_AFTER_MS),
+                (CRITIC_AGENT_NAME, CRITIC_HEDGE_AFTER_MS),
             )
             if after_ms > 0
         },
