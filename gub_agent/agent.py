@@ -80,7 +80,7 @@ from .agents.dispatcher import Dispatcher
 from .agents.evidence_index import record_evidence, reset_evidence_index
 from .agents.fast_path import fast_path
 from .agents.format_gate import format_gate
-from .agents.round_limiter import reset_rounds, round_limit
+from .agents.round_limiter import reset_rounds, round_limit, synthesis_round_thinking
 from .agents.router import router_agent
 from .agents.speculation import SPECULATIVE_DEEP, SpeculativeDispatch
 from .agents.tool_gate import tool_gate
@@ -124,7 +124,9 @@ def _before_model(callback_context, llm_request):
     turns (N from state["context_turn_window"], else CONTEXT_TURN_WINDOW), prune
     prior-turn tool payloads, mask `_sources` citation plumbing from
     current-turn results, withhold the file-search tool on non-file turns, then
-    cap ReAct rounds (strip tools past the budget).
+    cap ReAct rounds (strip tools past the budget) and, when
+    SYNTHESIS_ROUND_THINKING_LEVEL says so, think less on the round that writes
+    the answer.
 
     Sandbox first, deliberately: it only writes `llm_request.model` and fields
     of `config`, while the round limiter may clear `config.tools` — neither can
@@ -144,7 +146,8 @@ def _before_model(callback_context, llm_request):
 
     And one more since search-01:
 
-    * `tool_gate` BEFORE `round_limit`, which stays LAST. The limiter's whole
+    * `tool_gate` BEFORE `round_limit`, the last step that touches the tool
+      list (`synthesis_round_thinking` follows it, below). The limiter's whole
       job past the budget is to empty `config.tools` so the model cannot call
       anything; a gate running after it would be rewriting a list the limiter
       had deliberately cleared. Today that is merely pointless — filtering an
@@ -154,6 +157,15 @@ def _before_model(callback_context, llm_request):
       it, and would hand back a declaration the limiter had just taken away.
       Withholding one tool and withdrawing all of them compose in one
       direction only.
+
+    And one since latency-05:
+
+    * `synthesis_round_thinking` AFTER `round_limit`, because it reads the round
+      counter the limiter just ticked (it never ticks) and so must run once per
+      model call, after the tick. It writes `config.thinking_config` only —
+      never `config.tools` — so `round_limit` stays the last writer of the tool
+      list, and it comes after the sandbox's thinking override on purpose: an
+      explicit `synthesis_round_thinking_level` is the more specific of the two.
     """
     bind_model_call(callback_context)  # who is calling, for the model_call line
     sandbox_before_model(callback_context, llm_request, role="executor")
@@ -161,7 +173,8 @@ def _before_model(callback_context, llm_request):
     strip_prior_turn_tool_parts(callback_context, llm_request)
     strip_source_metadata(callback_context, llm_request)
     tool_gate(callback_context, llm_request)
-    return round_limit(callback_context, llm_request)
+    round_limit(callback_context, llm_request)
+    return synthesis_round_thinking(callback_context, llm_request)
 
 
 executor_agent = Agent(

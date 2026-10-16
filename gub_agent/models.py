@@ -115,6 +115,59 @@ loser cancelled and logged, no second send while genai retries.
   also have spent thinking tokens, and its `model_call:` line reports none of
   its usage (no usage arrives before its first chunk), so a token sum over
   `model_call:` lines does not include the second sends.
+
+The critic hedge (CRITIC_HEDGE_AFTER_MS). The same mechanism for the critic,
+whose streamed first token stalls the same way and which a pass waits for: its
+own deadline in `agent_hedge_after_ms`, its own `model_hedge: agent=critic …`
+line. A speculative critic call that the pass has already settled in code is
+cancelled by the pass (critic.py, `settle_speculation`): the cancellation lands
+in `_hedged` like any caller's and every request that is out is stopped, each
+writing its `model_call:` line as `status=error:cancelled` — both once the spare
+has been sent (and then one `model_hedge:` line with `winner=-`), only the first
+when the deadline has not yet passed (and then none).
+
+The hedge cap. Each fired hedge is an extra request, so one invocation may fire
+only so many (`_HEDGE_LIMIT`): two for the executor and the formatter together,
+one for the critic. The router is outside it: one call per invocation, at most
+one spare.
+
+- The budget belongs to the invocation id. Neither a new pass, nor a discarded
+  speculation, nor the speculative deep run's restart resets it: it bounds the
+  money actually spent, and the fast path, a discarded deep run and the kept one
+  share one invocation id.
+- It is spent only when a hedge fires. A call that would exceed it takes the
+  unhedged path — it waits on its own first request and relays it whole — and
+  logs once, at the decision point,
+
+    hedge_capped: agent=<name> after_ms=<n> used=<n> limit=<n> inv=… tenant=…
+
+  never a `model_hedge:` line, since no second request was sent.
+- A call with no bound invocation (`inv=-`) is never capped, the store keeps
+  the `_MAX_TRACKED` newest invocations (an evicted invocation starts again with
+  a full budget) and any failure inside the budget code lets the hedge fire: a
+  cap must never cost a call.
+
+The answer round's deadline (EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS). The executor's
+round past the ReAct budget (round_limiter.py) is the one that writes the
+answer, and its first chunk arrives after ALL of its thinking: in a local run two
+rounds of 4.3k and 6.5k thought tokens answered at 26.5 s and 28.9 s with
+nothing wrong with the request. A hedge at the tool rounds' deadline fires on
+those and loses to its own first request, one prompt of input spent and one of
+the invocation's two executor-or-formatter hedges used up. So that round has a
+deadline of its own, `synthesis_hedge_after_ms`; the tool rounds keep
+`agent_hedge_after_ms`.
+
+- Only the executor has such a round. `round_limit` marks the call
+  (`mark_synthesis_round`) after `bind_model_call` named the caller, so the mark
+  lasts for that one model call: the next call binds a fresh, unmarked caller.
+- 0 (the default) means the round has no deadline of its own: every executor
+  round takes the executor's, as before. The executor's own deadline at 0 still
+  means no executor hedge at all, whatever this one says.
+- Added, for a marked call, to the line of a hedge that fired (`model_hedge:`)
+  and to the line of one the cap withheld (`hedge_capped:`), before `inv=`:
+  `round=synthesis`. On an executor line its absence means a tool round, so the
+  two are told apart by `textPayload:"round=synthesis"`; it is written whatever
+  this deadline is, so the baseline can be read from the same lines.
 """
 
 from __future__ import annotations
@@ -125,10 +178,11 @@ import json
 import logging
 import os
 import time
+from collections import Counter, OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
@@ -138,6 +192,7 @@ from google.genai import types as genai_types
 from pydantic import Field, PrivateAttr
 from typing_extensions import override
 
+from .config import AGENT_NAME, CRITIC_AGENT_NAME, FORMATTER_AGENT_NAME
 from .tenant import label_of
 
 logger = logging.getLogger("gub_agent.models")
@@ -177,8 +232,14 @@ class VendorRouter(BaseLlm):
     #: The same deadline for other agents, by the name the `model_call:` line
     #: uses (module docstring, "The executor and formatter hedges"); an agent
     #: absent here, or at 0, never hedges. config.build_model passes the
-    #: executor's and the formatter's (EXECUTOR_/FORMATTER_HEDGE_AFTER_MS).
+    #: executor's, the formatter's and the critic's (EXECUTOR_/FORMATTER_/
+    #: CRITIC_HEDGE_AFTER_MS).
     agent_hedge_after_ms: dict[str, int] = Field(default_factory=dict)
+    #: The executor's deadline for its round past the ReAct budget (module
+    #: docstring, "The answer round's deadline"); 0 = the executor's own, as for
+    #: every other round. config.build_model passes
+    #: EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS.
+    synthesis_hedge_after_ms: int = 0
 
     _claude: dict[str, BaseLlm] = PrivateAttr(default_factory=dict)
 
@@ -257,7 +318,13 @@ class VendorRouter(BaseLlm):
             return self.router_hedge_after_ms
         if not stream:
             return 0
-        return self.agent_hedge_after_ms.get(agent, 0)
+        after_ms = self.agent_hedge_after_ms.get(agent, 0)
+        if after_ms > 0 and self.synthesis_hedge_after_ms > 0 and agent == AGENT_NAME:
+            # The executor's answer round, marked by round_limit for this call.
+            caller = _CALLER.get()
+            if caller is not None and caller.agent == agent and caller.synthesis:
+                return self.synthesis_hedge_after_ms
+        return after_ms
 
     async def _generate(
         self, llm_request: LlmRequest, stream: bool
@@ -294,6 +361,13 @@ class VendorRouter(BaseLlm):
             if asked.done() or primary.call.retries:
                 # In time — a failure too, raised below exactly as it is
                 # unhedged — or genai is already retrying it: no second send.
+                winner, outcome = primary, await asked
+            elif not (take := _take_hedge(agent, primary.call.caller))[0]:
+                # This invocation has fired all the hedges its budget allows
+                # (module docstring, "The hedge cap"): the call waits on its own
+                # request, exactly as unhedged. The check and the spend in
+                # _take_hedge have no await between them.
+                _log_capped(agent, after_ms, take, primary.call.caller)
                 winner, outcome = primary, await asked
             else:
                 hedge = _Leg(self, spare, stream, hedge=True)
@@ -357,6 +431,9 @@ class _Caller:
     agent: str
     invocation_id: str
     tenant: str
+    #: The executor's round past the ReAct budget, the one that writes the
+    #: answer (`mark_synthesis_round`); False until round_limit says otherwise.
+    synthesis: bool = False
 
 
 # Set by `bind_model_call`, read by the call that follows it. A ContextVar and
@@ -384,6 +461,18 @@ def bind_model_call(callback_context: Any) -> None:
             tenant=label_of(callback_context),
         )
     )
+
+
+def mark_synthesis_round() -> None:
+    """Called by round_limit for the executor's round past the ReAct budget, after
+    `bind_model_call` bound the caller: the model call that follows is the answer
+    round (module docstring, "The answer round's deadline"). The caller is
+    replaced, never edited — it is frozen and a copy of it may sit in a call
+    already in flight — and the next `bind_model_call` replaces it again, so the
+    mark covers this one call. With no bound caller there is nothing to mark."""
+    caller = _CALLER.get()
+    if caller is not None:
+        _CALLER.set(replace(caller, synthesis=True))
 
 
 # genai retries 429/408/5xx inside the request (HttpRetryOptions, config.py)
@@ -686,12 +775,79 @@ def _log_hedge(agent: str, primary: _Leg, hedge: _Leg, winner: _Leg | None) -> N
             *where,
         )
     else:
+        # `round=synthesis` only for the executor's answer round (module
+        # docstring), before `inv=`, so `tenant=` stays last.
+        answer_round = " round=synthesis" if caller is not None and caller.synthesis else ""
         logger.info(
-            "model_hedge: agent=%s fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s "
-            "inv=%s tenant=%s",
+            "model_hedge: agent=%s fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s"
+            + answer_round
+            + " inv=%s tenant=%s",
             agent,
             *where,
         )
+
+
+# ── The hedge cap (module docstring) ──────────────────────────────────────────
+
+#: The budget an agent's hedges are drawn from. The router is in none.
+_HEDGE_GROUP = {
+    AGENT_NAME: "exec_fmt",
+    FORMATTER_AGENT_NAME: "exec_fmt",
+    CRITIC_AGENT_NAME: "critic",
+}
+#: How many hedges one invocation may fire, per budget.
+_HEDGE_LIMIT = {"exec_fmt": 2, "critic": 1}
+#: Hedges fired so far, by invocation id and budget. Unlocked module state, like
+#: round_limiter._ROUNDS: an invocation runs on one event loop, and its check and
+#: spend (`_take_hedge`) have no await between them.
+_HEDGES: OrderedDict[str, Counter[str]] = OrderedDict()
+_MAX_TRACKED = 256  # the bound and the eviction round_limiter._ROUNDS has
+
+
+def _take_hedge(agent: str, caller: _Caller | None) -> tuple[bool, int, int]:
+    """Spend one of the invocation's hedges for this agent's budget:
+    `(allowed, used, limit)`, with `used` counting the one just spent when it
+    is allowed. The router, an agent in no budget and a call with no bound
+    invocation are never capped; a failure here lets the hedge fire."""
+    group = _HEDGE_GROUP.get(agent)
+    inv = caller.invocation_id if caller else "-"
+    if group is None or inv == "-":
+        return True, 0, 0
+    limit = _HEDGE_LIMIT[group]
+    try:
+        spent = _HEDGES.get(inv)
+        if spent is None:
+            spent = _HEDGES[inv] = Counter()
+            while len(_HEDGES) > _MAX_TRACKED:
+                _HEDGES.popitem(last=False)
+        else:
+            _HEDGES.move_to_end(inv)
+        if spent[group] >= limit:
+            return False, spent[group], limit
+        spent[group] += 1
+        return True, spent[group], limit
+    except Exception:  # noqa: BLE001 — a cap must never cost the call: fail open
+        return True, 0, limit
+
+
+def _log_capped(
+    agent: str, after_ms: int, take: tuple[bool, int, int], caller: _Caller | None
+) -> None:
+    """The one line of a hedge the cap withheld (module docstring)."""
+    _, used, limit = take
+    # `round=synthesis` for the executor's answer round, as on the fired line
+    # (module docstring), before `inv=`: with the deadlines equal, `after_ms=`
+    # alone would not tell a withheld answer-round hedge from a tool round's.
+    answer_round = " round=synthesis" if caller is not None and caller.synthesis else ""
+    logger.info(
+        "hedge_capped: agent=%s after_ms=%d used=%d limit=%d" + answer_round + " inv=%s tenant=%s",
+        agent,
+        after_ms,
+        used,
+        limit,
+        caller.invocation_id if caller else "-",
+        caller.tenant if caller else "-",
+    )
 
 
 # ── Request adaptation ────────────────────────────────────────────────────────

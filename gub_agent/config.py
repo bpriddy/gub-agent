@@ -217,6 +217,80 @@ FORMATTER_HEDGE_AFTER_MS: int = int(os.environ.get("FORMATTER_HEDGE_AFTER_MS", "
 #: this one; a test pins the two together.
 FORMATTER_AGENT_NAME = "formatter"
 
+# ── A stalled critic call is sent twice ──────────────────────────────────────
+# The executor and formatter hedges above, for the critic (models.py, "The
+# critic hedge"). Its streamed first token stalls the same way, and a pass
+# waits for the verdict. Measured on 33 instrumented tenant turns over 7 days
+# (a $0 log analysis): first-token p50 5.0 s, 35 of 49 calls answer within
+# 9.6 s and 12 took more than 15 s (the other 2 fall in between), each of those
+# 12 with TTFT about equal to its duration and at most 297 thought tokens, so
+# the wait is not thinking. 15000 fires on those 12 alone.
+#
+# The price, only on the calls it fires on: the critic's prompt sent once more,
+# ~$0.045 at the median and ~$0.13 at most — about $0.59 per 100 turns. One
+# invocation fires at most ONE critic hedge (models.py, "The hedge cap").
+#
+# 0 is the code default and the ROLLBACK, as for the other hedges. Read at
+# import: a redeploy either way. Stated in both deploy env files.
+CRITIC_HEDGE_AFTER_MS: int = int(os.environ.get("CRITIC_HEDGE_AFTER_MS", "0"))
+
+#: The critic's agent name (agents/critic.py), the key its hedge deadline and
+#: its hedge budget are looked up by. Restated here because that module imports
+#: this one; a test pins the two together.
+CRITIC_AGENT_NAME = "critic"
+
+# ── The executor's answer round is hedged on a later deadline ────────────────
+# The executor hedge above counts from the request's start to its first chunk.
+# For a round that calls tools that is a fair clock: it thinks 0.2-0.5k tokens
+# first and the chunk takes seconds. The round past the ReAct budget
+# (agents/round_limiter.py), the one that writes the answer, is not like that:
+# its first chunk comes after ALL of its thinking, 0.7-4.3k thought tokens
+# (median 2.1k, 6.5k seen), so a healthy call can wait well past 20 s. In a
+# local run (2026-10-16) two hedges fired at 20 s on such rounds and both lost:
+# their first requests answered at 26.5 s and 28.9 s, with thinking of 4.3k and
+# 6.5k tokens and no stall. Each lost hedge is a second prompt's input
+# (~$0.03-0.10) and one of the invocation's two executor-or-formatter hedges
+# (models.py, "The hedge cap"), which a formatter stall then finds spent.
+#
+# This is the deadline, in milliseconds, of THAT round only (models.py, "The
+# answer round's deadline"); the tool rounds keep EXECUTOR_HEDGE_AFTER_MS.
+# 35000 is above both healthy calls seen and still fires on a stall of the 100 s
+# kind (an executor round waited 102.7 s on 2026-10-15).
+#
+# 0 is the code default and the ROLLBACK: the round takes the executor's
+# deadline like every other. An EXECUTOR_HEDGE_AFTER_MS of 0 turns every
+# executor hedge off, this one included. Read at import: a redeploy either way.
+# Stated in both deploy env files.
+EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS: int = int(
+    os.environ.get("EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS", "0")
+)
+
+# ── Thinking on the executor's answer round ──────────────────────────────────
+# The round past the ReAct budget (agents/round_limiter.py) writes the answer
+# from data already gathered, and it thinks longest of any executor round:
+# 0.7-4.3k thought tokens (median 2.1k, 6.5k seen) against 0.2-0.5k on a tool
+# round. Thinking is not streamed, so the first chunk waits for all of it: about
+# 2.5 s + 4.4 s per thousand thought tokens in a local run, most of that round's
+# 13 s median in production (16 of 29 passes reach it). LOW on that one round is
+# expected to take ~5 s off a turn that reaches it — arithmetic, not a
+# measurement — at the risk of a thinner answer.
+#
+# AUTO is the code default and the ROLLBACK: the round thinks as every other
+# executor round does (MEDIUM). LOW lowers that round only; nothing else takes
+# it, not the tool rounds and not the other agents. Anything but LOW reads as
+# AUTO, so a typo in an env file can neither stop the engine from starting nor
+# send a level the model may refuse (only levels verified on this model are
+# accepted). Read as a module attribute at call time; the sandbox override
+# `synthesis_round_thinking_level` wins over it per call. Stays AUTO in both
+# deploy env files until a paid replay of the round on both levels shows the
+# answer holds.
+SYNTHESIS_ROUND_THINKING_LEVELS = ("AUTO", "LOW")
+SYNTHESIS_ROUND_THINKING_LEVEL: str = (
+    "LOW"
+    if os.environ.get("SYNTHESIS_ROUND_THINKING_LEVEL", "AUTO").strip().upper() == "LOW"
+    else "AUTO"
+)
+
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
 # id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
@@ -333,6 +407,29 @@ CRITIC_SKIP_FINAL_PASS: bool = os.environ.get("CRITIC_SKIP_FINAL_PASS", "1").low
     "yes",
 )
 
+# A first pass that answered from memory is sent back without a formatter call
+# (agents/critic.py:from_memory_pass; the shortcut in agents/format_gate.py).
+# Such a pass made no tool call, so the evidence index is empty and the gate
+# could only abstain; the critic gate then re-queries on that abstain in code
+# (`CriticGate._abstain_verdict`). The formatter call that produces the abstain
+# takes 2-4.6 s on a healthy turn and 15-30 s when its first token stalls, and
+# the speculative critic started beside it is cancelled unread. With the switch
+# on, the gate writes the same abstain payload itself and no critic call is
+# started for the pass. The verdict, its reason and its feedback are today's.
+#
+# Two things differ. A from-memory pass whose formatter would have chosen
+# `clarify` over abstain is now re-queried as well. And the pass-1 payload
+# event, which a stream reader sees before the retry's answer replaces it, is
+# the gate's own generic abstain instead of the formatter's wording.
+#
+# 0 is the code default and the ROLLBACK: the formatter is called as before.
+# Read as a module attribute at call time. Stated in both deploy env files.
+REQUERY_SKIPS_FORMATTER: bool = os.environ.get("REQUERY_SKIPS_FORMATTER", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Stop a formatter attempt the answer contract has already rejected
 # (agents/format_gate.py, "Early abort"). The contract's field checks — filler,
 # word budgets, block shape — on the headline and the blocks are decidable the
@@ -387,6 +484,29 @@ EVIDENCE_ROWS_EVENT: bool = os.environ.get("EVIDENCE_ROWS_EVENT", "0").lower() i
     "yes",
 )
 
+# Reader text carries no record ids and no raw ISO timestamps (latency-05 W1-5).
+# An account overview came back as "The account (id: <uuid>) was created on
+# 2026-06-04T18:33:52.846Z ..." because the fast path's draft copies every
+# scalar field of the response, the id and the timestamps included, and the
+# formatter wrote what it was given. On: the draft leaves out the record-id
+# fields (they stay in the evidence rows and `facts`, which is where a machine
+# reads them), and every payload the format gate emits has the record ids and
+# ISO timestamps rewritten out of its reader-visible fields (headline, text
+# blocks, bullets, table cells) by `agents/answers.py:scrub_for_emit` — a UUID
+# out, an ISO timestamp as "Jun 4, 2026"; `facts`, `citations`, source ids and
+# `[n]` / `[evidence id]` markers are never touched. 0 is the ROLLBACK:
+# today's draft and today's payloads, byte for byte. Read at import: a
+# redeploy either way.
+#
+# Watch `reader_text: scrubbed ids=… dates=… inv=… tenant=…`, logged only when
+# a scrub changed something (from answers.py, so `textPayload:"format_gate"`
+# does not see it).
+READER_TEXT_SCRUB: bool = os.environ.get("READER_TEXT_SCRUB", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 CLAUDE_VERTEX_LOCATION: str = os.environ.get("CLAUDE_VERTEX_LOCATION", "global")
 
 
@@ -421,8 +541,8 @@ def build_model() -> BaseLlm:
     The router hedge (ROUTER_HEDGE_AFTER_MS) sits above this, not inside it:
     one second send per router call at most, never one per attempt, never
     while the first send is retrying, and each send counts its own retries.
-    The executor and formatter hedges (EXECUTOR_/FORMATTER_HEDGE_AFTER_MS)
-    work the same way, on their own deadlines.
+    The executor, formatter and critic hedges (EXECUTOR_/FORMATTER_/
+    CRITIC_HEDGE_AFTER_MS) work the same way, on their own deadlines.
     """
     from .models import VendorRouter  # noqa: PLC0415 — models.py imports config
 
@@ -446,7 +566,9 @@ def build_model() -> BaseLlm:
             for name, after_ms in (
                 (AGENT_NAME, EXECUTOR_HEDGE_AFTER_MS),
                 (FORMATTER_AGENT_NAME, FORMATTER_HEDGE_AFTER_MS),
+                (CRITIC_AGENT_NAME, CRITIC_HEDGE_AFTER_MS),
             )
             if after_ms > 0
         },
+        synthesis_hedge_after_ms=EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS,
     )

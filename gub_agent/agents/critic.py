@@ -60,7 +60,7 @@ from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 
 from .. import config
-from ..config import AGENT_NAME, build_model, build_thinking_planner
+from ..config import AGENT_NAME, CRITIC_AGENT_NAME, build_model, build_thinking_planner
 from ..instruction_utils import current_date_note
 from ..models import bind_model_call
 from ..prompts import CRITIC_INSTRUCTION
@@ -280,6 +280,67 @@ def _pass_reason_before_format(ctx: InvocationContext) -> str | None:
     return None
 
 
+def _sent_back_this_turn(ctx: InvocationContext, critic_name: str = CRITIC_AGENT_NAME) -> bool:
+    """This turn's executor already had its from-memory retry: a verdict
+    authored `critic_name` with `sufficient: false` is in this invocation's
+    events (the critic LLM's own, or the gate's re-query, which is authored as
+    the critic)."""
+    for event in ctx.session.events:
+        if event.invocation_id != ctx.invocation_id or event.author != critic_name:
+            continue
+        delta = event.actions.state_delta if event.actions else None
+        verdict = (delta or {}).get("critic_verdict")
+        if isinstance(verdict, dict) and verdict.get("sufficient") is False:
+            return True
+    return False
+
+
+def from_memory_pass(ctx: InvocationContext) -> bool:
+    """This pass is a first pass that answered from memory, so its verdict is
+    the code re-query and neither the formatter nor the critic LLM can change
+    it (REQUERY_SKIPS_FORMATTER).
+
+    Every term is a fact about the session's events from before the format
+    gate and the speculative critic fork, so both branches of the parallel
+    wiring compute the same answer, and the flag is the only thing read from
+    outside it:
+
+    - the executor made no tool call this turn, so the evidence index is empty
+      and the gate could only abstain (a pass whose executor called a tool is
+      never eligible, whatever its index holds);
+    - no re-query was sent yet this turn, so this is the first pass: a second
+      pass without a tool call still goes through the formatter, as today;
+    - the executor wrote text — the gate emits nothing for an empty draft, and
+      the critic then judges the pass as it always did;
+    - no deterministic pass applies (sandbox critic off, the bare
+      NO_COMPANY_RECORDS marker), which keep their own verdict.
+
+    The fast path is not decided here: its draft lives in the gate's store, not
+    in the session, and the gate checks it itself (`FormatGate`). A caller that
+    acts on this answer without that check — the speculative critic — can only
+    be wrong in the safe direction: the critic was skipped and the gate still
+    answered, so the resolver finds nothing held and runs the critic serially.
+    """
+    return bool(
+        config.REQUERY_SKIPS_FORMATTER
+        and not _executor_made_tool_call(ctx)
+        and not _sent_back_this_turn(ctx)
+        and _last_executor_text(ctx).strip()
+        and _pass_reason_before_format(ctx) is None
+    )
+
+
+def log_requery_shortcut(ctx: InvocationContext) -> None:
+    """One line per from-memory pass the format gate abstained for without a
+    formatter call. Logged from here, not from the gate: rate queries match
+    `textPayload:"format_gate"`, and this is not a gate rejection."""
+    logger.info(
+        "critic_requery: shortcut reason=no_tool_call pass=1 inv=%s tenant=%s",
+        ctx.invocation_id,
+        label_of(ctx),
+    )
+
+
 def _passes_judged(ctx: InvocationContext) -> int:
     """How many of this turn's passes already carry a verdict.
 
@@ -477,15 +538,7 @@ class CriticGate(BaseAgent):
 
     def _already_sent_back(self, ctx: InvocationContext) -> bool:
         """This turn's executor already had its from-memory retry."""
-        critic = self._critic_name()
-        for event in ctx.session.events:
-            if event.invocation_id != ctx.invocation_id or event.author != critic:
-                continue
-            delta = event.actions.state_delta if event.actions else None
-            verdict = (delta or {}).get("critic_verdict")
-            if isinstance(verdict, dict) and verdict.get("sufficient") is False:
-                return True
-        return False
+        return _sent_back_this_turn(ctx, self._critic_name())
 
     def _abstain_verdict(self, ctx: InvocationContext, payload: object) -> Event | None:
         """The verdict an abstain payload settles in code, or None when the
@@ -729,7 +782,16 @@ class SpeculativeCritic(BaseAgent):
         ctx: InvocationContext,
     ) -> AsyncGenerator[Event, None]:
         _SPECULATIONS.pop(ctx.invocation_id, None)  # never an earlier pass's
-        if _pass_reason_before_format(ctx) is not None or _is_final_pass(self, ctx):
+        # A from-memory first pass is no exception to "known before the fork":
+        # the gate abstains for it without waiting on a formatter, so it can end
+        # and settle the pass before this task is even registered in `_RUNNING`,
+        # and the join would then wait out a whole critic call whose verdict the
+        # resolver discards (`from_memory_pass`).
+        if (
+            _pass_reason_before_format(ctx) is not None
+            or from_memory_pass(ctx)
+            or _is_final_pass(self, ctx)
+        ):
             return
         run = _Speculation(authors=self.payload_authors, started=time.monotonic())
         run.task = asyncio.create_task(

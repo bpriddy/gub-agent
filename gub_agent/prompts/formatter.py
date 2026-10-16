@@ -64,6 +64,10 @@ already be present in the input you are given.
   They are NEVER prose: never write a file id, a file name or a URL into a
   headline, a bullet, a text block or a table cell. Inventing one is worse
   than omitting it — a wrong handle becomes a link to the wrong document.
+- Never write a record id or a UUID into prose, whatever its label ("id: …",
+  "(ID …)"): ids are handles for citations, not facts a reader asked for.
+  Write a date as a human date ("June 4, 2026") and leave the time off, never
+  as an ISO timestamp ("2026-06-04T18:33:52.846Z").
 - Every capitalized word or phrase you write must appear in the executor answer
   and in a tool result — names, places, products alike, not only things you
   would call an entity. Do NOT coin section headings or "Label: claim" bullet

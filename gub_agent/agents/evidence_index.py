@@ -83,6 +83,8 @@ from collections.abc import Callable
 from typing import Any
 
 from ..schemas.answer import AnswerPayload, BulletBlock, TableBlock, TextBlock, count_words
+from ..tenant import label_of
+from .context_pruning import _without_plumbing
 
 logger = logging.getLogger(__name__)
 
@@ -502,12 +504,40 @@ def answer_draft(invocation_id: str) -> str:
     return _DRAFT.get(invocation_id, "")
 
 
+def log_tool_payload(invocation_id: str, tenant: str, tool_name: str, tool_response: Any) -> None:
+    """One line per tool response: how many characters it is as JSON (`chars`)
+    and how many remain once the plumbing keys the executor never sees are
+    dropped (`seen_chars`, the same `_without_plumbing` the prompt masking
+    applies). Data for deciding whether current-turn payloads are worth
+    trimming. Pure telemetry: it never raises and never touches the response.
+
+    Logged from THIS module: an engine line carries its file name, and
+    `textPayload:"format_gate"` is how the gate's drop and repair rates are
+    read."""
+    try:
+        chars = len(json.dumps(tool_response, ensure_ascii=False, default=str))
+        seen_chars = len(
+            json.dumps(_without_plumbing(tool_response), ensure_ascii=False, default=str)
+        )
+        logger.info(
+            "tool_payload: tool=%s chars=%d seen_chars=%d inv=%s tenant=%s",
+            tool_name,
+            chars,
+            seen_chars,
+            invocation_id,
+            tenant,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never cost the tool call (an odd __str__ too)
+        return
+
+
 def record_evidence(tool: Any, args: dict, tool_context: Any, tool_response: Any) -> None:
     """ADK after_tool_callback on the executor: index this result's rows and
     record it in the grounding store. Returns None so the tool response passes
     through unmodified."""
     invocation_id = getattr(tool_context, "invocation_id", "") or "?"
     tool_name = getattr(tool, "name", None) or str(tool)
+    log_tool_payload(invocation_id, label_of(tool_context), tool_name, tool_response)
     if isinstance(tool_response, (list, tuple)):
         # A bare array (`find`'s hits): the index does not read one, but it is a
         # tool result the executor wrote from, so the grounding store takes it

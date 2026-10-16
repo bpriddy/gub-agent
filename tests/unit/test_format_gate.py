@@ -14,6 +14,7 @@ import asyncio
 import gc
 import json
 import logging
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -37,6 +38,7 @@ from gub_agent.agents.evidence_index import (
     formatter_brief,
     record_evidence,
     reset_evidence_index,
+    set_answer_draft,
 )
 from gub_agent.agents.format_gate import (
     MAX_FORMAT_ATTEMPTS,
@@ -55,6 +57,15 @@ from gub_agent.schemas import AnswerPayload
 from gub_agent.schemas.answer import HEADLINE_MAX_WORDS, count_words
 
 INV = "inv-1"
+
+
+@pytest.fixture(autouse=True)
+def _formatter_always_runs(monkeypatch):
+    """This file describes the gate with the from-memory shortcut OFF, the code
+    default. The deployed value is 1: the tests of the shortcut below set it
+    themselves, and a shell that sources the deploy env must not turn the others
+    red."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", False, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -1257,3 +1268,219 @@ def test_early_abort_a_scan_that_trips_gives_up_instead_of_raising():
     assert scan.feed('{"kind":' + deep + ',"headline":"h","blocks":[]}') is None
     assert scan.done
     assert scan.feed(',"citations":[]}') is None
+
+
+# ── REQUERY_SKIPS_FORMATTER: a from-memory first pass abstains in code ────────
+#
+# A pass whose executor made no tool call has an empty evidence index, so the
+# formatter could only abstain, and the critic gate then sends the executor
+# back for one re-query on that abstain. With the switch on the gate writes the
+# abstain itself. The cases below are every way the pass can fail to be that
+# pass; each must still reach the formatter.
+
+MEMORY_TEXT = "Here is what's new: three hires and a refreshed Q3 plan."
+SHORTCUT_LINE = re.compile(
+    r"^critic_requery: shortcut reason=no_tool_call pass=1 inv=(\S+) tenant=(\S+)$"
+)
+
+
+def _tool_call_event(invocation_id: str) -> Event:
+    return Event(
+        invocation_id=invocation_id,
+        author=AGENT_NAME,
+        content=genai_types.Content(
+            role="model",
+            parts=[
+                genai_types.Part(function_call=genai_types.FunctionCall(name="org_query", args={}))
+            ],
+        ),
+    )
+
+
+def _sent_back_event(invocation_id: str) -> Event:
+    verdict = {
+        "info_sufficient": False,
+        "answer_satisfies": False,
+        "sufficient": False,
+        "reason": "Deterministic: from memory",
+        "feedback": "query GUB",
+    }
+    return Event(
+        invocation_id=invocation_id,
+        author="critic",
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part(text=json.dumps(verdict))]
+        ),
+        actions=EventActions(state_delta={"critic_verdict": verdict}),
+    )
+
+
+def _sandbox_critic_off() -> Event:
+    return Event(
+        invocation_id=INV,
+        author="user",
+        actions=EventActions(state_delta={"sandbox": {"critic_enabled": False}}),
+    )
+
+
+# What the gate's own abstain event carries (the NO_COMPANY_RECORDS marker's too).
+_ABSTAIN_DUMP = AnswerPayload(kind="abstain", headline="NO_COMPANY_RECORDS").model_dump(
+    exclude_none=True
+)
+
+# case -> (events appended to the session, flag, a fast-path draft, formatter runs expected)
+_MEMORY_CASES = {
+    "first pass from memory": ([], True, "", 0),
+    "an earlier turn's tool call is not this turn's": (
+        [_tool_call_event("inv-earlier")],
+        True,
+        "",
+        0,
+    ),
+    "an earlier turn's send-back is not this turn's": (
+        [_sent_back_event("inv-earlier")],
+        True,
+        "",
+        0,
+    ),
+    "second pass": ([_sent_back_event(INV)], True, "", 1),
+    "a tool call with an empty index": ([_tool_call_event(INV)], True, "", 1),
+    "a fast-path draft": ([], True, "the account is live (get_account:a1:status)", 1),
+    "the flag at 0": ([], False, "", 1),
+    "the sandbox critic off": ([_sandbox_critic_off()], True, "", 1),
+}
+
+
+@pytest.mark.parametrize("case", list(_MEMORY_CASES), ids=list(_MEMORY_CASES))
+async def test_only_a_from_memory_first_pass_skips_the_formatter(monkeypatch, case):
+    extra, flag, draft, expected_runs = _MEMORY_CASES[case]
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", flag)
+    monkeypatch.setattr(config, "SANDBOX_ENABLED", True)
+    reset_evidence_index(SimpleNamespace(invocation_id=INV))  # no evidence at all
+    if draft:
+        set_answer_draft(INV, draft)
+    formatter = _scripted([{"kind": "abstain", "headline": "NO_COMPANY_RECORDS"}])
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    ctx = await _gate_ctx(MEMORY_TEXT)
+    for event in extra:
+        await ctx.session_service.append_event(ctx.session, event)
+
+    try:
+        events = [e async for e in gate.run_async(ctx)]
+    finally:
+        reset_evidence_index(SimpleNamespace(invocation_id=INV))  # the draft too
+
+    assert len(formatter.runs) == expected_runs, case
+    # either way the pass ends with the abstain payload, from one event
+    # (the formatter's own, or the gate's) — the critic gate reads this
+    payloads = [e.actions.state_delta["answer_payload"] for e in events if e.actions.state_delta]
+    if expected_runs:  # the stand-in formatter's, as scripted
+        assert [p["kind"] for p in payloads] == ["abstain"]
+    else:  # the gate's own
+        assert payloads == [_ABSTAIN_DUMP]
+
+
+async def test_the_shortcut_abstain_is_the_gates_own_event_and_logs_two_lines(monkeypatch, caplog):
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    reset_evidence_index(SimpleNamespace(invocation_id=INV))
+    formatter = _scripted([_valid_dict()])
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    ctx = await _gate_ctx(MEMORY_TEXT)
+
+    with caplog.at_level(logging.INFO):
+        events = [e async for e in gate.run_async(ctx)]
+
+    assert formatter.runs == []  # the stub is never called
+    assert [e.author for e in events] == ["format_gate"]
+    abstain = events[0].actions.state_delta["answer_payload"]
+    assert abstain == _ABSTAIN_DUMP
+    assert json.loads(events[0].content.parts[0].text) == abstain
+
+    shortcut = [m for m in caplog.messages if m.startswith("critic_requery:")]
+    assert len(shortcut) == 1
+    match = SHORTCUT_LINE.match(shortcut[0])
+    assert match, shortcut[0]
+    assert match.groups() == (INV, "anomaly")
+    # not a gate line: rate queries match `textPayload:"format_gate"`
+    assert "format_gate" not in shortcut[0]
+    assert [r.name for r in caplog.records if r.getMessage() == shortcut[0]] == [
+        "gub_agent.agents.critic"
+    ]
+    # one `answer_shape` line, as the formatter's abstain would have left
+    shapes = [m for m in caplog.messages if m.startswith("answer_shape:")]
+    assert len(shapes) == 1
+    assert shapes[0].startswith("answer_shape: kind=abstain ")
+    assert f"exec_chars={len(MEMORY_TEXT)} " in shapes[0]
+    assert shapes[0].endswith(f"inv={INV} tenant=anomaly")
+
+
+async def test_evidence_rows_keep_the_formatter_even_without_a_tool_call_event(monkeypatch):
+    """The gate's own guard on top of the predicate: rows in the index mean
+    something was retrieved, whatever the session's events say."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    _seed_index()
+    formatter = _scripted([_valid_dict()])
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    ctx = await _gate_ctx("chevy is in good shape — the Q3 push is live.")  # no function_call event
+
+    events = [e async for e in gate.run_async(ctx)]
+
+    assert len(formatter.runs) == 1
+    assert [e.author for e in events] == ["formatter"]
+
+
+async def test_a_clarify_after_a_tool_call_with_nothing_indexed_passes_through(monkeypatch):
+    """The shortcut is for a pass that made no call. One that called a tool and
+    got nothing indexed is the formatter's to judge (abstain, clarify), with
+    the flag at its deployed value."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    reset_evidence_index(SimpleNamespace(invocation_id=INV))
+    clarify = {
+        "kind": "clarify",
+        "headline": "Which campaign do you mean?",
+        "candidates": [
+            {"name": "Holiday Event", "entity_type": "campaign"},
+            {"name": "Spring Push", "entity_type": "campaign"},
+        ],
+    }
+    formatter = _scripted([clarify])
+    gate = FormatGate(name="format_gate", sub_agents=[formatter])
+    ctx = await _gate_ctx("Two campaigns match; which one?")
+    await ctx.session_service.append_event(ctx.session, _tool_call_event(INV))
+
+    events = [e async for e in gate.run_async(ctx)]
+
+    assert len(formatter.runs) == 1
+    wire = [json.loads(e.content.parts[0].text) for e in events if e.content]
+    assert wire[-1]["kind"] == "clarify" and len(wire[-1]["candidates"]) == 2
+
+
+async def test_a_pass_whose_executor_wrote_nothing_is_not_a_from_memory_pass(monkeypatch):
+    """The gate emits nothing for an empty draft, so the speculative critic must
+    not be skipped for it: with no payload the resolver would find nothing
+    held and run the critic serially, after the join."""
+    from gub_agent.agents.critic import from_memory_pass
+
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    assert from_memory_pass(await _gate_ctx(MEMORY_TEXT)) is True
+    assert from_memory_pass(await _gate_ctx("")) is False  # an event with no text
+    assert from_memory_pass(await _gate_ctx("   \n")) is False
+    assert from_memory_pass(await _gate_ctx(None)) is False  # no executor event at all
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", False)
+    assert from_memory_pass(await _gate_ctx(MEMORY_TEXT)) is False  # the flag is the first term
+
+
+async def test_the_shortcuts_abstain_carries_the_gates_branch(monkeypatch):
+    """ADK hides a branch-stamped event from a sibling branch (the speculative
+    critic) and shows an unstamped one to every agent. The formatter's own
+    abstain carries the gate's branch, so the gate's must too."""
+    monkeypatch.setattr(config, "REQUERY_SKIPS_FORMATTER", True)
+    reset_evidence_index(SimpleNamespace(invocation_id=INV))
+    gate = FormatGate(name="format_gate", sub_agents=[_scripted([_valid_dict()])])
+    ctx = await _gate_ctx(MEMORY_TEXT)
+    ctx = ctx.model_copy(update={"branch": "format_and_critic.format_gate"})
+
+    events = [e async for e in gate.run_async(ctx)]
+
+    assert [e.author for e in events] == ["format_gate"]
+    assert events[0].branch == "format_and_critic.format_gate"
