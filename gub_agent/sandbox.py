@@ -78,6 +78,8 @@ MAX_PROMPT_BYTES = 64 * 1024
 
 Role = Literal["executor", "critic", "formatter", "router"]
 ThinkingLevel = Literal["MINIMAL", "LOW", "MEDIUM", "HIGH", "DYNAMIC", "OFF"]
+# What the executor's answer round thinks at (config.SYNTHESIS_ROUND_THINKING_LEVEL).
+SynthesisRoundThinkingLevel = Literal["AUTO", "LOW"]
 
 # Like DYNAMIC, not a genai thinking_level: thinking_budget=0, thinking switched
 # off. A level in this vocabulary so the provenance can name what the router and
@@ -121,6 +123,10 @@ class SandboxOverrides(BaseModel):
     formatter_thinking_level: ThinkingLevel | None = None
     router_thinking_level: ThinkingLevel | None = None
     temperature: float | None = None
+    # None follows config.SYNTHESIS_ROUND_THINKING_LEVEL; an explicit value wins
+    # over the env flag (`AUTO` too), even one equal to the env value, and so is
+    # reported as overridden (agents/round_limiter.py:synthesis_round_thinking).
+    synthesis_round_thinking_level: SynthesisRoundThinkingLevel | None = None
     critic_enabled: bool = True
     label: str | None = None
 
@@ -221,6 +227,12 @@ def _validate(overrides: SandboxOverrides) -> None:
         # caller before any retrieval has even happened.
         if router_level != "DYNAMIC":
             offending.append(f"router_thinking_level={router_level}")
+        # The answer round's level is a named one too, but only when asked for:
+        # AUTO (and None) send nothing of their own.
+        if overrides.synthesis_round_thinking_level not in (None, "AUTO"):
+            offending.append(
+                f"synthesis_round_thinking_level={overrides.synthesis_round_thinking_level}"
+            )
         if offending:
             why = (
                 "(Claude thinks adaptively; Anthropic has no named levels)"
@@ -233,8 +245,8 @@ def _validate(overrides: SandboxOverrides) -> None:
                 "to this run. Set thinking_level, formatter_thinking_level, "
                 "router_thinking_level (and "
                 "critic_thinking_level, unless critic_enabled is false) to DYNAMIC for this "
-                "model — or add the model to SANDBOX_THINKING_LEVEL_MODELS if it does accept "
-                "named levels."
+                "model, and synthesis_round_thinking_level to AUTO or leave it out — or add "
+                "the model to SANDBOX_THINKING_LEVEL_MODELS if it does accept named levels."
             )
     if overrides.temperature is not None and not 0.0 <= overrides.temperature <= 2.0:
         raise ValueError(
@@ -419,6 +431,27 @@ def sandbox_before_model(callback_context: Any, llm_request: Any, *, role: Role)
     return None
 
 
+def takes_named_thinking_level(model: str | None) -> bool:
+    """Whether a request for `model` may carry a named thinking level: the model
+    is in SANDBOX_THINKING_LEVEL_MODELS (None is the deployed default) and is not
+    a Claude id, whatever that list says — Anthropic has no named levels. ONE
+    rule for the answer round's switch, which leaves a model that fails it alone
+    (a named level is a 400 there), and for the provenance that reports it."""
+    model = model or config.GEMINI_MODEL
+    return model in config.SANDBOX_THINKING_LEVEL_MODELS and not model.startswith("claude-")
+
+
+def effective_synthesis_round_thinking_level(overrides: SandboxOverrides) -> str:
+    """The answer round's level these overrides resolve to: the explicit value
+    when the run gave one, else the env flag — and AUTO, whatever either says,
+    when the run's model takes no named level, because the round is not lowered
+    there (agents/round_limiter.py:synthesis_round_thinking). It is the switch's
+    value for the run, not proof that it fired: a request already at LOW or
+    below is left alone too, and its own level is reported beside this one."""
+    level = overrides.synthesis_round_thinking_level or config.SYNTHESIS_ROUND_THINKING_LEVEL
+    return level if takes_named_thinking_level(overrides.model) else "AUTO"
+
+
 def resolved_config(overrides: SandboxOverrides) -> dict[str, Any]:
     """Flat, JSON-safe provenance for one run: what actually ran, not what was
     asked for. Flat on purpose — the batch runner (04/#33) writes one row per
@@ -448,6 +481,7 @@ def resolved_config(overrides: SandboxOverrides) -> dict[str, Any]:
         "formatter_thinking_level": overrides.formatter_thinking_level or FORMATTER_THINKING_LEVEL,
         "router_thinking_level": overrides.router_thinking_level or ROUTER_THINKING_LEVEL,
         "critic_enabled": overrides.critic_enabled,
+        "synthesis_round_thinking_level": effective_synthesis_round_thinking_level(overrides),
         "executor_prompt_source": executor_source,
         "executor_prompt_sha256": _sha(executor_text),
         "critic_prompt_source": critic_source,

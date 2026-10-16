@@ -265,6 +265,32 @@ EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS: int = int(
     os.environ.get("EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS", "0")
 )
 
+# ── Thinking on the executor's answer round ──────────────────────────────────
+# The round past the ReAct budget (agents/round_limiter.py) writes the answer
+# from data already gathered, and it thinks longest of any executor round:
+# 0.7-4.3k thought tokens (median 2.1k, 6.5k seen) against 0.2-0.5k on a tool
+# round. Thinking is not streamed, so the first chunk waits for all of it: about
+# 2.5 s + 4.4 s per thousand thought tokens in a local run, most of that round's
+# 13 s median in production (16 of 29 passes reach it). LOW on that one round is
+# expected to take ~5 s off a turn that reaches it — arithmetic, not a
+# measurement — at the risk of a thinner answer.
+#
+# AUTO is the code default and the ROLLBACK: the round thinks as every other
+# executor round does (MEDIUM). LOW lowers that round only; nothing else takes
+# it, not the tool rounds and not the other agents. Anything but LOW reads as
+# AUTO, so a typo in an env file can neither stop the engine from starting nor
+# send a level the model may refuse (only levels verified on this model are
+# accepted). Read as a module attribute at call time; the sandbox override
+# `synthesis_round_thinking_level` wins over it per call. Stays AUTO in both
+# deploy env files until a paid replay of the round on both levels shows the
+# answer holds.
+SYNTHESIS_ROUND_THINKING_LEVELS = ("AUTO", "LOW")
+SYNTHESIS_ROUND_THINKING_LEVEL: str = (
+    "LOW"
+    if os.environ.get("SYNTHESIS_ROUND_THINKING_LEVEL", "AUTO").strip().upper() == "LOW"
+    else "AUTO"
+)
+
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
 # id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
