@@ -146,6 +146,28 @@ one spare.
   the `_MAX_TRACKED` newest invocations (an evicted invocation starts again with
   a full budget) and any failure inside the budget code lets the hedge fire: a
   cap must never cost a call.
+
+The answer round's deadline (EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS). The executor's
+round past the ReAct budget (round_limiter.py) is the one that writes the
+answer, and its first chunk arrives after ALL of its thinking: in a local run two
+rounds of 4.3k and 6.5k thought tokens answered at 26.5 s and 28.9 s with
+nothing wrong with the request. A hedge at the tool rounds' deadline fires on
+those and loses to its own first request, one prompt of input spent and one of
+the invocation's two executor-or-formatter hedges used up. So that round has a
+deadline of its own, `synthesis_hedge_after_ms`; the tool rounds keep
+`agent_hedge_after_ms`.
+
+- Only the executor has such a round. `round_limit` marks the call
+  (`mark_synthesis_round`) after `bind_model_call` named the caller, so the mark
+  lasts for that one model call: the next call binds a fresh, unmarked caller.
+- 0 (the default) means the round has no deadline of its own: every executor
+  round takes the executor's, as before. The executor's own deadline at 0 still
+  means no executor hedge at all, whatever this one says.
+- Added, for a marked call, to the line of a hedge that fired (`model_hedge:`)
+  and to the line of one the cap withheld (`hedge_capped:`), before `inv=`:
+  `round=synthesis`. On an executor line its absence means a tool round, so the
+  two are told apart by `textPayload:"round=synthesis"`; it is written whatever
+  this deadline is, so the baseline can be read from the same lines.
 """
 
 from __future__ import annotations
@@ -160,7 +182,7 @@ from collections import Counter, OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
@@ -213,6 +235,11 @@ class VendorRouter(BaseLlm):
     #: executor's, the formatter's and the critic's (EXECUTOR_/FORMATTER_/
     #: CRITIC_HEDGE_AFTER_MS).
     agent_hedge_after_ms: dict[str, int] = Field(default_factory=dict)
+    #: The executor's deadline for its round past the ReAct budget (module
+    #: docstring, "The answer round's deadline"); 0 = the executor's own, as for
+    #: every other round. config.build_model passes
+    #: EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS.
+    synthesis_hedge_after_ms: int = 0
 
     _claude: dict[str, BaseLlm] = PrivateAttr(default_factory=dict)
 
@@ -291,7 +318,13 @@ class VendorRouter(BaseLlm):
             return self.router_hedge_after_ms
         if not stream:
             return 0
-        return self.agent_hedge_after_ms.get(agent, 0)
+        after_ms = self.agent_hedge_after_ms.get(agent, 0)
+        if after_ms > 0 and self.synthesis_hedge_after_ms > 0 and agent == AGENT_NAME:
+            # The executor's answer round, marked by round_limit for this call.
+            caller = _CALLER.get()
+            if caller is not None and caller.agent == agent and caller.synthesis:
+                return self.synthesis_hedge_after_ms
+        return after_ms
 
     async def _generate(
         self, llm_request: LlmRequest, stream: bool
@@ -398,6 +431,9 @@ class _Caller:
     agent: str
     invocation_id: str
     tenant: str
+    #: The executor's round past the ReAct budget, the one that writes the
+    #: answer (`mark_synthesis_round`); False until round_limit says otherwise.
+    synthesis: bool = False
 
 
 # Set by `bind_model_call`, read by the call that follows it. A ContextVar and
@@ -425,6 +461,18 @@ def bind_model_call(callback_context: Any) -> None:
             tenant=label_of(callback_context),
         )
     )
+
+
+def mark_synthesis_round() -> None:
+    """Called by round_limit for the executor's round past the ReAct budget, after
+    `bind_model_call` bound the caller: the model call that follows is the answer
+    round (module docstring, "The answer round's deadline"). The caller is
+    replaced, never edited — it is frozen and a copy of it may sit in a call
+    already in flight — and the next `bind_model_call` replaces it again, so the
+    mark covers this one call. With no bound caller there is nothing to mark."""
+    caller = _CALLER.get()
+    if caller is not None:
+        _CALLER.set(replace(caller, synthesis=True))
 
 
 # genai retries 429/408/5xx inside the request (HttpRetryOptions, config.py)
@@ -727,9 +775,13 @@ def _log_hedge(agent: str, primary: _Leg, hedge: _Leg, winner: _Leg | None) -> N
             *where,
         )
     else:
+        # `round=synthesis` only for the executor's answer round (module
+        # docstring), before `inv=`, so `tenant=` stays last.
+        answer_round = " round=synthesis" if caller is not None and caller.synthesis else ""
         logger.info(
-            "model_hedge: agent=%s fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s "
-            "inv=%s tenant=%s",
+            "model_hedge: agent=%s fired=1 winner=%s primary_ttft_ms=%s hedge_ttft_ms=%s"
+            + answer_round
+            + " inv=%s tenant=%s",
             agent,
             *where,
         )
@@ -783,8 +835,12 @@ def _log_capped(
 ) -> None:
     """The one line of a hedge the cap withheld (module docstring)."""
     _, used, limit = take
+    # `round=synthesis` for the executor's answer round, as on the fired line
+    # (module docstring), before `inv=`: with the deadlines equal, `after_ms=`
+    # alone would not tell a withheld answer-round hedge from a tool round's.
+    answer_round = " round=synthesis" if caller is not None and caller.synthesis else ""
     logger.info(
-        "hedge_capped: agent=%s after_ms=%d used=%d limit=%d inv=%s tenant=%s",
+        "hedge_capped: agent=%s after_ms=%d used=%d limit=%d" + answer_round + " inv=%s tenant=%s",
         agent,
         after_ms,
         used,

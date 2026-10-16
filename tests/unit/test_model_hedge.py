@@ -87,8 +87,14 @@ CAPPED_LINE = re.compile(
 
 
 def _vendor(
-    *scripts, agent_ms: dict[str, int] | None = None, router_ms: int = 0
+    *scripts,
+    agent_ms: dict[str, int] | None = None,
+    router_ms: int = 0,
+    synthesis_ms: int | None = None,
 ) -> tuple[VendorRouter, _Stub]:
+    """`synthesis_ms` is the executor's answer-round deadline. Left out (None) it
+    is not passed at all; and only a router that has the field is handed it, so
+    a test built on this helper reaches its assertion on an older router too."""
     stub = _Stub(
         model=GEMINI_MODEL,
         scripts=[list(s) for s in scripts],
@@ -99,11 +105,17 @@ def _vendor(
         cancelled=[],
         closed=[],
     )
+    extra = (
+        {"synthesis_hedge_after_ms": synthesis_ms}
+        if synthesis_ms is not None and "synthesis_hedge_after_ms" in VendorRouter.model_fields
+        else {}
+    )
     router = VendorRouter(
         model=GEMINI_MODEL,
         gemini=stub,  # type: ignore[arg-type]
         router_hedge_after_ms=router_ms,
         agent_hedge_after_ms=agent_ms or {},
+        **extra,
     )
     return router, stub
 
@@ -735,6 +747,7 @@ def test_the_flags_reach_the_deployed_models(executor, formatter, critic, expect
         "FORMATTER_HEDGE_AFTER_MS",
         "CRITIC_HEDGE_AFTER_MS",
         "ROUTER_HEDGE_AFTER_MS",
+        "EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS",
         "AGENT_NAME",
     )
     env = {k: v for k, v in os.environ.items() if k not in names}
@@ -771,7 +784,13 @@ def _stated(name: str, key: str) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    "key", ["EXECUTOR_HEDGE_AFTER_MS", "FORMATTER_HEDGE_AFTER_MS", "CRITIC_HEDGE_AFTER_MS"]
+    "key",
+    [
+        "EXECUTOR_HEDGE_AFTER_MS",
+        "FORMATTER_HEDGE_AFTER_MS",
+        "CRITIC_HEDGE_AFTER_MS",
+        "EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS",
+    ],
 )
 def test_both_deploy_env_files_state_the_flag_with_one_value(key):
     """Stated, not defaulted — the rollback is a line already in front of the

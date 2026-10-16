@@ -239,6 +239,32 @@ CRITIC_HEDGE_AFTER_MS: int = int(os.environ.get("CRITIC_HEDGE_AFTER_MS", "0"))
 #: this one; a test pins the two together.
 CRITIC_AGENT_NAME = "critic"
 
+# ── The executor's answer round is hedged on a later deadline ────────────────
+# The executor hedge above counts from the request's start to its first chunk.
+# For a round that calls tools that is a fair clock: it thinks 0.2-0.5k tokens
+# first and the chunk takes seconds. The round past the ReAct budget
+# (agents/round_limiter.py), the one that writes the answer, is not like that:
+# its first chunk comes after ALL of its thinking, 0.7-4.3k thought tokens
+# (median 2.1k, 6.5k seen), so a healthy call can wait well past 20 s. In a
+# local run (2026-10-16) two hedges fired at 20 s on such rounds and both lost:
+# their first requests answered at 26.5 s and 28.9 s, with thinking of 4.3k and
+# 6.5k tokens and no stall. Each lost hedge is a second prompt's input
+# (~$0.03-0.10) and one of the invocation's two executor-or-formatter hedges
+# (models.py, "The hedge cap"), which a formatter stall then finds spent.
+#
+# This is the deadline, in milliseconds, of THAT round only (models.py, "The
+# answer round's deadline"); the tool rounds keep EXECUTOR_HEDGE_AFTER_MS.
+# 35000 is above both healthy calls seen and still fires on a stall of the 100 s
+# kind (an executor round waited 102.7 s on 2026-10-15).
+#
+# 0 is the code default and the ROLLBACK: the round takes the executor's
+# deadline like every other. An EXECUTOR_HEDGE_AFTER_MS of 0 turns every
+# executor hedge off, this one included. Read at import: a redeploy either way.
+# Stated in both deploy env files.
+EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS: int = int(
+    os.environ.get("EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS", "0")
+)
+
 
 # Where Anthropic models are served for a sandbox run that selects a `claude-*`
 # id (gub_agent/models.py). Claude on Vertex serves from the global endpoint;
@@ -518,4 +544,5 @@ def build_model() -> BaseLlm:
             )
             if after_ms > 0
         },
+        synthesis_hedge_after_ms=EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS,
     )

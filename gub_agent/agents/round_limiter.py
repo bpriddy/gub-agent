@@ -18,6 +18,12 @@ before_agent_callback, so each LoopAgent retry iteration (the critic asked the
 executor to try again) starts with a fresh MAX_ROUNDS budget. Without the reset,
 a retry would inherit the first pass's count — often already at the cap — and
 open with tools already stripped, unable to make the call the critic requested.
+
+The round past the budget is the one that writes the answer, and its first
+chunk comes after ALL of its thinking (0.7-4.3k thought tokens, against
+0.2-0.5k on a tool round): `round_limit` marks that model call
+(`models.mark_synthesis_round`), so the executor's hedge can wait longer for it
+than for a tool round (config.EXECUTOR_SYNTHESIS_HEDGE_AFTER_MS).
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from typing import Any
 
 from google.genai import types as genai_types
 
+from ..models import mark_synthesis_round
 from ..tenant import label_of
 
 logger = logging.getLogger(__name__)
@@ -92,6 +99,8 @@ def round_limit(callback_context: Any, llm_request: Any) -> None:
             ],
         )
     ]
+    # This model call is the answer round: the hedge may wait longer for it.
+    mark_synthesis_round()
     logger.warning(
         "round_limit: HIT (round %d, inv=%s) — tools removed tenant=%s",
         rnd,
