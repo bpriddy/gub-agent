@@ -182,6 +182,45 @@ async def _exchange_google_token(google_access_token: str) -> str:
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 
+# ── App scope (UBScope, gub #119) ─────────────────────────────────────────────
+#
+# A tenant bot declares which records its surface covers and puts that in
+# session state as `app_scope`: a STRING, the bot's serialized JSON. This
+# module forwards that string as the `X-App-Scope` request header and does
+# nothing else with it. Never parsed, rebuilt, re-serialised or defaulted here —
+# the backend owns interpretation, and a re-serialisation would change key
+# order or escapes and make the agent's idea of the scope drift from the bot's.
+#
+# Read-only by structure: no tool takes a scope parameter, nothing in this
+# package writes `app_scope`, and `_exchange_google_token` (the broker
+# exchange, not a records read) never carries the header.
+
+APP_SCOPE_STATE_KEY = "app_scope"
+APP_SCOPE_HEADER = "X-App-Scope"
+
+
+def _state_of_tool_context(tool_context: Any | None) -> Any:
+    return getattr(tool_context, "state", None)
+
+
+def _scope_headers(state: Any) -> dict[str, str]:
+    """`{"X-App-Scope": <state value>}`, or `{}` when the state carries none.
+
+    The value goes out exactly as stored. A non-string value is not forwarded:
+    it cannot be sent byte for byte, and guessing a serialisation is the one
+    thing this function must never do.
+    """
+    if state is None:
+        return {}
+    try:
+        raw = state.get(APP_SCOPE_STATE_KEY)
+    except AttributeError:
+        return {}
+    if isinstance(raw, str):
+        return {APP_SCOPE_HEADER: raw}
+    return {}
+
+
 # ── Account scope (tenant-10) ─────────────────────────────────────────────────
 #
 # A tenant bot's GUB session is scoped to one account's records. When the
@@ -259,6 +298,7 @@ async def gub_get(
     Non-None query params are forwarded as URL query parameters.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
+    scope_headers = _scope_headers(_state_of_tool_context(tool_context))
     jwt = await _resolve_gub_jwt(tool_context)
     clean_params = {k: v for k, v in params.items() if v is not None}
 
@@ -266,7 +306,7 @@ async def gub_get(
     try:
         resp = await client.get(
             f"{GUB_BASE_URL}{path}",
-            headers={"Authorization": f"Bearer {jwt}"},
+            headers={"Authorization": f"Bearer {jwt}", **scope_headers},
             params=clean_params,
         )
         resp.raise_for_status()
@@ -292,13 +332,14 @@ async def gub_post(
     Make an authenticated POST request to the GUB backend.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
+    scope_headers = _scope_headers(_state_of_tool_context(tool_context))
     jwt = await _resolve_gub_jwt(tool_context)
 
     client = _get_client()
     try:
         resp = await client.post(
             f"{GUB_BASE_URL}{path}",
-            headers={"Authorization": f"Bearer {jwt}"},
+            headers={"Authorization": f"Bearer {jwt}", **scope_headers},
             json=body,
         )
         resp.raise_for_status()

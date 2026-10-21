@@ -25,12 +25,17 @@ and this module does two things with it, both cheap and both per-call:
    account this surface is branded for, and tells the model what to say when a
    tool result reports that records were withheld.
 
-   This block is NOT the boundary. Since tenant-10 the real one is enforced in
-   the backend — an account scope on the trusted-app registration, carried as a
-   token claim and intersected into every account / campaign / piece / idea
-   read — and it applies to admins too. The block stays because it is still the
-   honest description of the surface, and because a filtered read has to be
-   described rather than reported as an absence.
+   This block is NOT the boundary. Since UBScope (gub #119) the scope is a
+   presentation guardrail owned by the app: the bot declares it per tenant
+   (`{"account": [{"id", "name"}, ...]}`, a name beside every id) and puts it in
+   session state as `app_scope`, a STRING, every turn. The agent forwards it
+   untouched as the `X-App-Scope` header on every GUB call (`tools/_client.py`)
+   and the backend interprets it and narrows each read; it is intersected with
+   the user's grants and never widens them. The agent only READS it, here, for
+   the labels: the persona names the accounts the surface covers from the
+   scope's own names instead of from the tenant slug. The block stays because
+   it is still the honest description of the surface, and because a filtered
+   read has to be described rather than reported as an absence.
 
    The 📊 half is scoped; the ✉️ Workspace half is NOT, and cannot be with the
    machinery that exists: the connector data stores publish no schema, and a
@@ -51,6 +56,7 @@ Invariants, both pinned by tests:
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from typing import Any
@@ -58,6 +64,14 @@ from typing import Any
 from google.adk.agents.readonly_context import ReadonlyContext
 
 STATE_KEY = "tenant"
+
+#: Session-state key holding the app scope: the bot's serialized JSON, as a string.
+SCOPE_STATE_KEY = "app_scope"
+
+#: Bounds on what is read back out of the scope for the prompt (the backend
+#: caps entries and label length at the same figures).
+_MAX_LABELS = 50
+_MAX_LABEL_CHARS = 128
 
 #: The label for traffic that carries no tenant — i.e. the original bot.
 DEFAULT_LABEL = "anomaly"
@@ -100,6 +114,63 @@ def read_tenant(state: Any) -> str | None:
     return raw
 
 
+def read_scope_labels(state: Any) -> list[str]:
+    """The human labels of the app scope in `state`, in declaration order.
+
+    Read-only: parses a COPY of the string, returns names only (never ids), and
+    never writes anything back. Total — a missing, non-string or unparseable
+    scope yields `[]`, because the backend is what validates a scope and this is
+    only the persona asking what to call the surface; callers fall back to the
+    tenant slug.
+    """
+    if state is None:
+        return []
+    try:
+        raw = state.get(SCOPE_STATE_KEY)
+    except AttributeError:
+        return []
+    if not isinstance(raw, str):
+        return []
+    try:
+        scope = json.loads(raw)
+    except (ValueError, RecursionError):
+        return []
+    if not isinstance(scope, dict):
+        return []
+    labels: list[str] = []
+    for entries in scope.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str):
+                continue
+            # One line, bounded: the label lands in a prompt.
+            name = " ".join(name.split())[:_MAX_LABEL_CHARS]
+            if name and name not in labels:
+                labels.append(name)
+            if len(labels) >= _MAX_LABELS:
+                return labels
+    return labels
+
+
+def _names(tenant: str, labels: list[str] | None) -> str:
+    """What to call the covered subject in prose: the scope's own labels
+    ("A", "A and B", "A, B and C"), or the tenant slug when no scope is present."""
+    if not labels:
+        return tenant
+    if len(labels) == 1:
+        return labels[0]
+    return f"{', '.join(labels[:-1])} and {labels[-1]}"
+
+
+def _account_phrase(tenant: str, labels: list[str] | None) -> str:
+    """'the <names> account(s)'. With no scope this is exactly the phrase the
+    prompt has always carried ('the <slug> account')."""
+    plural = "s" if labels and len(labels) > 1 else ""
+    return f"the {_names(tenant, labels)} account{plural}"
+
+
 def label_of(ctx_or_state: Any) -> str:
     """The tenant label for a LOG line: the turn's tenant, or `anomaly`.
 
@@ -112,7 +183,7 @@ def label_of(ctx_or_state: Any) -> str:
         return DEFAULT_LABEL
 
 
-def tenant_note(tenant: str) -> str:
+def tenant_note(tenant: str, labels: list[str] | None = None) -> str:
     """The '## Tenant surface' block appended to the instruction for a tenant turn.
 
     Still not a refusal rule, and still not the boundary — that now lives in
@@ -134,15 +205,18 @@ def tenant_note(tenant: str) -> str:
         filtered it, and telling them otherwise sends them to ask for access
         they already have.
 
-    The label is interpolated, never hardcoded — this engine is multi-company
-    and a client name in a prompt is a client name in every tenant's prompt.
+    The subject is interpolated, never hardcoded — this engine is multi-company
+    and a client name in a prompt is a client name in every tenant's prompt. It
+    is the scope's own labels when the turn carries a scope (`labels`, from
+    `read_scope_labels`), and the tenant slug until it does.
     """
+    subject = _names(tenant, labels)
     return (
         "## Tenant surface\n"
         f"This turn arrived through the **{tenant}** surface: a chat app branded "
-        f"for the {tenant} account, and scoped to it in our database.\n"
-        f"- Treat {tenant} as the default subject. When a question does not name "
-        f"an account, it is about {tenant}.\n"
+        f"for {_account_phrase(tenant, labels)}, and scoped to it in our database.\n"
+        f"- Treat {subject} as the default subject. When a question does not name "
+        f"an account, it is about {subject}.\n"
         "- A tool result may carry `account_scope_notice`. When it does, some "
         "records were withheld because they are outside this surface's scope. "
         "Answer with what you DID get, and leave the withheld part alone.\n"
@@ -162,7 +236,7 @@ def tenant_note(tenant: str) -> str:
     )
 
 
-def tenant_note_formatter(tenant: str) -> str:
+def tenant_note_formatter(tenant: str, labels: list[str] | None = None) -> str:
     """The formatter's version of the block.
 
     The formatter needs its own because it is the ONLY model on some turns:
@@ -184,7 +258,7 @@ def tenant_note_formatter(tenant: str) -> str:
     return (
         "## Tenant surface\n"
         f"This turn arrived through the **{tenant}** surface, which is scoped to "
-        f"the {tenant} account in our database.\n"
+        f"{_account_phrase(tenant, labels)} in our database.\n"
         "- Do not add a sentence saying records were withheld, and do not keep "
         "one if the text you were given has it: the surface states that itself, "
         "once, above your answer. Two statements of it read as a stutter.\n"
@@ -197,7 +271,7 @@ def tenant_note_formatter(tenant: str) -> str:
 
 def tenant_instruction(
     base_provider: Callable[[ReadonlyContext], str],
-    note: Callable[[str], str] = tenant_note,
+    note: Callable[..., str] = tenant_note,
     tenant_base: Callable[[ReadonlyContext], str] | None = None,
 ) -> Callable[[ReadonlyContext], str]:
     """Wrap an InstructionProvider so a tenant turn carries the scope block.
@@ -216,6 +290,7 @@ def tenant_instruction(
         if tenant is None:
             return base_provider(ctx)
         base = (tenant_base or base_provider)(ctx)
-        return f"{base}\n\n{note(tenant)}"
+        labels = read_scope_labels(_state_of(ctx))
+        return f"{base}\n\n{note(tenant, labels)}"
 
     return provider
