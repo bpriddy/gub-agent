@@ -48,6 +48,8 @@ Invariants, both pinned by tests:
 - With no `tenant` key in state, EVERY function here is a no-op: the prompt is
   the base provider's text, byte for byte, and the log label is `anomaly`. The
   engine runs this code on every single prod turn.
+- A tenant turn with no app scope is a HARD error too (`require_app_scope`): a
+  bot that believes it is scoped and sends nothing must not run unscoped.
 - A malformed label is a HARD error, never a silent fall back to unscoped. A bot
   that believes it is scoped and is not is the failure worth being loud about,
   and the label is already validated at the bot's own boot, so reaching here
@@ -57,11 +59,14 @@ Invariants, both pinned by tests:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from typing import Any
 
 from google.adk.agents.readonly_context import ReadonlyContext
+
+logger = logging.getLogger(__name__)
 
 STATE_KEY = "tenant"
 
@@ -112,6 +117,42 @@ def read_tenant(state: Any) -> str | None:
             f"{_LABEL.pattern!r}; got {raw!r}"
         )
     return raw
+
+
+def require_app_scope(state: Any) -> None:
+    """Fail hard when a tenant turn carries no app scope.
+
+    A tenant bot never runs unscoped: with `state["tenant"]` set, `app_scope`
+    must be a non-empty string (the bot's serialized scope). Anything else —
+    absent, `None`, an object, an empty string — raises ValueError, the same
+    way a malformed tenant label does, and writes one `tenant_scope: missing`
+    line. Only the type of the offending value is logged, never the value: it
+    can hold the scope's labels.
+
+    No tenant, no check: with no `tenant` in state this is a no-op, so every
+    non-tenant turn is byte for byte what it was.
+
+    Two call sites, because there are two doors: the tenant instruction
+    provider (the deep path) and `tools/_client.py` before any request (the
+    fast path never runs an instruction provider).
+    """
+    tenant = read_tenant(state)
+    if tenant is None:
+        return
+    raw = state.get(SCOPE_STATE_KEY)
+    if isinstance(raw, str) and raw:
+        return
+    logger.error(
+        "tenant_scope: missing state_key=%s value_type=%s tenant=%s",
+        SCOPE_STATE_KEY,
+        type(raw).__name__,
+        tenant,
+    )
+    raise ValueError(
+        f"state[{STATE_KEY!r}] is set but state[{SCOPE_STATE_KEY!r}] is "
+        f"{'empty' if raw == '' else 'missing' if raw is None else 'not a string'}: "
+        "a tenant turn must carry its app scope"
+    )
 
 
 def read_scope_labels(state: Any) -> list[str]:
@@ -289,6 +330,7 @@ def tenant_instruction(
         tenant = read_tenant(_state_of(ctx))
         if tenant is None:
             return base_provider(ctx)
+        require_app_scope(_state_of(ctx))
         base = (tenant_base or base_provider)(ctx)
         labels = read_scope_labels(_state_of(ctx))
         return f"{base}\n\n{note(tenant, labels)}"

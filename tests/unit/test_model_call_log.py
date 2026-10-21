@@ -496,7 +496,9 @@ async def test_every_model_agent_in_the_tree_logs_its_own_calls(logs):
         )
         runner = InMemoryRunner(agent=clone, app_name="gub")
         session = await runner.session_service.create_session(
-            app_name="gub", user_id="u", state={"tenant": "chevy"}
+            app_name="gub",
+            user_id="u",
+            state={"tenant": "chevy", "app_scope": '{"account":[{"id":"i","name":"Acme"}]}'},
         )
         message = genai_types.Content(role="user", parts=[genai_types.Part(text="how is chevy?")])
         logs.clear()

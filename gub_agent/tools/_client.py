@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 
 from ..config import GUB_AUTHORIZATION_ID, GUB_BASE_URL, GUB_SERVICE_JWT
+from ..tenant import require_app_scope
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +79,12 @@ async def _resolve_gub_jwt(tool_context: Any | None) -> str:
       1. Cached GUB JWT in ToolContext session state (avoids re-exchange per call)
       2. Google OAuth access token injected by Gemini Enterprise → exchange for GUB JWT
       3. GUB_SERVICE_JWT env var (local dev / CI fallback)
+
+    The token exchange is itself a GUB call, so a tenant turn without a scope
+    is refused here too, before it (the tools also warm this cache directly).
     """
     if tool_context is not None:
+        require_app_scope(_state_of_tool_context(tool_context))
         # 1. Cached from a previous tool call in this session
         cached = tool_context.state.get("gub_jwt")
         if cached:
@@ -191,6 +196,10 @@ async def _exchange_google_token(google_access_token: str) -> str:
 # the backend owns interpretation, and a re-serialisation would change key
 # order or escapes and make the agent's idea of the scope drift from the bot's.
 #
+# A tenant turn (`state["tenant"]` set) with no scope raises before any request
+# (`tenant.require_app_scope`): the fast path runs no instruction provider, so
+# the provider's own check cannot be the only door.
+#
 # Read-only by structure: no tool takes a scope parameter, nothing in this
 # package writes `app_scope`, and `_exchange_google_token` (the broker
 # exchange, not a records read) never carries the header.
@@ -298,7 +307,9 @@ async def gub_get(
     Non-None query params are forwarded as URL query parameters.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
-    scope_headers = _scope_headers(_state_of_tool_context(tool_context))
+    state = _state_of_tool_context(tool_context)
+    require_app_scope(state)  # before ANY GUB call, the token exchange included
+    scope_headers = _scope_headers(state)
     jwt = await _resolve_gub_jwt(tool_context)
     clean_params = {k: v for k, v in params.items() if v is not None}
 
@@ -332,7 +343,9 @@ async def gub_post(
     Make an authenticated POST request to the GUB backend.
     Returns the parsed JSON response, or an error dict on HTTP failure.
     """
-    scope_headers = _scope_headers(_state_of_tool_context(tool_context))
+    state = _state_of_tool_context(tool_context)
+    require_app_scope(state)  # before ANY GUB call, the token exchange included
+    scope_headers = _scope_headers(state)
     jwt = await _resolve_gub_jwt(tool_context)
 
     client = _get_client()

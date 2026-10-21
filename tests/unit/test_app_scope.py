@@ -106,7 +106,7 @@ async def test_the_scope_is_never_reserialised(recorder) -> None:
     assert recorder.requests[0].headers["x-app-scope"] == RAW_SCOPE
 
 
-@pytest.mark.parametrize("state", [{}, {"app_scope": None}, {"tenant": "somebot"}])
+@pytest.mark.parametrize("state", [{}, {"app_scope": None}, {"other": "x"}])
 async def test_no_scope_means_no_header(recorder, state) -> None:
     await gub_get("/org/accounts", _tool_context(state), limit=5)
     await gub_post("/org/query", {"entity": "campaigns"}, _tool_context(state))
@@ -275,16 +275,16 @@ def test_the_formatter_note_names_the_labels_too() -> None:
     assert "scoped to the Acme Roadworks account" in out
 
 
-def test_without_a_scope_the_note_is_todays_slug_text() -> None:
-    provider = tenant_instruction(lambda _c: "BASE")
-
-    assert provider(_ctx({"tenant": "somebot"})) == f"BASE\n\n{tenant_note('somebot')}"
-    assert "branded for the somebot account" in provider(_ctx({"tenant": "somebot"}))
-    fmt = tenant_instruction(lambda _c: "BASE", note=tenant_note_formatter)
-    assert fmt(_ctx({"tenant": "somebot"})) == f"BASE\n\n{tenant_note_formatter('somebot')}"
+def test_without_labels_the_note_is_todays_slug_text() -> None:
+    """The notes' own default (no labels) is the text the prompt has always had."""
+    assert "branded for the somebot account, and scoped to it" in tenant_note("somebot")
+    assert "scoped to the somebot account in our database" in tenant_note_formatter("somebot")
+    assert tenant_note("somebot", None) == tenant_note("somebot", [])
 
 
 def test_an_unreadable_scope_falls_back_to_the_slug_text() -> None:
+    """The backend validates the scope; the persona only needs a name for the
+    surface, so a present-but-unreadable string degrades to the slug text."""
     provider = tenant_instruction(lambda _c: "BASE")
 
     out = provider(_ctx({"tenant": "somebot", "app_scope": "not json"}))
