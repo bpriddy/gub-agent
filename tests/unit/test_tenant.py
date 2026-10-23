@@ -38,6 +38,10 @@ def _ctx(state: dict | None) -> SimpleNamespace:
     return SimpleNamespace(state=state)
 
 
+#: A tenant turn always carries its app scope (a string); synthetic label.
+_APP_SCOPE = '{"account":[{"id":"11111111-1111-1111-1111-111111111111","name":"Acme"}]}'
+
+
 def _inv_ctx(state: dict | None) -> SimpleNamespace:
     """An InvocationContext-shaped context (state hangs off `.session`)."""
     return SimpleNamespace(session=SimpleNamespace(state=state))
@@ -66,7 +70,7 @@ def test_no_tenant_logs_the_default_label() -> None:
 
 def test_tenant_appends_the_scope_block() -> None:
     provider = tenant_instruction(lambda _ctx: "BASE")
-    out = provider(_ctx({"gub_jwt": "jwt", "tenant": "chevy"}))
+    out = provider(_ctx({"gub_jwt": "jwt", "tenant": "chevy", "app_scope": _APP_SCOPE}))
 
     assert out.startswith("BASE\n\n")
     assert "## Tenant surface" in out
@@ -133,7 +137,7 @@ def test_the_formatter_block_is_opt_in_like_the_executor_one() -> None:
     provider = tenant_instruction(lambda _ctx: "BASE", note=tenant_note_formatter)
 
     assert provider(_ctx({"gub_jwt": "jwt"})) == "BASE"
-    assert "## Tenant surface" in provider(_ctx({"tenant": "someclient"}))
+    assert "## Tenant surface" in provider(_ctx({"tenant": "someclient", "app_scope": _APP_SCOPE}))
 
 
 def test_state_read_works_through_both_context_shapes() -> None:
@@ -240,13 +244,15 @@ def test_no_tenant_executor_keeps_the_agency_persona() -> None:
 
 @pytest.mark.parametrize("agent", [_router.router_agent, _critic.critic_agent])
 def test_router_and_critic_carry_the_scope_block_on_a_tenant_turn(agent) -> None:
-    out = _render(agent, {"gub_jwt": "jwt", "tenant": "chevy"})
+    out = _render(agent, {"gub_jwt": "jwt", "tenant": "chevy", "app_scope": _APP_SCOPE})
     assert "## Tenant surface" in out
     assert "chevy" in out
 
 
 def test_tenant_executor_swaps_the_agency_persona() -> None:
-    out = _render(_agent.executor_agent, {"gub_jwt": "jwt", "tenant": "chevy"})
+    out = _render(
+        _agent.executor_agent, {"gub_jwt": "jwt", "tenant": "chevy", "app_scope": _APP_SCOPE}
+    )
     assert "one client account's team" in out
     assert "## Tenant surface" in out
     for gone in (
@@ -261,7 +267,9 @@ def test_tenant_executor_swaps_the_agency_persona() -> None:
 
 
 def test_tenant_executor_keeps_tool_use_and_safety_rules() -> None:
-    out = _render(_agent.executor_agent, {"gub_jwt": "jwt", "tenant": "chevy"})
+    out = _render(
+        _agent.executor_agent, {"gub_jwt": "jwt", "tenant": "chevy", "app_scope": _APP_SCOPE}
+    )
     base_tail = EXECUTOR_INSTRUCTION.partition(_SCOPE)[2]
     for rule in (
         "GROUND EVERY ENTITY IN A TOOL RESULT",

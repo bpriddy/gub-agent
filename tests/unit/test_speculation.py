@@ -1676,7 +1676,11 @@ async def test_the_round_and_tool_budgets_hold_on_a_kept_speculation():
 
 async def test_sandbox_overrides_and_the_tenant_reach_the_fork(monkeypatch, caplog):
     monkeypatch.setattr(config, "SANDBOX_ENABLED", True)
-    state = {"sandbox": {"temperature": 0.3}, "tenant": "chevy"}
+    state = {
+        "sandbox": {"temperature": 0.3},
+        "tenant": "chevy",
+        "app_scope": '{"account":[{"id":"i","name":"Acme"}]}',
+    }
     built = _build(speculative=True, router=[_decision()])
     with caplog.at_level(logging.INFO):
         after = await _one_turn(built, state=state)
