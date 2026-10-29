@@ -248,7 +248,7 @@ Resolver = Callable[[str | None, tuple[str, ...], Any], Awaitable[Resolution]]
 # silently matches nothing (`tools/org_query.py` docstring) — so a status the
 # entity does not know is a deep-path question, not a filter.
 _STATUS_VALUES = {
-    "campaigns": {"pitch", "awarded", "live", "ended", "lost"},
+    "campaigns": {"pitch", "awarded", "in_progress", "live", "paused", "ended", "lost"},
     "accounts": {"active", "inactive", "prospect"},
     "staff": {"active", "on_leave", "former"},
     "pieces": set(),
