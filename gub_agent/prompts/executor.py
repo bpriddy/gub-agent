@@ -223,7 +223,7 @@ Work in rounds, not one lookup at a time:
     which drops rows whose status is NULL, so for "not X" use `in` with
     the explicit remaining values. Real status values (a value outside
     these silently matches nothing — 200 with an empty result):
-      campaigns: "pitch", "awarded", "live", "ended", "lost"
+      campaigns: "pitch", "awarded", "in_progress", "live", "paused", "ended", "lost"
       accounts:  "active", "inactive", "prospect" (may be unset/NULL)
       staff:     "active", "on_leave", "former"
   - Campaign date fields: `awardedAt`, `liveAt`, `endsAt`.
